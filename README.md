@@ -20,6 +20,20 @@
 
 ---
 
+## ✅ Krav
+
+| Krav | Detalj |
+|---|---|
+| **Python** | 3.8 eller senare |
+| **Google Chrome** | Måste vara installerat på datorn |
+| **ChromeDriver** | Hanteras automatiskt av `webdriver-manager` |
+
+> **Obs!** `webdriver-manager` laddar automatiskt ned rätt version av ChromeDriver för din Chrome-installation – du behöver inte göra något manuellt. Däremot måste **Google Chrome** finnas installerat, annars kan varken hybrid-motorn, headless-läget eller `login_then_headless` användas.
+>
+> Ladda ned Chrome här om det saknas: [google.com/chrome](https://www.google.com/chrome)
+
+---
+
 ## 🛠️ Installation
 
 Kräver Python 3.8+.
