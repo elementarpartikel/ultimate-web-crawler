@@ -1,5 +1,9 @@
 # 🕸️ Ultimat Webbdammsugare v3.5 (AI & RAG Edition)
 
+![Skärmdump av GUI](screenshots/gui_preview.png)
+
+> 💡 *Lägg till en skärmdump genom att ta en bild av programmet och spara den som `screenshots/gui_preview.png` i repositoryt – bilden visas då automatiskt här.*
+
 **Ultimat Webbdammsugare** är ett professionellt verktyg för att skrapa, strukturera och lagra innehåll från webbplatser. Det är särskilt framtaget för att generera högkvalitativ textdata för AI-modeller, RAG-pipelines och vektordatabaser.
 
 ---
@@ -14,7 +18,6 @@
 - **Flera Körlägen:** Stöd för osynligt läge (`headless`), synligt läge (`visible`) eller manuell inloggning innan automatiserad skrapning (`login_then_headless`).
 - **Pausa & Återuppta:** Crawlningen kan pausas och återupptas mitt i körningen utan att data går förlorad.
 - **Dokumenthantering:** Identifierar och laddar automatiskt ned dokument som PDF, DOCX, XLSX, PPTX och CSV i en separat mapp.
-- **Supabase-integration:** Valfritt stöd för att ladda upp skrapad data direkt till en Supabase-databas via `.env`-konfiguration.
 - **Minnesövervakning:** Övervakar RAM-användning via `psutil` och utlöser automatisk garbage collection vid >1 500 MB.
 - **Roterande loggfiler:** Körloggar sparas per session med `RotatingFileHandler` (max 5 MB × 2 backupfiler).
 
@@ -44,30 +47,27 @@ git clone https://github.com/DITT-ANVANDARNAMN/ultimate-web-crawler.git
 cd ultimate-web-crawler
 ```
 
-**2. Installera obligatoriska beroenden:**
+**2. Installera beroenden:**
 ```bash
-pip install requests beautifulsoup4 selenium webdriver-manager trafilatura
-```
-
-**3. Installera valfria beroenden** (aktiverar extrafunktioner):
-```bash
-pip install supabase python-dotenv psutil pandas
+pip install -r requirements.txt
 ```
 
 | Paket | Funktion |
 |---|---|
-| `trafilatura` | Högkvalitativ textextraktion (rekommenderas starkt) |
-| `supabase` + `python-dotenv` | Uppladdning av data till Supabase |
+| `requests` | HTTP-hämtning |
+| `beautifulsoup4` | HTML-parsning |
+| `selenium` + `webdriver-manager` | JS-rendering via Chrome |
+| `trafilatura` | AI-optimerad textextraktion (rekommenderas starkt) |
+
+**3. Installera valfria beroenden** (aktiverar extrafunktioner):
+```bash
+pip install psutil pandas
+```
+
+| Paket | Funktion |
+|---|---|
 | `psutil` | Realtidsövervakning av minnesanvändning |
 | `pandas` | Utökad datahantering |
-
-**4. (Valfritt) Konfigurera Supabase:**
-
-Skapa en `.env`-fil i projektmappen:
-```
-SUPABASE_URL=https://ditt-projekt.supabase.co
-SUPABASE_KEY=din-anon-nyckel
-```
 
 ---
 
@@ -141,7 +141,6 @@ HÄMTAD: 2025-01-01 12:00:00
 | Caching | SQLite3 |
 | Loggning | RotatingFileHandler |
 | Parallellism | ThreadPoolExecutor (dokumentnedladdning) |
-| Moln-integration | Supabase (valfritt) |
 
 ---
 
