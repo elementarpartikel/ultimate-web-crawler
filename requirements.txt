@@ -1,0 +1,10 @@
+# Obligatoriska beroenden
+requests
+beautifulsoup4
+selenium
+webdriver-manager
+trafilatura
+
+# Valfria beroenden (aktiverar extrafunktioner)
+# psutil        # Realtidsövervakning av minnesanvändning
+# pandas        # Utökad datahantering
