@@ -1,4 +1,3 @@
-# ultimate-web-crawler
 # 🕸️ Ultimat Webbdammsugare v3.5 (AI & RAG Edition)
 
 **Ultimat Webbdammsugare** är ett professionellt verktyg utvecklat för att effektivt skrapa, strukturera och lagra innehåll från webbplatser. Den är särskilt framtagen för att generera högkvalitativ textdata för AI-modeller och RAG-pipelines.
