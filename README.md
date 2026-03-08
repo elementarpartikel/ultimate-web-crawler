@@ -4,7 +4,6 @@
 
 ![Skärmdump av GUI](screenshots/gui_preview.png)
 
-> 💡 *Lägg till en skärmdump genom att ta en bild av programmet och spara den som `screenshots/gui_preview.png` i repositoryt – bilden visas då automatiskt här.*
 
 **Webbdammsugare Pro** är ett professionellt verktyg för att skrapa, strukturera och lagra innehåll från webbplatser. Det är särskilt framtaget för att generera högkvalitativ textdata för AI-modeller, RAG-pipelines och vektordatabaser.
 
