@@ -79,7 +79,7 @@ pip install psutil pandas
 
 Starta applikationen:
 ```bash
-python site_crawler4.py
+python ultimate-web-crawler.py
 ```
 
 ### GUI-inställningar
