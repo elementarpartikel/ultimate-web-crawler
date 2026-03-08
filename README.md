@@ -1,4 +1,4 @@
-# 🕸️ Ultimat Webbdammsugare v3.8 (AI & RAG Edition)
+# 🕸️ Ultimat Webbdammsugare v3.9 (AI & RAG Edition)
 
 ![Skärmdump av GUI](screenshots/gui_preview.png)
 
@@ -23,7 +23,7 @@
 - **Flera Körlägen:** Stöd för osynligt läge (`headless`), synligt läge (`visible`) eller manuell inloggning innan automatiserad skrapning (`login_then_headless`).
 - **Pausa & Återuppta:** Crawlningen kan pausas och återupptas mitt i körningen utan att data går förlorad.
 - **Utökad Dokumenthantering:** Identifierar och laddar automatiskt ned PDF, DOCX, XLSX, PPTX, CSV, ODT, Markdown m.fl. i en separat mapp. Pågående nedladdningar slutförs alltid säkert innan programmet stängs.
-- **Flerspråkig JS-detektion:** Känner igen JavaScript-krav på både svenska och engelska och byter automatiskt till Selenium-rendering.
+- **Valbart utdataformat:** Sparar extraherad text som `.md` (Markdown, rekommenderas för AI/LLM) eller `.txt` (klassiskt format) – väljs direkt i GUI:t. Känner igen JavaScript-krav på både svenska och engelska och byter automatiskt till Selenium-rendering.
 - **Minnesövervakning:** Övervakar RAM-användning via `psutil` och utlöser automatisk garbage collection vid >1 500 MB.
 - **Roterande loggfiler:** Körloggar sparas per session med `RotatingFileHandler` (max 5 MB × 2 backupfiler).
 
@@ -90,6 +90,7 @@ python site_crawler4.py
 | **Startadress** | Ange komplett URL inklusive `https://` |
 | **Fördröjning** | Sekunder mellan varje förfrågan (standard: 0.5 s) |
 | **Max sidor** | Sätt till `0` för att crawla hela sajten |
+| **Utdataformat** | `.md` (rekommenderas för AI) eller `.txt` |
 | **Ladda ned dokument** | Aktivera för att spara PDF, DOCX m.m. |
 | **Körläge** | Se tabellen nedan |
 | **Mapp** | Output-katalog för sparade filer |
@@ -114,8 +115,8 @@ python site_crawler4.py
 
 ```
 crawl_output/
-├── texter/              # En .txt-fil per skrapad sida
-│   └── sidnamn.txt      # Innehåller källa, titel, datum och ren text
+├── texter/              # En fil per skrapad sida (.md eller .txt beroende på val)
+│   └── sidnamn.md       # Innehåller källa, titel, datum och ren text
 ├── dokument/            # Nedladdade PDF, DOCX, XLSX m.m.
 ├── logs/
 │   └── crawl_YYYYMMDD_HHMMSS.log
