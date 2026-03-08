@@ -1,4 +1,4 @@
-# 🕸️ Ultimat Webbdammsugare v3.9 (AI & RAG Edition)
+# 🕸️ Webbdammsugare Pro v1.0 (AI & RAG Edition)
 
 ![Skärmdump av GUI](screenshots/gui_preview.png)
 
