@@ -1,4 +1,4 @@
-# 🕸️ Ultimat Webbdammsugare v3.6 (AI & RAG Edition)
+# 🕸️ Ultimat Webbdammsugare v3.8 (AI & RAG Edition)
 
 ![Skärmdump av GUI](screenshots/gui_preview.png)
 
@@ -13,14 +13,17 @@
 - **Hybridmotor:** Växlar intelligent mellan blixtsnabb hämtning via `requests` och dynamisk rendering via `Selenium` vid behov – ger maximal kompatibilitet med moderna webbplatser.
 - **Content-Type Routing:** Kontrollerar serverns headers *innan* en fil laddas ned. Mediafiler ignoreras direkt, och dokument utan filändelse i URL:en skickas automatiskt till dokumenthanteraren – sparar minne och bandbredd.
 - **Selenium PDF-skydd:** Konfigurerar Chrome att aldrig öppna PDF:er i webbläsarfliken, vilket annars får crawlern att fastna. Nedladdade filer hamnar automatiskt i rätt mapp.
-- **Smarta filnamn:** Läser `content-disposition`-headern för att hitta det verkliga filnamnet vid nedladdning (t.ex. `Årsredovisning_2024.pdf`) även om URL:en ser ut som `download?id=9942`.
+- **Smarta filnamn:** Läser `content-disposition`-headern för att hitta det verkliga filnamnet vid nedladdning (t.ex. `Årsredovisning_2024.pdf`) även om URL:en ser ut som `download?id=9942`. Unik hash i filnamnet garanterar att inga filer skrivs över.
 - **AI/RAG-Optimerad:** Extraherar ren text rensad från menyer, footers och skräpkod med hjälp av `Trafilatura`, redo att användas direkt i vektordatabaser.
 - **Intelligent Caching:** Använder SQLite för att spåra innehållsändringar via SHA-256-hash och undvika att skrapa oförändrade sidor om igen (Incremental Crawling).
+- **Sitemap-index stöd:** Parsar sitemap-index-filer rekursivt och följer länkade undersitemaps automatiskt – fångar alla URL:er även på stora sajter.
 - **Prioriterad URL-kö:** URLs från `sitemap.xml` bearbetas med högre prioritet för ett mer strukturerat och effektivt crawlflöde.
+- **Canonical-hantering:** Noterar canonical-taggar och lägger till den kanoniska URL:en i kön, men extraherar ändå text från originalsidan för att inte tappa unik RAG-data.
 - **Avancerat Skydd:** Inbyggt skydd mot evighetsloopar, URL-längdsbegränsning, domänspärrning samt hantering av `robots.txt` och `sitemap.xml`.
 - **Flera Körlägen:** Stöd för osynligt läge (`headless`), synligt läge (`visible`) eller manuell inloggning innan automatiserad skrapning (`login_then_headless`).
 - **Pausa & Återuppta:** Crawlningen kan pausas och återupptas mitt i körningen utan att data går förlorad.
-- **Utökad Dokumenthantering:** Identifierar och laddar automatiskt ned PDF, DOCX, XLSX, PPTX, CSV, ODT, Markdown m.fl. i en separat mapp.
+- **Utökad Dokumenthantering:** Identifierar och laddar automatiskt ned PDF, DOCX, XLSX, PPTX, CSV, ODT, Markdown m.fl. i en separat mapp. Pågående nedladdningar slutförs alltid säkert innan programmet stängs.
+- **Flerspråkig JS-detektion:** Känner igen JavaScript-krav på både svenska och engelska och byter automatiskt till Selenium-rendering.
 - **Minnesövervakning:** Övervakar RAM-användning via `psutil` och utlöser automatisk garbage collection vid >1 500 MB.
 - **Roterande loggfiler:** Körloggar sparas per session med `RotatingFileHandler` (max 5 MB × 2 backupfiler).
 
@@ -41,8 +44,6 @@
 ---
 
 ## 🛠️ Installation
-
-Kräver Python 3.8+.
 
 **1. Klona repositoryt:**
 ```bash
@@ -103,7 +104,7 @@ python site_crawler4.py
 **Avancerat:**
 - **Hybrid-motor** – låter programmet välja `requests` eller `Selenium` per sida
 - **Trafilatura** – aktiverar AI-optimerad textextraktion
-- **Sitemap.xml** – förladdas automatiskt för effektivare crawling
+- **Sitemap.xml** – förladdas automatiskt för effektivare crawling, inklusive sitemap-index
 - **robots.txt** – respekterar webbplatsens crawling-regler
 - **Uteslut ord i URL** – kommaseparerad lista med nyckelord; sidor vars URL innehåller dessa hoppar över
 
