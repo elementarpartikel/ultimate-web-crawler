@@ -1,5 +1,7 @@
 # 🕸️ Webbdammsugare Pro v1.0 (AI & RAG Edition)
 
+[![Ladda ner .exe för Windows](https://img.shields.io/badge/Ladda_ner-.exe-blue?style=for-the-badge&logo=windows)](https://github.com/elementarpartikel/ultimate-web-crawler/releases/latest)
+
 ![Skärmdump av GUI](screenshots/gui_preview.png)
 
 > 💡 *Lägg till en skärmdump genom att ta en bild av programmet och spara den som `screenshots/gui_preview.png` i repositoryt – bilden visas då automatiskt här.*
