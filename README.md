@@ -1,4 +1,4 @@
-# 🕸️ Webbdammsugare Pro v1.0 (AI & RAG Edition)
+# 🕸️ Webbdammsugare Pro v1.1 (AI & RAG Edition)
 
 [![Ladda ner .exe för Windows](https://img.shields.io/badge/Ladda_ner-.exe-blue?style=for-the-badge&logo=windows)](https://github.com/elementarpartikel/ultimate-web-crawler/releases/latest)
 
