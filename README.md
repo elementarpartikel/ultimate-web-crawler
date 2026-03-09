@@ -1,4 +1,4 @@
-# 🕸️ Webbdammsugare Pro v1.1 (AI & RAG Edition)
+# 🕸️ Webbdammsugare Pro v1.2 (AI & RAG Edition)
 
 [![Ladda ner .exe för Windows](https://img.shields.io/badge/Ladda_ner-.exe-blue?style=for-the-badge&logo=windows)](https://github.com/elementarpartikel/ultimate-web-crawler/releases/latest)
 
@@ -25,6 +25,9 @@
 - **Pausa & Återuppta:** Crawlningen kan pausas och återupptas mitt i körningen utan att data går förlorad.
 - **Utökad Dokumenthantering:** Identifierar och laddar automatiskt ned PDF, DOCX, XLSX, PPTX, CSV, ODT, Markdown m.fl. i en separat mapp. Pågående nedladdningar slutförs alltid säkert innan programmet stängs.
 - **Valbart utdataformat:** Sparar extraherad text som `.md` (Markdown, rekommenderas för AI/LLM) eller `.txt` (klassiskt format) – väljs direkt i GUI:t. Känner igen JavaScript-krav på både svenska och engelska och byter automatiskt till Selenium-rendering.
+- **Crawldjup:** Ny inställning för max länkdjup från startsidan (0 = obegränsat). Förhindrar att crawlern fastnar i djupa, irrelevanta delar av en sajt.
+- **Automatisk retry:** HTTP-anrop återförsöks automatiskt vid tillfälliga nätverksfel med exponentiell backoff – mer stabilt på ostadiga anslutningar.
+- **URL-deduplicering:** `index.html` och `index.php` normaliseras bort automatiskt så att startsidan inte crawlas dubbelt.
 - **Minnesövervakning:** Övervakar RAM-användning via `psutil` och utlöser automatisk garbage collection vid >1 500 MB.
 - **Roterande loggfiler:** Körloggar sparas per session med `RotatingFileHandler` (max 5 MB × 2 backupfiler).
 
@@ -48,7 +51,7 @@
 
 **1. Klona repositoryt:**
 ```bash
-git clone https://github.com/DITT-ANVANDARNAMN/ultimate-web-crawler.git
+git clone https://github.com/elementarpartikel/ultimate-web-crawler.git
 cd ultimate-web-crawler
 ```
 
@@ -91,6 +94,7 @@ python ultimate-web-crawler.py
 | **Startadress** | Ange komplett URL inklusive `https://` |
 | **Fördröjning** | Sekunder mellan varje förfrågan (standard: 0.5 s) |
 | **Max sidor** | Sätt till `0` för att crawla hela sajten |
+| **Max djup** | Antal länknivåer från startsidan (0 = obegränsat) |
 | **Utdataformat** | `.md` (rekommenderas för AI) eller `.txt` |
 | **Ladda ned dokument** | Aktivera för att spara PDF, DOCX m.m. |
 | **Körläge** | Se tabellen nedan |
