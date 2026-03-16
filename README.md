@@ -1,36 +1,47 @@
-# 🕸️ Webbdammsugare Pro v1.4 (AI & RAG Edition)
+# 🕸️ Webbdammsugare Pro / Web Crawler Pro v1.7 (AI & RAG Edition)
 
 [![Ladda ner .exe för Windows](https://img.shields.io/badge/Ladda_ner-.exe-blue?style=for-the-badge&logo=windows)](https://github.com/elementarpartikel/ultimate-web-crawler/releases/latest)
 
 ![Skärmdump av GUI](screenshots/gui_preview.png)
 
-**Webbdammsugare Pro** är ett professionellt verktyg för att skrapa, strukturera och lagra innehåll från webbplatser. Det är särskilt framtaget för att generera högkvalitativ textdata för AI-modeller, RAG-pipelines och vektordatabaser.
+**Webbdammsugare Pro** är ett professionellt verktyg för att skrapa, strukturera och lagra innehåll från webbplatser – särskilt framtaget för att generera högkvalitativ textdata för AI-modeller, RAG-pipelines och vektordatabaser.
+
+From v1.7 the interface is fully bilingual. Switch between 🇸🇪 Swedish and 🇬🇧 English directly in the app.
+
+---
+
+## 🆕 Nyheter i v1.7
+
+- **Tvåspråkigt gränssnitt (SV/EN):** Byt språk i realtid direkt i appens huvud-meny via en flaggknapp – hela gränssnittet, alla etiketter, knappar och statistiktext uppdateras omedelbart.
+- **Mörkt/Ljust tema:** En dedikerad switch (🌙 / ☀️) i fönstret låter dig växla tema utan att starta om. Treeview-tabellen anpassar sig automatiskt till valt tema.
+- **Temakonsistent scrollbar:** Treeview använder nu `CTkScrollbar` som matchar det valda temat i stället för systemets standardscrollbar.
 
 ---
 
 ## 🚀 Huvudfunktioner
 
 - **Hybridmotor:** Växlar intelligent mellan blixtsnabb hämtning via `requests` och dynamisk rendering via `Selenium` vid behov – ger maximal kompatibilitet med moderna webbplatser.
-- **Content-Type Routing:** Kontrollerar serverns headers *innan* en fil laddas ned. Mediafiler ignoreras direkt, och dokument utan filändelse i URL:en skickas automatiskt till dokumenthanteraren – sparar minne och bandbredd.
-- **Selenium PDF-skydd:** Konfigurerar Chrome att aldrig öppna PDF:er i webbläsarfliken, vilket annars får crawlern att fastna. Nedladdade filer hamnar automatiskt i rätt mapp.
-- **Smarta filnamn:** Läser `content-disposition`-headern för att hitta det verkliga filnamnet vid nedladdning (t.ex. `Årsredovisning_2024.pdf`) även om URL:en ser ut som `download?id=9942`. Unik hash i filnamnet garanterar att inga filer skrivs över.
-- **AI/RAG-Optimerad:** Extraherar ren text rensad från menyer, footers och skräpkod med hjälp av `Trafilatura`, redo att användas direkt i vektordatabaser.
-- **Intelligent Caching:** Använder SQLite för att spåra innehållsändringar via SHA-256-hash och undvika att skrapa oförändrade sidor om igen (Incremental Crawling).
-- **Sitemap-index stöd:** Parsar sitemap-index-filer rekursivt och följer länkade undersitemaps automatiskt – fångar alla URL:er även på stora sajter.
-- **Prioriterad URL-kö:** URL:er från `sitemap.xml` bearbetas med högre prioritet för ett mer strukturerat och effektivt crawlflöde.
-- **Canonical-hantering:** Känner igen canonical-taggar och lägger automatiskt till den kanoniska URL:en i kön med hög prioritet. Originalsidan hoppas över för att undvika dubbletter i RAG-data.
-- **URL-filter:** Avancerade regler för att styra vilka sidor som besöks. Uteslut sidor vars URL innehåller valda nyckelord, eller kräv att URL:en innehåller ett visst ord – användbart för att låsa crawlern till en specifik del av en sajt eller plattform.
-- **Automatisk index-fil:** Genererar en `index.csv` vid körningens slut med en fullständig översikt av alla besökta sidor (URL, titel, datum och filnamn).
-- **Avancerat Skydd:** Inbyggt skydd mot evighetsloopar i sitemap-kedjor, URL-längdsbegränsning, domänspärrning samt hantering av `robots.txt`.
-- **Flera Körlägen:** Stöd för osynligt läge (`headless`), synligt läge (`visible`) eller manuell inloggning innan automatiserad skrapning (`login_then_headless`).
-- **Pausa & Återuppta:** Crawlningen kan pausas och återupptas mitt i körningen utan att data går förlorad.
-- **Utökad Dokumenthantering:** Identifierar och laddar automatiskt ned PDF, DOCX, XLSX, PPTX, CSV, ODT, Markdown m.fl. i en separat mapp. Pågående nedladdningar slutförs alltid säkert innan programmet stängs.
-- **Valbart utdataformat:** Sparar extraherad text som `.md` (Markdown, rekommenderas för AI/LLM) eller `.txt` (klassiskt format) – väljs direkt i GUI:t.
-- **Crawldjup:** Inställning för max länkdjup från startsidan (0 = obegränsat). Förhindrar att crawlern fastnar i djupa, irrelevanta delar av en sajt.
-- **Automatisk retry:** HTTP-anrop återförsöks automatiskt vid tillfälliga nätverksfel med exponentiell backoff – mer stabilt på ostadiga anslutningar.
-- **URL-deduplicering:** `index.html` och `index.php` normaliseras bort automatiskt så att startsidan inte crawlas dubbelt. Tracking-parametrar som `utm_source`, `fbclid` m.fl. rensas från URL:er.
-- **Minnesövervakning:** Övervakar RAM-användning via `psutil` och utlöser automatisk garbage collection vid >1 500 MB.
-- **Roterande loggfiler:** Körloggar sparas per session med `RotatingFileHandler` (max 5 MB × 2 backupfiler).
+- **Content-Type Routing:** Kontrollerar serverns headers *innan* en fil laddas ned. Mediafiler ignoreras direkt och dokument skickas automatiskt till dokumenthanteraren.
+- **Selenium PDF-skydd:** Konfigurerar Chrome att aldrig öppna PDF:er i webbläsarfliken, vilket annars kan få crawlern att fastna.
+- **Smarta filnamn:** Läser `content-disposition`-headern för att hitta det verkliga filnamnet vid nedladdning. Unik hash garanterar att inga filer skrivs över.
+- **AI/RAG-Optimerad:** Extraherar ren text rensad från menyer, footers och skräpkod med `Trafilatura`, redo för vektordatabaser.
+- **Intelligent Caching:** Använder SQLite (WAL-läge) för att spåra innehållsändringar via SHA-256-hash och hoppa över oförändrade sidor (Incremental Crawling).
+- **Sitemap-index stöd:** Parsar sitemap-index-filer rekursivt med inbyggt loop-skydd – fångar alla URL:er även på stora sajter.
+- **Prioriterad URL-kö:** URL:er från `sitemap.xml` bearbetas med högre prioritet för ett strukturerat crawlflöde.
+- **Canonical-hantering:** Lägger till kanoniska URL:er i kön med hög prioritet och hoppar över originalsidan för att undvika dubbletter i RAG-data.
+- **URL-filter:** Uteslut sidor vars URL innehåller valda nyckelord, eller kräv att ett visst ord finns med – användbart för att låsa crawlern till en specifik del av en delad plattform.
+- **Automatisk index-fil:** Genererar `index.csv` vid körningens slut med URL, titel, datum och filnamn för alla besökta sidor.
+- **Strikt Domän:** Tvingar crawlern att stanna på exakt angiven domän. Kan stängas av för att tillåta underdomäner.
+- **Flera Körlägen:** Osynligt (`headless`), synligt (`visible`) eller manuell inloggning med event-baserad väntan (`login_then_headless`).
+- **Pausa & Återuppta:** Körningen kan pausas och återupptas utan att data går förlorad.
+- **Utökad Dokumenthantering:** Laddar ned PDF, DOCX, XLSX, PPTX, CSV, ODT m.fl. Pågående nedladdningar slutförs alltid säkert innan programmet stängs.
+- **Valbart utdataformat:** `.md` (Markdown, rekommenderas för AI/LLM) eller `.txt`.
+- **Crawldjup:** Max antal länknivåer från startsidan (0 = obegränsat).
+- **Automatisk retry:** Återförsöker HTTP-anrop vid nätverksfel med exponentiell backoff.
+- **URL-deduplicering:** `index.html`/`index.php` normaliseras bort. Tracking-parametrar som `utm_source`, `fbclid` m.fl. rensas automatiskt.
+- **Minnesövervakning:** Utlöser garbage collection automatiskt vid >1 500 MB RAM-användning (kräver `psutil`).
+- **Roterande loggfiler:** Per session, max 5 MB × 2 backupfiler.
+- **Trådsäker arkitektur:** `threading.Lock` skyddar SQLite-databasen och dokumentnedladdningarna. `RateLimiter` sover utanför låset.
 
 ---
 
@@ -42,7 +53,7 @@
 | **Google Chrome** | Måste vara installerat på datorn |
 | **ChromeDriver** | Hanteras automatiskt av `webdriver-manager` |
 
-> **Obs!** `webdriver-manager` laddar automatiskt ned rätt version av ChromeDriver för din Chrome-installation – du behöver inte göra något manuellt. Däremot måste **Google Chrome** finnas installerat, annars kan varken hybrid-motorn, headless-läget eller `login_then_headless` användas.
+> **Obs!** `webdriver-manager` laddar ned rätt ChromeDriver automatiskt. **Google Chrome** måste finnas installerat för att hybrid-motorn och headless-lägena ska fungera.
 >
 > Ladda ned Chrome här om det saknas: [google.com/chrome](https://www.google.com/chrome)
 
@@ -58,7 +69,7 @@ cd ultimate-web-crawler
 
 **2. Installera beroenden:**
 ```bash
-pip install requests beautifulsoup4 lxml selenium webdriver-manager trafilatura
+pip install requests beautifulsoup4 lxml selenium webdriver-manager trafilatura customtkinter
 ```
 
 | Paket | Funktion |
@@ -68,8 +79,9 @@ pip install requests beautifulsoup4 lxml selenium webdriver-manager trafilatura
 | `lxml` | XML-parsning för sitemap-stöd |
 | `selenium` + `webdriver-manager` | JS-rendering via Chrome |
 | `trafilatura` | AI-optimerad textextraktion (rekommenderas starkt) |
+| `customtkinter` | Modernt GUI med mörkt/ljust tema |
 
-**3. Installera valfria beroenden** (aktiverar extrafunktioner):
+**3. Installera valfria beroenden:**
 ```bash
 pip install psutil
 ```
@@ -80,47 +92,46 @@ pip install psutil
 
 ---
 
-## 🖥️ Användning
+## 🖥️ Användning / Usage
 
-Starta applikationen:
 ```bash
 python ultimate-web-crawler.py
 ```
 
 ### GUI-inställningar
 
-**Grundinställningar:**
+**Grundinställningar / Basic Settings:**
 
 | Inställning | Beskrivning |
 |---|---|
-| **Startadress** | Ange komplett URL inklusive `https://` |
-| **Fördröjning** | Sekunder mellan varje förfrågan (standard: 0.5 s) |
-| **Max sidor** | Sätt till `0` för att crawla hela sajten |
-| **Max djup** | Antal länknivåer från startsidan (0 = obegränsat) |
-| **Utdataformat** | `.md` (rekommenderas för AI) eller `.txt` |
-| **Ladda ned dokument** | Aktivera för att spara PDF, DOCX m.m. |
-| **Körläge** | Se tabellen nedan |
-| **Mapp** | Output-katalog för sparade filer |
+| **Startadress / Start URL** | Komplett URL inklusive `https://` |
+| **Fördröjning / Delay** | Sekunder mellan förfrågningar (standard: 0.5 s) |
+| **Max sidor / Max pages** | `0` = crawla hela sajten |
+| **Max djup / Max depth** | Länknivåer från startsidan (`0` = obegränsat) |
+| **Filformat / File Format** | `.md` (rekommenderas för AI) eller `.txt` |
+| **Ladda ner dokument** | Sparar PDF, DOCX m.m. i undermappen `dokument/` |
+| **Körläge / Run Mode** | Se tabellen nedan |
+| **Mapp / Folder** | Katalog för alla sparade filer |
 
-**Körlägen:**
+**Körlägen / Run Modes:**
 
 | Läge | Beskrivning |
 |---|---|
 | `headless` | Osynlig Chrome-instans (standard, snabbast) |
 | `visible` | Synlig webbläsare – bra för felsökning |
-| `login_then_headless` | En synlig webbläsare öppnas så du kan logga in. Klicka OK i programmet när du är klar, så fortsätter dammsugningen osynligt. |
+| `login_then_headless` | Öppnar synlig webbläsare för manuell inloggning. Klicka OK i dialogrutan när du är klar. |
 
-**Avancerat:**
+**Avancerat / Advanced:**
 
 | Inställning | Beskrivning |
 |---|---|
-| **Hybrid-motor** | Låter programmet välja `requests` eller `Selenium` per sida |
+| **Hybrid-motor** | Väljer automatiskt `requests` eller `Selenium` per sida |
 | **Trafilatura** | Aktiverar AI-optimerad textextraktion |
-| **Sitemap.xml** | Förladdas automatiskt för effektivare crawling, inklusive sitemap-index |
+| **Sitemap.xml** | Förladdas rekursivt för effektivare crawling |
 | **robots.txt** | Respekterar webbplatsens crawling-regler |
-| **Strikt Domän** | Tvingar crawlern att stanna på exakt angiven domän. Bocka ur för att tillåta underdomäner. |
-| **Uteslut ord i URL** | Kommaseparerad lista – sidor vars URL innehåller dessa ord hoppas över |
-| **Kräv ord i URL** | Kommaseparerad lista – crawlern besöker bara sidor vars URL innehåller minst ett av dessa ord. Användbart för att hålla sig till en specifik del av en delad plattform (t.ex. `utb.tyreso.se`) |
+| **Strikt Domän** | Tvingar crawlern att stanna på exakt angiven domän |
+| **Uteslut ord i URL** | Kommaseparerad lista – matchande sidor hoppas över |
+| **Kräv ord i URL** | Crawlern besöker bara sidor vars URL innehåller minst ett av dessa ord |
 
 ---
 
@@ -133,7 +144,7 @@ crawl_output/
 ├── dokument/                        # Nedladdade PDF, DOCX, XLSX m.m.
 ├── logs/
 │   └── crawl_YYYYMMDD_HHMMSS.log
-├── index.csv                        # Automatisk översikt: URL, titel, datum, filnamn
+├── index.csv                        # Översikt: URL, titel, datum, filnamn
 └── domännamn_cache.db               # SQLite-cache för incremental crawling
 ```
 
@@ -153,11 +164,11 @@ HÄMTAD: 2025-01-01 12:00:00
 
 | Komponent | Teknik |
 |---|---|
-| GUI | Tkinter + ttk |
-| HTTP-hämtning | Requests (med Session + automatisk retry) |
+| GUI | CustomTkinter (mörkt/ljust tema, tvåspråkigt) |
+| HTTP-hämtning | Requests (Session + automatisk retry) |
 | Textextraktion | BeautifulSoup4 + Trafilatura |
 | JS-rendering | Selenium + ChromeDriverManager |
-| Caching | SQLite3 (WAL-läge) |
+| Caching | SQLite3 (WAL-läge, trådsäker) |
 | Loggning | RotatingFileHandler |
 | Parallellism | ThreadPoolExecutor (dokumentnedladdning) |
 
