@@ -1,9 +1,8 @@
-# 🕸️ Webbdammsugare Pro v1.2 (AI & RAG Edition)
+# 🕸️ Webbdammsugare Pro v1.4 (AI & RAG Edition)
 
 [![Ladda ner .exe för Windows](https://img.shields.io/badge/Ladda_ner-.exe-blue?style=for-the-badge&logo=windows)](https://github.com/elementarpartikel/ultimate-web-crawler/releases/latest)
 
 ![Skärmdump av GUI](screenshots/gui_preview.png)
-
 
 **Webbdammsugare Pro** är ett professionellt verktyg för att skrapa, strukturera och lagra innehåll från webbplatser. Det är särskilt framtaget för att generera högkvalitativ textdata för AI-modeller, RAG-pipelines och vektordatabaser.
 
@@ -18,16 +17,18 @@
 - **AI/RAG-Optimerad:** Extraherar ren text rensad från menyer, footers och skräpkod med hjälp av `Trafilatura`, redo att användas direkt i vektordatabaser.
 - **Intelligent Caching:** Använder SQLite för att spåra innehållsändringar via SHA-256-hash och undvika att skrapa oförändrade sidor om igen (Incremental Crawling).
 - **Sitemap-index stöd:** Parsar sitemap-index-filer rekursivt och följer länkade undersitemaps automatiskt – fångar alla URL:er även på stora sajter.
-- **Prioriterad URL-kö:** URLs från `sitemap.xml` bearbetas med högre prioritet för ett mer strukturerat och effektivt crawlflöde.
-- **Canonical-hantering:** Noterar canonical-taggar och lägger till den kanoniska URL:en i kön, men extraherar ändå text från originalsidan för att inte tappa unik RAG-data.
-- **Avancerat Skydd:** Inbyggt skydd mot evighetsloopar, URL-längdsbegränsning, domänspärrning samt hantering av `robots.txt` och `sitemap.xml`.
+- **Prioriterad URL-kö:** URL:er från `sitemap.xml` bearbetas med högre prioritet för ett mer strukturerat och effektivt crawlflöde.
+- **Canonical-hantering:** Känner igen canonical-taggar och lägger automatiskt till den kanoniska URL:en i kön med hög prioritet. Originalsidan hoppas över för att undvika dubbletter i RAG-data.
+- **URL-filter:** Avancerade regler för att styra vilka sidor som besöks. Uteslut sidor vars URL innehåller valda nyckelord, eller kräv att URL:en innehåller ett visst ord – användbart för att låsa crawlern till en specifik del av en sajt eller plattform.
+- **Automatisk index-fil:** Genererar en `index.csv` vid körningens slut med en fullständig översikt av alla besökta sidor (URL, titel, datum och filnamn).
+- **Avancerat Skydd:** Inbyggt skydd mot evighetsloopar i sitemap-kedejor, URL-längdsbegränsning, domänspärrning samt hantering av `robots.txt`.
 - **Flera Körlägen:** Stöd för osynligt läge (`headless`), synligt läge (`visible`) eller manuell inloggning innan automatiserad skrapning (`login_then_headless`).
 - **Pausa & Återuppta:** Crawlningen kan pausas och återupptas mitt i körningen utan att data går förlorad.
 - **Utökad Dokumenthantering:** Identifierar och laddar automatiskt ned PDF, DOCX, XLSX, PPTX, CSV, ODT, Markdown m.fl. i en separat mapp. Pågående nedladdningar slutförs alltid säkert innan programmet stängs.
-- **Valbart utdataformat:** Sparar extraherad text som `.md` (Markdown, rekommenderas för AI/LLM) eller `.txt` (klassiskt format) – väljs direkt i GUI:t. Känner igen JavaScript-krav på både svenska och engelska och byter automatiskt till Selenium-rendering.
-- **Crawldjup:** Ny inställning för max länkdjup från startsidan (0 = obegränsat). Förhindrar att crawlern fastnar i djupa, irrelevanta delar av en sajt.
+- **Valbart utdataformat:** Sparar extraherad text som `.md` (Markdown, rekommenderas för AI/LLM) eller `.txt` (klassiskt format) – väljs direkt i GUI:t.
+- **Crawldjup:** Inställning för max länkdjup från startsidan (0 = obegränsat). Förhindrar att crawlern fastnar i djupa, irrelevanta delar av en sajt.
 - **Automatisk retry:** HTTP-anrop återförsöks automatiskt vid tillfälliga nätverksfel med exponentiell backoff – mer stabilt på ostadiga anslutningar.
-- **URL-deduplicering:** `index.html` och `index.php` normaliseras bort automatiskt så att startsidan inte crawlas dubbelt.
+- **URL-deduplicering:** `index.html` och `index.php` normaliseras bort automatiskt så att startsidan inte crawlas dubbelt. Tracking-parametrar som `utm_source`, `fbclid` m.fl. rensas från URL:er.
 - **Minnesövervakning:** Övervakar RAM-användning via `psutil` och utlöser automatisk garbage collection vid >1 500 MB.
 - **Roterande loggfiler:** Körloggar sparas per session med `RotatingFileHandler` (max 5 MB × 2 backupfiler).
 
@@ -64,18 +65,18 @@ pip install -r requirements.txt
 |---|---|
 | `requests` | HTTP-hämtning |
 | `beautifulsoup4` | HTML-parsning |
+| `lxml` | XML-parsning för sitemap-stöd |
 | `selenium` + `webdriver-manager` | JS-rendering via Chrome |
 | `trafilatura` | AI-optimerad textextraktion (rekommenderas starkt) |
 
 **3. Installera valfria beroenden** (aktiverar extrafunktioner):
 ```bash
-pip install psutil pandas
+pip install psutil
 ```
 
 | Paket | Funktion |
 |---|---|
 | `psutil` | Realtidsövervakning av minnesanvändning |
-| `pandas` | Utökad datahantering |
 
 ---
 
@@ -108,11 +109,14 @@ python ultimate-web-crawler.py
 | `login_then_headless` | Öppnar synlig webbläsare i 60 sekunder för manuell inloggning, växlar sedan till osynligt läge med sparade cookies |
 
 **Avancerat:**
-- **Hybrid-motor** – låter programmet välja `requests` eller `Selenium` per sida
-- **Trafilatura** – aktiverar AI-optimerad textextraktion
-- **Sitemap.xml** – förladdas automatiskt för effektivare crawling, inklusive sitemap-index
-- **robots.txt** – respekterar webbplatsens crawling-regler
-- **Uteslut ord i URL** – kommaseparerad lista med nyckelord; sidor vars URL innehåller dessa hoppar över
+| Inställning | Beskrivning |
+|---|---|
+| **Hybrid-motor** | Låter programmet välja `requests` eller `Selenium` per sida |
+| **Trafilatura** | Aktiverar AI-optimerad textextraktion |
+| **Sitemap.xml** | Förladdas automatiskt för effektivare crawling, inklusive sitemap-index |
+| **robots.txt** | Respekterar webbplatsens crawling-regler |
+| **Uteslut ord i URL** | Kommaseparerad lista – sidor vars URL innehåller dessa ord hoppas över |
+| **Kräv ord i URL** | Kommaseparerad lista – crawlern besöker bara sidor vars URL innehåller minst ett av dessa ord. Användbart för att hålla sig till en specifik del av en delad plattform (t.ex. `utb.tyreso.se`) |
 
 ---
 
@@ -120,12 +124,13 @@ python ultimate-web-crawler.py
 
 ```
 crawl_output/
-├── texter/              # En fil per skrapad sida (.md eller .txt beroende på val)
-│   └── sidnamn.md       # Innehåller källa, titel, datum och ren text
-├── dokument/            # Nedladdade PDF, DOCX, XLSX m.m.
+├── texter/                          # En fil per skrapad sida (.md eller .txt)
+│   └── sidnamn_a1b2c3.md
+├── dokument/                        # Nedladdade PDF, DOCX, XLSX m.m.
 ├── logs/
 │   └── crawl_YYYYMMDD_HHMMSS.log
-└── domännamn_cache.db   # SQLite-cache för incremental crawling
+├── index.csv                        # Automatisk översikt: URL, titel, datum, filnamn
+└── domännamn_cache.db               # SQLite-cache för incremental crawling
 ```
 
 Varje textfil inleds med ett metadata-huvud:
@@ -145,10 +150,10 @@ HÄMTAD: 2025-01-01 12:00:00
 | Komponent | Teknik |
 |---|---|
 | GUI | Tkinter + ttk |
-| HTTP-hämtning | Requests (med Session) |
+| HTTP-hämtning | Requests (med Session + automatisk retry) |
 | Textextraktion | BeautifulSoup4 + Trafilatura |
 | JS-rendering | Selenium + ChromeDriverManager |
-| Caching | SQLite3 |
+| Caching | SQLite3 (WAL-läge) |
 | Loggning | RotatingFileHandler |
 | Parallellism | ThreadPoolExecutor (dokumentnedladdning) |
 
