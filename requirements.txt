@@ -6,9 +6,9 @@ selenium
 webdriver-manager
 trafilatura
 customtkinter
-aiohttp
-aiosqlite
-psutil
-uvloop
 
 # Valfria beroenden (aktiverar extrafunktioner)
+aiohttp        # Asynkron motor (kräver Python 3.11+)
+aiosqlite      # Asynkron motor (kräver Python 3.11+)
+psutil         # Realtidsövervakning av minnesanvändning
+uvloop         # Snabbare event loop – endast Linux/macOS
