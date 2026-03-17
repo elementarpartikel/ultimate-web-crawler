@@ -2,11 +2,13 @@
 requests
 beautifulsoup4
 lxml
-selenium
-webdriver-manager
+playwright
 trafilatura
 customtkinter
-
+ 
+# OBS: Efter installation, kör även:
+# playwright install chromium
+ 
 # Valfria beroenden (aktiverar extrafunktioner)
 aiohttp        # Asynkron motor (kräver Python 3.11+)
 aiosqlite      # Asynkron motor (kräver Python 3.11+)
