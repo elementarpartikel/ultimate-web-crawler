@@ -1,4 +1,4 @@
-# 🕸️ Webbdammsugare Pro / Web Crawler Pro v2.0 (AI & RAG Edition)
+# 🕸️ Webbdammsugare Pro / Web Crawler Pro v3.0 (Playwright Edition)
 
 [![Ladda ner .exe för Windows](https://img.shields.io/badge/Ladda_ner-.exe-blue?style=for-the-badge&logo=windows)](https://github.com/elementarpartikel/ultimate-web-crawler/releases/latest)
 
@@ -10,45 +10,45 @@ From v1.7 the interface is fully bilingual. Switch between 🇸🇪 Swedish and 
 
 ---
 
-## 🆕 Nyheter i v2.0
+## 🆕 Nyheter i v3.0
 
-- **Asynkron motor (Experimentell):** En ny motor byggd på `asyncio` och `aiohttp` som aktiveras direkt i GUI:t. Hanterar upp till 50 parallella anslutningar via en inbyggd semaphore, vilket ger dramatiskt högre hastighet på stora sajter. Stödjer manuell inloggning (`login_then_headless`), robots.txt och rekursiva sitemaps. Kräver Python 3.11+ och valfria beroenden `aiohttp` och `aiosqlite`.
-- **`lxml` som HTML-parser:** Hela programmet använder nu `lxml` för HTML-parsning, inte bara sitemaps. Snabbare och mer tolerant mot trasig HTML.
-- **Dokumenträknare i statusraden:** Statistiken visar nu nedladdade dokument separat, vilket ger bättre överblick vid körningar med dokumentnedladdning aktiverat.
-- **Förloppsindikator:** En `CTkProgressBar` visas under körning. När max sidor är angett fylls den proportionellt – vid oändligt läge kör den en löpande animation.
-- **Dubbelklick öppnar URL:** Dubbelklicka på valfri rad i Live Data-tabellen för att öppna sidan direkt i din webbläsare. Praktiskt vid felsökning av sidor med status "Fel".
-- **Anti-stutter:** Loggfönstret trimmas automatiskt vid 500 rader och GUI-kön bearbetar upp till 20 meddelanden per tick.
-- **Användarvänliga körlägen:** De tekniska termerna är ersatta med tydliga beskrivningar på båda språken: *Snabb (dold)*, *Logga in, sen dold* och *Synlig (felsökning)*.
-- **Tvåspråkigt gränssnitt (SV/EN):** Byt språk i realtid via flaggknappen – hela gränssnittet, inklusive körlägesmenyn, uppdateras omedelbart.
-- **Mörkt/Ljust tema:** Switch (🌙 / ☀️) för att växla tema utan omstart. Treeview och scrollbar anpassar sig automatiskt.
+- **Playwright ersätter Selenium:** Hela JS-renderingen är omskriven med [Playwright](https://playwright.dev/python/). Playwright väntar intelligent på att sidan ska bli klar med sina nätverksanrop (`networkidle`) istället för en fast `sleep()`-tid. Mer stabilt, snabbare och hanterar moderna webbplatser med lazy-loading och API-anrop korrekt.
+- **Förbättrat inloggningsflöde:** `login_then_headless`-läget hanteras nu av Playwright med en korrekt context manager. Cookies sparas och förs vidare till både Playwright-kontexten och requests-sessionen – fungerar nu i klassisk och asynkron motor.
+- **Tolerant mot HTTPS-fel:** Playwright-kontexten är konfigurerad med `ignore_https_errors=True`, vilket gör att crawlern fungerar på intranät med självutfärdade certifikat utan att krascha.
+- **Playwright i async-motorn:** Den asynkrona motorn använder `async_playwright` med ett dubbelt asynkront lås som förhindrar att flera tasks skapar webbläsarinstanser parallellt.
 
 ---
 
 ## 🚀 Huvudfunktioner
 
-- **Dubbla motorer:** Välj mellan den klassiska trådade motorn (`requests` + `Selenium`) eller den asynkrona motorn (`aiohttp` + `asyncio`).
-- **Hybridmotor:** Växlar automatiskt mellan snabb HTTP-hämtning och Selenium-rendering för JavaScript-tunga sidor.
-- **Content-Type Routing:** Kontrollerar serverns headers *innan* en fil laddas ned. Mediafiler ignoreras direkt och dokument skickas till dokumenthanteraren.
-- **Selenium PDF-skydd:** Konfigurerar Chrome att aldrig öppna PDF:er i webbläsarfliken.
-- **Smarta filnamn:** Läser `content-disposition`-headern för att hitta det verkliga filnamnet. Unik hash garanterar att inga filer skrivs över.
+- **Dubbla motorer:** Välj mellan den klassiska trådade motorn (`requests` + Playwright) eller den asynkrona motorn (`aiohttp` + `asyncio` + Playwright).
+- **Hybridmotor:** Hämtar sidor med requests/aiohttp och faller automatiskt tillbaka på Playwright-rendering om sidan kräver JavaScript.
+- **Intelligent sidväntan:** Playwright väntar på `networkidle` innan HTML:en läses av – ingen mer gissning med fast väntetid.
+- **Content-Type Routing:** Kontrollerar serverns headers *innan* en fil laddas ned. Mediafiler ignoreras och dokument skickas till dokumenthanteraren.
+- **Smarta filnamn:** Läser `content-disposition`-headern för verkliga filnamn. Unik hash garanterar att inga filer skrivs över.
 - **AI/RAG-Optimerad:** Extraherar ren text rensad från menyer, footers och skräpkod med `Trafilatura`, redo för vektordatabaser.
 - **Intelligent Caching:** SQLite (WAL-läge) med SHA-256-hash för att hoppa över oförändrade sidor. Async-motorn använder `aiosqlite`.
 - **Sitemap-index stöd:** Parsar sitemap-index-filer rekursivt med inbyggt loop-skydd. Async-motorn hämtar undersitemaps parallellt.
 - **Prioriterad URL-kö:** URL:er från `sitemap.xml` bearbetas med högre prioritet.
-- **Canonical-hantering:** Lägger till kanoniska URL:er i kön med hög prioritet och hoppar över originalsidan för att undvika dubbletter.
-- **URL-filter:** Uteslut eller kräv nyckelord i URL:er – användbart för att låsa crawlern till en specifik del av en delad plattform.
+- **Canonical-hantering:** Lägger till kanoniska URL:er i kön och hoppar över originalsidan för att undvika dubbletter.
+- **URL-filter:** Uteslut eller kräv nyckelord i URL:er.
 - **Automatisk index-fil:** Genererar `index.csv` vid körningens slut.
 - **Strikt Domän:** Tvingar crawlern att stanna på exakt angiven domän. Kan stängas av för underdomäner.
-- **Manuell inloggning:** Öppnar synlig webbläsare för inloggning, tar sedan över med sparade cookies. Fungerar i båda motorlägena.
+- **Manuell inloggning:** Playwright öppnar en synlig webbläsare, väntar på OK-klick, sparar sedan cookies och fortsätter osynligt.
 - **Pausa & Återuppta:** Fungerar i båda motorlägena.
 - **Utökad Dokumenthantering:** Laddar ned PDF, DOCX, XLSX, PPTX, CSV, ODT m.fl. Pågående nedladdningar slutförs alltid säkert.
 - **Valbart utdataformat:** `.md` (rekommenderas för AI/LLM) eller `.txt`.
 - **Crawldjup:** Max länknivåer från startsidan (0 = obegränsat).
 - **Automatisk retry:** Exponentiell backoff vid nätverksfel (klassisk motor).
 - **URL-deduplicering:** `index.html`/`index.php` normaliseras bort. Tracking-parametrar som `utm_source`, `fbclid` m.fl. rensas automatiskt.
+- **Förloppsindikator:** Determinate-läge när max sidor är angett, annars löpande animation.
+- **Dubbelklick öppnar URL:** Dubbelklicka i tabellen för att öppna sidan i webbläsaren.
+- **Anti-stutter:** Loggen trimmas vid 500 rader, GUI-kön bearbetar 20 meddelanden per tick.
+- **Tvåspråkigt gränssnitt (SV/EN):** Byt språk i realtid via flaggknappen.
+- **Mörkt/Ljust tema:** Switch (🌙 / ☀️) utan omstart.
 - **Minnesövervakning:** Garbage collection vid >1 500 MB (kräver valfri `psutil`).
 - **Roterande loggfiler:** Per session, max 5 MB × 2 backupfiler.
-- **Trådsäker arkitektur:** `threading.Lock` skyddar databas och nedladdningar i klassisk motor. Async-motorn använder `asyncio.Lock` och `asyncio.Semaphore(50)`.
+- **Trådsäker arkitektur:** `threading.Lock` i klassisk motor, `asyncio.Lock` + `asyncio.Semaphore(50)` i async-motorn.
 
 ---
 
@@ -57,12 +57,9 @@ From v1.7 the interface is fully bilingual. Switch between 🇸🇪 Swedish and 
 | Krav | Detalj |
 |---|---|
 | **Python** | 3.8+ (klassisk motor) / **3.11+** (async-motor) |
-| **Google Chrome** | Måste vara installerat på datorn |
-| **ChromeDriver** | Hanteras automatiskt av `webdriver-manager` |
+| **Chromium** | Installeras via `playwright install chromium` (se nedan) |
 
-> **Obs!** `webdriver-manager` laddar ned rätt ChromeDriver automatiskt. **Google Chrome** måste finnas installerat för hybrid-motorn och headless-lägena.
->
-> Ladda ned Chrome här om det saknas: [google.com/chrome](https://www.google.com/chrome)
+> **Obs!** Playwright laddar ned och hanterar sin egen Chromium-instans – du behöver inte installera Google Chrome manuellt.
 
 ---
 
@@ -84,11 +81,18 @@ pip install -r requirements.txt
 | `requests` | HTTP-hämtning (klassisk motor) |
 | `beautifulsoup4` | HTML-parsning |
 | `lxml` | HTML- och XML-parsning |
-| `selenium` + `webdriver-manager` | JS-rendering via Chrome |
+| `playwright` | JS-rendering, inloggning, networkidle-väntan |
 | `trafilatura` | AI-optimerad textextraktion (rekommenderas starkt) |
 | `customtkinter` | Modernt GUI med mörkt/ljust tema |
 
-**3. Installera valfria beroenden** (aktiverar extrafunktioner):
+**3. Installera Playwrights webbläsare** ⚠️ Obligatoriskt steg:
+```bash
+playwright install chromium
+```
+
+> Detta laddar ned Playwrights egna Chromium-version (~150 MB). Steget behöver bara göras en gång.
+
+**4. Installera valfria beroenden** (aktiverar extrafunktioner):
 ```bash
 pip install aiohttp aiosqlite uvloop psutil
 ```
@@ -135,7 +139,7 @@ python ultimate-web-crawler.py
 | Inställning | Beskrivning |
 |---|---|
 | **Async Mode** | Aktiverar den asynkrona motorn (experimentell, kräver Python 3.11+) |
-| **Hybrid-motor** | Väljer automatiskt HTTP-hämtning eller Selenium per sida |
+| **Hybrid-motor** | Väljer automatiskt HTTP-hämtning eller Playwright per sida |
 | **Trafilatura** | Aktiverar AI-optimerad textextraktion |
 | **Sitemap.xml** | Förladdas rekursivt för effektivare crawling |
 | **robots.txt** | Respekterar webbplatsens crawling-regler |
@@ -178,8 +182,8 @@ HÄMTAD: 2025-01-01 12:00:00
 |---|---|
 | GUI | CustomTkinter (mörkt/ljust tema, tvåspråkigt) |
 | HTTP-hämtning | `requests` (klassisk), `aiohttp` (asynkron) |
+| JS-rendering | Playwright (`networkidle`, sync + async API) |
 | HTML-parsning | `lxml` + BeautifulSoup4, Trafilatura |
-| JS-rendering | Selenium + ChromeDriverManager |
 | Caching | SQLite3/WAL (klassisk), `aiosqlite` (asynkron) |
 | Parallellism | `ThreadPoolExecutor` (klassisk), `asyncio` + `Semaphore(50)` (asynkron) |
 | Loggning | RotatingFileHandler |
