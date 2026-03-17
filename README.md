@@ -1,4 +1,4 @@
-# 🕸️ Webbdammsugare Pro / Web Crawler Pro v2.0 (UI Refresh, uvloop, lxml & AI Edition)
+# 🕸️ Webbdammsugare Pro / Web Crawler Pro v2.0 (AI & RAG Edition)
 
 [![Ladda ner .exe för Windows](https://img.shields.io/badge/Ladda_ner-.exe-blue?style=for-the-badge&logo=windows)](https://github.com/elementarpartikel/ultimate-web-crawler/releases/latest)
 
@@ -12,40 +12,41 @@ From v1.7 the interface is fully bilingual. Switch between 🇸🇪 Swedish and 
 
 ## 🆕 Nyheter i v2.0
 
-- **Förbättrat Gränssnitt:** En stor uppdatering av användargränssnittet med flikar för grundläggande och avancerade inställningar, vilket ger en renare och mer organiserad arbetsyta.
-- **Användarvänliga Körlägen:** De tekniska termerna `headless`, `visible` etc. är utbytta mot mer intuitiva beskrivningar på både svenska och engelska för att underlätta för alla användare.
-- **Asynkron motor (Experimentell):** En helt ny, högpresterande motor byggd på `asyncio`, `aiohttp` och `aiosqlite`. Kan aktiveras i GUI:t och är designad för att hantera hundratals anslutningar samtidigt, vilket dramatiskt ökar hastigheten på stora crawls.
-- **Tvåspråkigt gränssnitt (SV/EN):** Byt språk i realtid direkt i appens huvud-meny via en flaggknapp – hela gränssnittet, alla etiketter, knappar och statistiktext uppdateras omedelbart.
-- **Mörkt/Ljust tema:** En dedikerad switch (🌙 / ☀️) i fönstret låter dig växla tema utan att starta om. Treeview-tabellen anpassar sig automatiskt till valt tema.
-- **Temakonsistent scrollbar:** Treeview använder nu `CTkScrollbar` som matchar det valda temat i stället för systemets standardscrollbar.
+- **Asynkron motor (Experimentell):** En helt ny motor byggd på `asyncio` och `aiohttp` som kan aktiveras direkt i GUI:t. Designad för hög genomströmning – hanterar många anslutningar parallellt för snabbare körningar på stora sajter. Kräver Python 3.11+ och valfria beroenden `aiohttp` och `aiosqlite`.
+- **Förloppsindikator:** En `CTkProgressBar` visas under körning. När max sidor är angett fylls den proportionellt – vid oändligt läge kör den en löpande animation som visar att programmet är aktivt.
+- **Dubbelklick öppnar URL:** Dubbelklicka på valfri rad i Live Data-tabellen för att öppna sidan direkt i din webbläsare. Praktiskt vid felsökning av sidor med status "Fel".
+- **Anti-stutter:** Loggfönstret trimmas automatiskt vid 500 rader och GUI-kön bearbetar upp till 20 meddelanden per tick, vilket förhindrar att gränssnittet hackar vid intensiv crawling.
+- **Användarvänliga körlägen:** De tekniska termerna `headless`/`visible` är ersatta med tydliga beskrivningar på båda språken: *Snabb (dold)*, *Logga in, sen dold* och *Synlig (felsökning)*.
+- **Tvåspråkigt gränssnitt (SV/EN):** Byt språk i realtid via flaggknappen – hela gränssnittet uppdateras omedelbart, inklusive körlägesmenyn som översätts korrekt i båda riktningarna.
+- **Mörkt/Ljust tema:** Switch (🌙 / ☀️) för att växla tema utan omstart. Treeview och scrollbar anpassar sig automatiskt.
 
 ---
 
 ## 🚀 Huvudfunktioner
 
-- **Dubbla motorer:** Välj mellan den klassiska, trådade motorn (`requests` + `Selenium`) eller den nya, blixtsnabba asynkrona motorn (`aiohttp`).
-- **Hybridmotor:** Växlar intelligent mellan blixtsnabb hämtning via `requests`/`aiohttp` och dynamisk rendering via `Selenium` vid behov – ger maximal kompatibilitet med moderna webbplatser.
-- **Content-Type Routing:** Kontrollerar serverns headers *innan* en fil laddas ned. Mediafiler ignoreras direkt och dokument skickas automatiskt till dokumenthanteraren.
-- **Selenium PDF-skydd:** Konfigurerar Chrome att aldrig öppna PDF:er i webbläsarfliken, vilket annars kan få crawlern att fastna.
-- **Smarta filnamn:** Läser `content-disposition`-headern för att hitta det verkliga filnamnet vid nedladdning. Unik hash garanterar att inga filer skrivs över.
+- **Dubbla motorer:** Välj mellan den klassiska trådade motorn (`requests` + `Selenium`) eller den nya asynkrona motorn (`aiohttp` + `asyncio`).
+- **Hybridmotor:** Växlar automatiskt mellan snabb HTTP-hämtning och Selenium-rendering för JavaScript-tunga sidor.
+- **Content-Type Routing:** Kontrollerar serverns headers *innan* en fil laddas ned. Mediafiler ignoreras direkt och dokument skickas till dokumenthanteraren.
+- **Selenium PDF-skydd:** Konfigurerar Chrome att aldrig öppna PDF:er i webbläsarfliken.
+- **Smarta filnamn:** Läser `content-disposition`-headern för att hitta det verkliga filnamnet. Unik hash garanterar att inga filer skrivs över.
 - **AI/RAG-Optimerad:** Extraherar ren text rensad från menyer, footers och skräpkod med `Trafilatura`, redo för vektordatabaser.
-- **Intelligent Caching:** Använder SQLite (WAL-läge) för att spåra innehållsändringar via SHA-256-hash och hoppa över oförändrade sidor (Incremental Crawling).
-- **Sitemap-index stöd:** Parsar sitemap-index-filer rekursivt med inbyggt loop-skydd – fångar alla URL:er även på stora sajter.
-- **Prioriterad URL-kö:** URL:er från `sitemap.xml` bearbetas med högre prioritet för ett strukturerat crawlflöde.
-- **Canonical-hantering:** Lägger till kanoniska URL:er i kön med hög prioritet och hoppar över originalsidan för att undvika dubbletter i RAG-data.
-- **URL-filter:** Uteslut sidor vars URL innehåller valda nyckelord, eller kräv att ett visst ord finns med – användbart för att låsa crawlern till en specifik del av en delad plattform.
-- **Automatisk index-fil:** Genererar `index.csv` vid körningens slut med URL, titel, datum och filnamn för alla besökta sidor.
-- **Strikt Domän:** Tvingar crawlern att stanna på exakt angiven domän. Kan stängas av för att tillåta underdomäner.
-- **Flera Körlägen:** Osynligt (`headless`), synligt (`visible`) eller manuell inloggning med event-baserad väntan (`login_then_headless`).
-- **Pausa & Återuppta:** Körningen kan pausas och återupptas utan att data går förlorad.
-- **Utökad Dokumenthantering:** Laddar ned PDF, DOCX, XLSX, PPTX, CSV, ODT m.fl. Pågående nedladdningar slutförs alltid säkert innan programmet stängs.
-- **Valbart utdataformat:** `.md` (Markdown, rekommenderas för AI/LLM) eller `.txt`.
-- **Crawldjup:** Max antal länknivåer från startsidan (0 = obegränsat).
-- **Automatisk retry:** Återförsöker HTTP-anrop vid nätverksfel med exponentiell backoff.
+- **Intelligent Caching:** SQLite (WAL-läge) med SHA-256-hash för att hoppa över oförändrade sidor (Incremental Crawling). Async-motorn använder `aiosqlite`.
+- **Sitemap-index stöd:** Parsar sitemap-index-filer rekursivt med inbyggt loop-skydd. Async-motorn hämtar undersitemaps parallellt.
+- **Prioriterad URL-kö:** URL:er från `sitemap.xml` bearbetas med högre prioritet.
+- **Canonical-hantering:** Lägger till kanoniska URL:er i kön med hög prioritet och hoppar över originalsidan för att undvika dubbletter.
+- **URL-filter:** Uteslut eller kräv nyckelord i URL:er – användbart för att låsa crawlern till en specifik del av en delad plattform.
+- **Automatisk index-fil:** Genererar `index.csv` vid körningens slut.
+- **Strikt Domän:** Tvingar crawlern att stanna på exakt angiven domän. Kan stängas av för underdomäner.
+- **Manuell inloggning:** Öppnar synlig webbläsare för inloggning, tar sedan över med sparade cookies.
+- **Pausa & Återuppta:** Fungerar i båda motorlägena.
+- **Utökad Dokumenthantering:** Laddar ned PDF, DOCX, XLSX, PPTX, CSV, ODT m.fl. Pågående nedladdningar slutförs alltid säkert.
+- **Valbart utdataformat:** `.md` (rekommenderas för AI/LLM) eller `.txt`.
+- **Crawldjup:** Max länknivåer från startsidan (0 = obegränsat).
+- **Automatisk retry:** Exponentiell backoff vid nätverksfel (trådad motor).
 - **URL-deduplicering:** `index.html`/`index.php` normaliseras bort. Tracking-parametrar som `utm_source`, `fbclid` m.fl. rensas automatiskt.
-- **Minnesövervakning:** Utlöser garbage collection automatiskt vid >1 500 MB RAM-användning (kräver `psutil`).
+- **Minnesövervakning:** Garbage collection vid >1 500 MB (kräver valfri `psutil`).
 - **Roterande loggfiler:** Per session, max 5 MB × 2 backupfiler.
-- **Trådsäker arkitektur:** `threading.Lock` skyddar SQLite-databasen och dokumentnedladdningarna. `RateLimiter` sover utanför låset.
+- **Trådsäker arkitektur:** `threading.Lock` skyddar databas och nedladdningar. `RateLimiter` sover utanför låset.
 
 ---
 
@@ -53,11 +54,11 @@ From v1.7 the interface is fully bilingual. Switch between 🇸🇪 Swedish and 
 
 | Krav | Detalj |
 |---|---|
-| **Python** | 3.8 eller senare |
+| **Python** | 3.8+ (klassisk motor) / **3.11+** (async-motor) |
 | **Google Chrome** | Måste vara installerat på datorn |
 | **ChromeDriver** | Hanteras automatiskt av `webdriver-manager` |
 
-> **Obs!** `webdriver-manager` laddar ned rätt ChromeDriver automatiskt. **Google Chrome** måste finnas installerat för att hybrid-motorn och headless-lägena ska fungera.
+> **Obs!** `webdriver-manager` laddar ned rätt ChromeDriver automatiskt. **Google Chrome** måste finnas installerat för hybrid-motorn och headless-lägena.
 >
 > Ladda ned Chrome här om det saknas: [google.com/chrome](https://www.google.com/chrome)
 
@@ -71,21 +72,29 @@ git clone https://github.com/elementarpartikel/ultimate-web-crawler.git
 cd ultimate-web-crawler
 ```
 
-**2. Installera beroenden:**
+**2. Installera obligatoriska beroenden:**
 ```bash
 pip install -r requirements.txt
 ```
 
 | Paket | Funktion |
 |---|---|
-| `requests` | HTTP-hämtning (trådad motor) |
-| `aiohttp` | Asynkron HTTP-hämtning (async-motor) |
-| `aiosqlite`| Asynkron SQLite-access (async-motor) |
+| `requests` | HTTP-hämtning (klassisk motor) |
 | `beautifulsoup4` | HTML-parsning |
 | `lxml` | XML-parsning för sitemap-stöd |
 | `selenium` + `webdriver-manager` | JS-rendering via Chrome |
 | `trafilatura` | AI-optimerad textextraktion (rekommenderas starkt) |
 | `customtkinter` | Modernt GUI med mörkt/ljust tema |
+
+**3. Installera valfria beroenden** (aktiverar extrafunktioner):
+```bash
+pip install aiohttp aiosqlite uvloop psutil
+```
+
+| Paket | Funktion |
+|---|---|
+| `aiohttp` + `aiosqlite` | Aktiverar den asynkrona motorn (kräver Python 3.11+) |
+| `uvloop` | Snabbare event loop för async-motorn (Linux/macOS) |
 | `psutil` | Realtidsövervakning av minnesanvändning |
 
 ---
@@ -113,31 +122,26 @@ python ultimate-web-crawler.py
 
 **Körlägen / Run Modes:**
 
-| Läge (SV) | Beskrivning |
-|---|---|
-| **Snabb (dold)** | Kör i bakgrunden utan synligt fönster. Snabbast. |
-| **Logga in, sen dold** | Visar först webbläsaren för manuell inloggning, kör sedan i bakgrunden. |
-| **Synlig (felsökning)** | Visar webbläsaren. Användbart för att se vad som händer, men långsammare. |
-
-| Mode (EN) | Description |
-|---|---|
-| **Fast (hidden)** | Runs in the background without a visible window. Fastest option. |
-| **Login, then hidden** | First shows the browser for a manual login, then runs in the background. |
-| **Visible (debugging)** | Shows the browser window. Useful for seeing what's happening, but is slower. |
-
+| Svenska | English | Beskrivning |
+|---|---|---|
+| Snabb (dold) | Fast (hidden) | Kör i bakgrunden utan synligt fönster. Snabbast. |
+| Logga in, sen dold | Login, then hidden | Öppnar synlig webbläsare för manuell inloggning, kör sedan i bakgrunden. |
+| Synlig (felsökning) | Visible (debugging) | Visar webbläsarfönstret. Bra för att förstå vad som händer. |
 
 **Avancerat / Advanced:**
 
 | Inställning | Beskrivning |
 |---|---|
-| **Async Mode** | Aktiverar den nya, snabba asynkrona motorn (experimentell) |
-| **Hybrid-motor** | Väljer automatiskt `requests`/`aiohttp` eller `Selenium` per sida |
+| **Async Mode** | Aktiverar den asynkrona motorn (experimentell, kräver Python 3.11+) |
+| **Hybrid-motor** | Väljer automatiskt HTTP-hämtning eller Selenium per sida |
 | **Trafilatura** | Aktiverar AI-optimerad textextraktion |
 | **Sitemap.xml** | Förladdas rekursivt för effektivare crawling |
 | **robots.txt** | Respekterar webbplatsens crawling-regler |
 | **Strikt Domän** | Tvingar crawlern att stanna på exakt angiven domän |
 | **Uteslut ord i URL** | Kommaseparerad lista – matchande sidor hoppas över |
 | **Kräv ord i URL** | Crawlern besöker bara sidor vars URL innehåller minst ett av dessa ord |
+
+> 💡 **Tips:** Dubbelklicka på valfri rad i Live Data-tabellen för att öppna URL:en i din webbläsare.
 
 ---
 
@@ -170,14 +174,14 @@ HÄMTAD: 2025-01-01 12:00:00
 
 | Komponent | Teknik |
 |---|---|
-| Kärnlogik | `asyncio` (för asynkron motor) |
 | GUI | CustomTkinter (mörkt/ljust tema, tvåspråkigt) |
-| HTTP-hämtning | `requests` (trådad), `aiohttp` (asynkron) |
+| HTTP-hämtning | `requests` (klassisk), `aiohttp` (asynkron) |
 | Textextraktion | BeautifulSoup4 + Trafilatura |
 | JS-rendering | Selenium + ChromeDriverManager |
-| Caching | SQLite3 (trådsäker), `aiosqlite` (asynkron) |
+| Caching | SQLite3/WAL (klassisk), `aiosqlite` (asynkron) |
+| Parallellism | `ThreadPoolExecutor` (klassisk), `asyncio.TaskGroup` (asynkron) |
 | Loggning | RotatingFileHandler |
-| Parallellism | ThreadPoolExecutor, asyncio Tasks |
+| Event loop | `asyncio` (standard), `uvloop` (valfri optimering) |
 
 ---
 
