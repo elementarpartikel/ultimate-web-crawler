@@ -1,10 +1,11 @@
 # Obligatoriska beroenden
 requests
 beautifulsoup4
+lxml
 selenium
 webdriver-manager
 trafilatura
+customtkinter
 
 # Valfria beroenden (aktiverar extrafunktioner)
 # psutil        # Realtidsövervakning av minnesanvändning
-# pandas        # Utökad datahantering
