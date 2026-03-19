@@ -1,0 +1,34 @@
+[
+  {
+    "name": "Skolverket Betyg",
+    "start_url": "https://www.skolverket.se",
+    "require_keywords": ["betyg"],
+    "exclude_keywords": [],
+    "find_sitemap": true,
+    "max_depth": 3,
+    "delay": 1.0,
+    "save_format": ".json", 
+    "download_docs": true,
+    "use_trafilatura": true,
+    "remove_email": true,
+    "remove_phone": true,
+    "remove_pnr": true,
+    "remove_ip": false
+  },
+  {
+    "name": "Tyresö Kommun (Endast Dokument)",
+    "start_url": "https://www.tyreso.se",
+    "require_keywords": [],
+    "exclude_keywords": ["kalender", "politik"],
+    "find_sitemap": true,
+    "max_depth": 1,
+    "delay": 0.5,
+    "save_format": "Ingen text",
+    "download_docs": true,
+    "use_trafilatura": false,
+    "remove_email": false,
+    "remove_phone": false,
+    "remove_pnr": false,
+    "remove_ip": false
+  }
+]
