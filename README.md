@@ -63,18 +63,125 @@
 
 **1. Klona repositoryt:**
 ```bash
-git clone [https://github.com/elementarpartikel/ultimate-web-crawler.git](https://github.com/elementarpartikel/ultimate-web-crawler.git)
+git clone https://github.com/elementarpartikel/ultimate-web-crawler.git
 cd ultimate-web-crawler
-2. Installera obligatoriska beroenden:Bashpip install -r requirements.txt
-PaketFunktionaiohttp + aiosqliteAsynkron HTTP-hämtning och databasbeautifulsoup4 + lxmlHTML- och XML-parsningplaywrightJS-rendering med networkidle-väntantrafilaturaAI-optimerad textextraktioncustomtkinterModernt GUI med mörkt/ljust tema3. Installera Playwrights webbläsare ⚠️ Obligatoriskt steg:Bashplaywright install chromium
-Laddar ned Playwrights Chromium (~150 MB). Görs bara en gång.4. Installera valfria beroenden:Bashpip install uvloop psutil
-PaketFunktionuvloopSnabbare event loop (Linux/macOS)psutilRealtidsövervakning av minnesanvändning🖥️ Användning / UsageBashpython ultimate-web-crawler.py
-GUI-inställningarGrundinställningar / Basic Settings:InställningBeskrivningStartadress / Start URLKomplett URL inklusive https://Fördröjning / DelaySekunder mellan förfrågningar (standard: 0.5 s)Max sidor / Max pages0 = crawla hela sajtenMax djup / Max depthLänknivåer från startsidan (0 = obegränsat)Filformat / File FormatSe tabellen nedanLadda ner dokumentSparar PDF, DOCX m.m. i undermappen dokument/Körläge / Run ModeSe tabellen nedanMapp / FolderKatalog för alla sparade filerUtdataformat / File Formats:FormatBeskrivning.jsonStrukturerad data med sektioner och chunks – rekommenderas för vektordatabaser.mdMarkdown med metadata-huvud – bra för generell LLM-läsning.txtRen textIngen text / No textCrawlar och laddar enbart ned dokument, sparar ingen sidtextKörlägen / Run Modes:SvenskaEnglishBeskrivningSnabb (dold)Fast (hidden)Kör i bakgrunden utan synligt fönster. Snabbast.Logga in, sen doldLogin, then hiddenÖppnar synlig webbläsare för manuell inloggning, kör sedan i bakgrunden.Synlig (felsökning)Visible (debugging)Visar webbläsarfönstret. Bra för att förstå vad som händer.Avancerat / Advanced:InställningBeskrivningHybrid-motorVäljer automatiskt aiohttp eller Playwright per sidaTrafilaturaAktiverar AI-optimerad textextraktionSitemap.xmlFörladdas rekursivt, inklusive gzip-komprimerade sitemapsrobots.txtRespekterar crawling-regler och Crawl-DelayStrikt DomänTvingar crawlern att stanna på exakt angiven domänUteslut ord i URLKommaseparerad lista – matchande sidor hoppas överKräv ord i URLCrawlern besöker bara sidor vars URL innehåller minst ett av dessa ordPII-Tvätt / PII Wash (GDPR):InställningVad som maskerasRadera E-postkontakt@myndighet.se → [E-POST]Radera TelefonnummerSvenska format inkl. landskod och parenteser → [TELEFON]Radera PersonnummerVanliga PNR och samordningsnummer → [PERSONNUMMER]Radera IP-adresserIPv4-adresser → [IP-ADRESS]💡 Tips: Dubbelklicka på valfri rad i Live Data-tabellen för att öppna URL:en i din webbläsare.💻 Serverläge / Server ModeKör crawlern headless med en JSON-konfigurationsfil – perfekt för schemalagd körning med cron eller Task Scheduler:Bashpython ultimate-web-crawler.py --config sites.json
-python ultimate-web-crawler.py --config sites.json --webhook "[https://hooks.slack.com/](https://hooks.slack.com/)..."
-Webhook-URL kan även anges via miljövariabeln WEBHOOK_URL. Max 3 sajter körs parallellt. Varje sajt crawlas i sin egen undermapp under server_data/.Exempel på sites.json (två olika användningsområden):Nedan visas två vanliga konfigurationer. Det första exemplet skrapar data anpassad för RAG/AI där personuppgifter tvättas bort. Det andra exemplet är inställt på att ignorera text helt och istället enbart leta efter och ladda ner dokument.JSON[
+```
+
+**2. Installera beroenden:**
+```bash
+pip install -r requirements.txt
+```
+
+| Paket | Funktion |
+|---|---|
+| `aiohttp` + `aiosqlite` | Asynkron HTTP-hämtning och databas |
+| `beautifulsoup4` + `lxml` | HTML- och XML-parsning |
+| `playwright` | JS-rendering med networkidle-väntan |
+| `trafilatura` | AI-optimerad textextraktion |
+| `customtkinter` | Modernt GUI med mörkt/ljust tema |
+
+**3. Installera Playwrights webbläsare** ⚠️ Obligatoriskt steg:
+```bash
+playwright install chromium
+```
+
+> Laddar ned Playwrights Chromium (~150 MB). Görs bara en gång.
+
+**4. Installera valfria beroenden:**
+```bash
+pip install uvloop psutil
+```
+
+| Paket | Funktion |
+|---|---|
+| `uvloop` | Snabbare event loop (Linux/macOS) |
+| `psutil` | Realtidsövervakning av minnesanvändning |
+
+---
+
+## 🖥️ Användning / Usage
+
+```bash
+python ultimate-web-crawler.py
+```
+
+### GUI-inställningar
+
+**Grundinställningar / Basic Settings:**
+
+| Inställning | Beskrivning |
+|---|---|
+| **Startadress / Start URL** | Komplett URL inklusive `https://` |
+| **Fördröjning / Delay** | Sekunder mellan förfrågningar (standard: 0.5 s) |
+| **Max sidor / Max pages** | `0` = crawla hela sajten |
+| **Max djup / Max depth** | Länknivåer från startsidan (`0` = obegränsat) |
+| **Filformat / File Format** | Se tabellen "Utdataformat" nedan |
+| **Ladda ner dokument** | Sparar PDF, DOCX m.m. i undermappen `dokument/` |
+| **Körläge / Run Mode** | Se tabellen "Körlägen" nedan |
+| **Mapp / Folder** | Katalog för alla sparade filer |
+
+**Utdataformat / File Formats:**
+
+| Format | Beskrivning |
+|---|---|
+| **.json** | Strukturerad data med sektioner och chunks – rekommenderas för vektordatabaser. |
+| **.md** | Markdown med metadata-huvud – bra för generell LLM-läsning. |
+| **.txt** | Ren text. |
+| **Ingen text / No text** | Crawlar och laddar enbart ned dokument, sparar ingen sidtext. |
+
+**Körlägen / Run Modes:**
+
+| Svenska | English | Beskrivning |
+|---|---|---|
+| **Snabb (dold)** | Fast (hidden) | Kör i bakgrunden utan synligt fönster. Snabbast. |
+| **Logga in, sen dold** | Login, then hidden | Öppnar synlig webbläsare för manuell inloggning, kör sedan i bakgrunden. |
+| **Synlig (felsökning)** | Visible (debugging) | Visar webbläsarfönstret. Bra för att förstå vad som händer. |
+
+**Avancerat / Advanced:**
+
+| Inställning | Beskrivning |
+|---|---|
+| **Hybrid-motor** | Väljer automatiskt aiohttp eller Playwright per sida |
+| **Trafilatura** | Aktiverar AI-optimerad textextraktion |
+| **Sitemap.xml** | Förladdas rekursivt, inklusive gzip-komprimerade sitemaps |
+| **robots.txt** | Respekterar crawling-regler och Crawl-Delay |
+| **Strikt Domän** | Tvingar crawlern att stanna på exakt angiven domän |
+| **Uteslut ord i URL** | Kommaseparerad lista – matchande sidor hoppas över |
+| **Kräv ord i URL** | Crawlern besöker bara sidor vars URL innehåller minst ett av dessa ord |
+
+**PII-Tvätt / PII Wash (GDPR):**
+
+| Inställning | Vad som maskeras |
+|---|---|
+| **Radera E-post** | kontakt@myndighet.se → `[E-POST]` |
+| **Radera Telefonnummer** | Svenska format inkl. landskod och parenteser → `[TELEFON]` |
+| **Radera Personnummer** | Vanliga PNR och samordningsnummer → `[PERSONNUMMER]` |
+| **Radera IP-adresser** | IPv4-adresser → `[IP-ADRESS]` |
+
+> 💡 **Tips:** Dubbelklicka på valfri rad i *Live Data*-tabellen för att öppna URL:en i din webbläsare.
+
+---
+
+## 💻 Serverläge / Server Mode
+
+Kör crawlern headless med en JSON-konfigurationsfil – perfekt för schemalagd körning med `cron` eller Task Scheduler:
+
+```bash
+python ultimate-web-crawler.py --config sites.json
+python ultimate-web-crawler.py --config sites.json --webhook "https://hooks.slack.com/..."
+```
+
+> Webhook-URL kan även anges via miljövariabeln `WEBHOOK_URL`. Max 3 sajter körs parallellt. Varje sajt crawlas i sin egen undermapp under `server_data/`.
+
+### Exempel på `sites.json` (två olika användningsområden)
+
+Nedan visas två vanliga konfigurationer. Det första exemplet skrapar data anpassad för RAG/AI där personuppgifter tvättas bort. Det andra exemplet är inställt på att ignorera text helt och istället enbart leta efter och ladda ner dokument.
+
+```json
+[
   {
     "name": "Skolverket Betyg (RAG & AI-text)",
-    "start_url": "[https://www.skolverket.se](https://www.skolverket.se)",
+    "start_url": "https://www.skolverket.se",
     "require_keywords": ["betyg"],
     "exclude_keywords": [],
     "find_sitemap": true,
@@ -90,7 +197,7 @@ Webhook-URL kan även anges via miljövariabeln WEBHOOK_URL. Max 3 sajter körs 
   },
   {
     "name": "Tyresö Kommun (Endast Dokument)",
-    "start_url": "[https://www.tyreso.se](https://www.tyreso.se)",
+    "start_url": "https://www.tyreso.se",
     "require_keywords": [],
     "exclude_keywords": ["kalender", "politik"],
     "find_sitemap": true,
@@ -105,7 +212,14 @@ Webhook-URL kan även anges via miljövariabeln WEBHOOK_URL. Max 3 sajter körs 
     "remove_ip": false
   }
 ]
-📂 Output-strukturcrawl_output/
+```
+
+---
+
+## 📂 Output-struktur
+
+```text
+crawl_output/
 ├── texter/                          # En fil per skrapad sida
 │   └── sidnamn_a1b2c3.json          # eller .md / .txt
 ├── dokument/                        # Nedladdade PDF, DOCX, XLSX m.m.
@@ -113,9 +227,14 @@ Webhook-URL kan även anges via miljövariabeln WEBHOOK_URL. Max 3 sajter körs 
 │   └── crawl_YYYYMMDD_HHMMSS.log
 ├── index.csv                        # Översikt: URL, titel, datum, filnamn
 └── domännamn_cache.db               # SQLite-cache för incremental crawling
-JSON-format per sida (Exempel med PII-tvätt):JSON{
+```
+
+### JSON-format per sida (Exempel med PII-tvätt):
+
+```json
+{
   "title": "Sidonamn - Kontakta oss",
-  "url": "[https://exempel.se/kontakt](https://exempel.se/kontakt)",
+  "url": "https://exempel.se/kontakt",
   "crawled_at": "2026-01-01T12:00:00",
   "description": "Meta-beskrivning utan [PERSONNUMMER]",
   "keywords": ["nyckelord", "kontakt"],
@@ -126,4 +245,15 @@ JSON-format per sida (Exempel med PII-tvätt):JSON{
     "Överlappande textblock för RAG..."
   ]
 }
-🏗️ Teknisk StackKomponentTeknikGUICustomTkinter (grid-layout, mörkt/ljust tema, tvåspråkigt)HTTP-hämtningaiohttp (asynkron, 100 anslutningar)JS-renderingPlaywright (networkidle, max 5 parallella flikar)HTML-parsninglxml + BeautifulSoup4, TrafilaturaChunkingOverlapping semantic chunking (400 ord, 50 ords överlapp)PII-tvättRegex för e-post, telefon, PNR/samordningsnummer, IPCachingaiosqlite (WAL-läge)Parallellismasyncio.TaskGroup + Semaphore(50)LoggningRotatingFileHandlerEvent loopasyncio (standard), uvloop (valfri optimering)⚖️ Etik och AnsvarDetta verktyg är utvecklat för laglig och etisk datainsamling. Användaren ansvarar för att:Följa webbplatsens användarvillkor.Inte överbelasta servrar – använd den inbyggda fördröjningsfunktionen.Respektera de begränsningar som anges i robots.txt.Säkerställa att insamlad data hanteras i enlighet med GDPR och tillämplig lagstiftning.
+```
+
+---
+
+## ⚖️ Etik och Ansvar
+
+Detta verktyg är utvecklat för laglig och etisk datainsamling. Användaren ansvarar för att:
+
+- Följa webbplatsens användarvillkor.
+- Inte överbelasta servrar – använd den inbyggda fördröjningsfunktionen.
+- Respektera de begränsningar som anges i `robots.txt`.
+- Säkerställa att insamlad data hanteras i enlighet med GDPR och tillämplig lagstiftning.
