@@ -1,0 +1,16 @@
+# Obligatoriska beroenden
+aiohttp
+aiosqlite
+beautifulsoup4
+lxml
+playwright
+requests
+trafilatura
+customtkinter
+
+# OBS: Efter installation, kör även:
+# playwright install chromium
+
+# Valfria beroenden (aktiverar extrafunktioner)
+# uvloop       # Snabbare event loop – endast Linux/macOS
+# psutil       # Realtidsövervakning av minnesanvändning
