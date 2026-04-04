@@ -12,7 +12,8 @@
 
 - **Strukturerade chunks:** Varje chunk är nu ett objekt med `heading`, `content`, `chunk_index` och `total_chunks` – redo för RAG-pipelines som behöver rubrikkontext och positionsdata.
 - **Absoluta länkar i chunks:** Alla relativa länkar görs absoluta vid extraktion. Gäller både Trafilatura-vägen och fallback-parsern, så att en AI-assistent kan hänvisa vidare med fungerande URL:er.
-- **Mallar via sites.json:** Lägg en `sites.json` i samma mapp som programmet. En dropdown visas i GUI:t där du väljer mall – alla fält fylls i automatiskt. Samma fil fungerar i serverläge (`--config`).
+- **Mallar via sites.json:** Lägg en `sites.json` i samma mapp som programmet (eller `.exe`-filen). En dropdown visas i GUI:t där du väljer mall – alla fält fylls i automatiskt. Sparmappen sätts automatiskt till en undermapp baserad på mallens namn (t.ex. `crawl_output/skolverket`). Samma fil fungerar i serverläge (`--config`).
+- **Snabbare crawlning:** HTML-parsning (BeautifulSoup/Trafilatura) körs nu i en bakgrundstråd via `asyncio.to_thread()`, så att nätverksanrop kan fortsätta parallellt under tunga sidbearbetningar.
 - **Sessionsdetektering:** Crawlern upptäcker automatiskt om en intranäts-session har löpt ut (inloggningssida returneras) och loggar det som varning istället för att spara skräpdata.
 - **Kraschsäker TaskGroup:** `bounded_process` fångar nu `CancelledError` och oväntade undantag separat, så att ett enstaka sidfel inte dödar hela crawlen.
 - **Korrekt cookie-överföring:** Playwright-cookies överförs nu korrekt till aiohttp-sessionen via Cookie-header, inklusive domäninformation.
@@ -24,7 +25,7 @@
 
 ## 🚀 Huvudfunktioner
 
-- **Ren async-arkitektur:** Byggd på `asyncio` och `aiohttp` med upp till 10 parallella HTTP-anslutningar och separata Playwright-semaforer (max 2) för stabilitet.
+- **Ren async-arkitektur:** Byggd på `asyncio` och `aiohttp` med upp till 10 parallella HTTP-anslutningar och separata Playwright-semaforer (max 2) för stabilitet. HTML-parsning körs i bakgrundstråd för att inte blockera nätverksanrop.
 - **Playwright-rendering:** Faller automatiskt tillbaka på Playwright (`networkidle`-väntan) för JS-tunga sidor. En enda webbläsarinstans återanvänds under hela körningen.
 - **Hybridmotor:** Hämtar sidor snabbt med aiohttp och använder Playwright bara när sidan kräver det.
 - **Per-domän rate limiting:** Respekterar `Crawl-Delay` från `robots.txt` och håller en konfigurerbar fördröjning per domän.
@@ -106,7 +107,7 @@ python ultimate-web-crawler.py
 
 ### Mallar / Templates
 
-Lägg en `sites.json` i samma mapp som `ultimate-web-crawler.py`. En **📋 Mall**-dropdown visas automatiskt i GUI:t. Välj en mall, välj mapp och klicka Starta – alla inställningar fylls i från filen.
+Lägg en `sites.json` i samma mapp som `ultimate-web-crawler.py` (eller `.exe`-filen). En **📋 Mall**-dropdown visas automatiskt i GUI:t. Välj en mall och klicka Starta – alla inställningar fylls i och sparmappen sätts automatiskt till en undermapp baserad på mallens namn (t.ex. `crawl_output/skolverket`).
 
 Samma `sites.json` fungerar i serverläge med `--config`. Se "Serverläge" nedan.
 
