@@ -1,0 +1,22 @@
+# Obligatoriska beroenden
+aiohttp
+aiosqlite
+beautifulsoup4
+lxml
+playwright
+requests
+trafilatura
+customtkinter
+
+# OBS: Efter installation, kör även:
+# playwright install chromium
+
+# Dokumentkonvertering (valfritt – aktiverar PDF/Word/Excel/PPTX → Markdown)
+# PyMuPDF          # PDF-textextraktion
+# python-docx      # Word (.docx/.dotx)
+# openpyxl         # Excel (.xlsx)
+# python-pptx      # PowerPoint (.pptx)
+
+# Övriga valfria beroenden
+# uvloop           # Snabbare event loop – endast Linux/macOS
+# brotli           # Brotli-komprimering i HTTP-svar
