@@ -20,7 +20,8 @@
     "remove_email": true,
     "remove_phone": true,
     "remove_pnr": true,
-    "remove_ip": false
+    "remove_ip": false,
+    "keep_role_emails": true
   },
   {
     "name": "SKR (Dokument + Markdown)",
@@ -37,6 +38,7 @@
     "use_trafilatura": false,
     "download_docs": true,
     "convert_docs_to_md": true,
+    "max_download_mb": 50,
     "strict_domain": true,
     "exclude_keywords": [],
     "require_keywords": [],
@@ -44,5 +46,31 @@
     "remove_phone": false,
     "remove_pnr": false,
     "remove_ip": false
+  },
+  {
+    "name": "Kommun-intranät (inloggning, schemalagd)",
+    "start_url": "https://intranat.kommun.se",
+    "delay": 1.0,
+    "max_pages": 0,
+    "max_depth": 0,
+    "concurrency": 5,
+    "save_format": ".md",
+    "headless_mode": "login_then_headless",
+    "cookie_file": "C:/secure/intranat-cookies.json",
+    "find_sitemap": true,
+    "respect_robots": false,
+    "use_hybrid": true,
+    "use_trafilatura": true,
+    "download_docs": true,
+    "convert_docs_to_md": true,
+    "strict_domain": true,
+    "allowed_domains": [],
+    "ignore_https_errors": false,
+    "exclude_keywords": ["logout", "kalender", "arkiv"],
+    "require_keywords": [],
+    "remove_email": true,
+    "remove_phone": true,
+    "remove_pnr": true,
+    "remove_ip": true
   }
 ]

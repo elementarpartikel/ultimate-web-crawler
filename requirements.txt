@@ -1,22 +1,30 @@
 # Obligatoriska beroenden
-aiohttp
-aiosqlite
-beautifulsoup4
-lxml
-playwright
-requests
-trafilatura
-customtkinter
+aiohttp>=3.9
+aiosqlite>=0.19
+beautifulsoup4>=4.12
+lxml>=5.0
+playwright>=1.40
+trafilatura>=1.8
+customtkinter>=5.2      # endast för GUI:t; serverläget (--config) fungerar utan
+defusedxml>=0.7         # säker XML-tolkning av sitemaps
+protego>=0.3            # robots.txt med * och $ i reglerna
 
 # OBS: Efter installation, kör även:
-# playwright install chromium
+#   playwright install chromium
 
-# Dokumentkonvertering (valfritt – aktiverar PDF/Word/Excel/PPTX → Markdown)
-# PyMuPDF          # PDF-textextraktion
-# python-docx      # Word (.docx/.dotx)
-# openpyxl         # Excel (.xlsx)
-# python-pptx      # PowerPoint (.pptx)
+# Dokumentkonvertering (PDF/Word/Excel/PowerPoint → Markdown).
+# Påslaget som standard i GUI:t, så installera dem om du vill ha texten ur dokument.
+PyMuPDF>=1.24           # PDF-textextraktion (OCR kräver dessutom Tesseract, se README)
+python-docx>=1.1        # Word (.docx/.dotx)
+openpyxl>=3.1           # Excel (.xlsx)
+python-pptx>=0.6.23     # PowerPoint (.pptx)
 
 # Övriga valfria beroenden
 # uvloop           # Snabbare event loop – endast Linux/macOS
 # brotli           # Brotli-komprimering i HTTP-svar
+
+# Äldre format (.doc, .xls, .ppt, .odt, .rtf) konverteras automatiskt om
+# LibreOffice ("soffice") finns installerat och ligger i PATH.
+
+# Utveckling
+# pytest           # python -m pytest tests -q

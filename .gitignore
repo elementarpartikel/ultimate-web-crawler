@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+backup/
+crawl_output/
+server_data/
+sites.json
+*.cookies.json
+cookies.json
+*.db
+*.db-wal
+*.db-shm
+*.tmp
+*.part
