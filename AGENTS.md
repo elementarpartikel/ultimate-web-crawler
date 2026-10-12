@@ -21,6 +21,7 @@ loggmeddelanden och användartexter på svenska, och lägg till engelsk översä
 | `sites.example.json` | Mallar. Kopieras till `sites.json` (läses av GUI:t och `--config`). `sites.json` är gitignorerad. |
 | `requirements.txt` | Beroenden med nedre gränser. |
 | `README.md` | Användardokumentation (sv). Uppdatera vid nya config-nycklar eller ändrad utdata. |
+| `README.en.md` | Engelsk användardokumentation. Håll innehåll och språkval synkroniserade med README.md. |
 
 Git-repo: https://github.com/elementarpartikel/ultimate-web-crawler. Miljö: Windows 11, Python 3.11+
 (använder `asyncio.TaskGroup`; testat på 3.14).

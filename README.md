@@ -1,5 +1,7 @@
 # 🕸️ Webbdammsugare Pro / Web Crawler Pro v7.1
 
+**Svenska** | [English](README.en.md)
+
 ![Skärmdump av GUI](screenshots/gui_preview.png)
 
 **Webbdammsugare Pro** är ett professionellt verktyg för att skrapa, strukturera och lagra innehåll från webbplatser – särskilt framtaget för att generera högkvalitativ textdata för AI-modeller, RAG-pipelines och vektordatabaser.
