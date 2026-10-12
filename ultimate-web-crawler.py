@@ -31,11 +31,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import csv
 import hashlib
 import ipaddress
+import io
 import json
 import logging
+import math
 import os
 import posixpath
 import queue
@@ -49,16 +52,49 @@ import tempfile
 import threading
 import time
 import zlib
+import uuid
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from email.utils import parsedate_to_datetime
 from http.cookies import SimpleCookie
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 
 from bs4 import BeautifulSoup, Comment
+from crawler_runtime import ConversionProcessRunner, PublicationWorkspace, remove_tree, blocking_complete
+
+from crawler_text import (LogLevel, slugify, metadata_line, file_sha256, markdown_table,
+                          downgrade_body_h1, atomic_write_text, detect_prompt_injection,
+                          clean_pii_text, ROLE_MAILBOX_LOCALPARTS, _INJECTION_RE,
+                          _is_table_row, _is_table_sep, _split_long_text)
+from document_conversion import (DocumentConverter, convert_document_result, HAS_PYMUPDF,
+                                 HAS_DOCX, HAS_OPENPYXL, HAS_PPTX)
+import document_conversion
+try:
+    if HAS_PYMUPDF:
+        pymupdf = document_conversion.pymupdf
+except ImportError:
+    HAS_PYMUPDF = False
+try:
+    if HAS_DOCX:
+        DocxDocument = document_conversion.DocxDocument
+except ImportError:
+    HAS_DOCX = False
+try:
+    if HAS_OPENPYXL:
+        xl_load_workbook = document_conversion.xl_load_workbook
+except ImportError:
+    HAS_OPENPYXL = False
+try:
+    if HAS_PPTX:
+        PptxPresentation = document_conversion.PptxPresentation
+except ImportError:
+    HAS_PPTX = False
 
 VERSION = "7.1"
 DEFAULT_USER_AGENT = ("UltimateWebCrawler/7.1 "
@@ -117,33 +153,9 @@ try:
 except ImportError:
     HAS_BROTLI = False
 
-try:
-    import pymupdf  # PyMuPDF >= 1.24 (nytt importnamn)
-    HAS_PYMUPDF = True
-except ImportError:
-    try:
-        import fitz as pymupdf  # äldre PyMuPDF-versioner
-        HAS_PYMUPDF = True
-    except ImportError:
-        HAS_PYMUPDF = False
 
-try:
-    from docx import Document as DocxDocument
-    HAS_DOCX = True
-except ImportError:
-    HAS_DOCX = False
 
-try:
-    from openpyxl import load_workbook as xl_load_workbook
-    HAS_OPENPYXL = True
-except ImportError:
-    HAS_OPENPYXL = False
 
-try:
-    from pptx import Presentation as PptxPresentation
-    HAS_PPTX = True
-except ImportError:
-    HAS_PPTX = False
 
 try:
     import defusedxml.ElementTree as SafeET
@@ -157,11 +169,6 @@ try:
 except ImportError:
     HAS_PROTEGO = False
 
-try:
-    from docx.table import Table as DocxTable
-    from docx.text.paragraph import Paragraph as DocxParagraph
-except ImportError:
-    DocxTable = DocxParagraph = None
 
 if HAS_GUI:
     ctk.set_appearance_mode("Light")
@@ -170,11 +177,6 @@ if HAS_GUI:
 # ─────────────────────────────────────────────────────────────
 #  ENUMS OCH DATACLASSES
 # ─────────────────────────────────────────────────────────────
-class LogLevel(Enum):
-    DEBUG = logging.DEBUG
-    INFO = logging.INFO
-    WARNING = logging.WARNING
-    ERROR = logging.ERROR
 
 
 class CrawlPriority(Enum):
@@ -219,11 +221,6 @@ class CrawlStats:
 # ─────────────────────────────────────────────────────────────
 #  HJÄLPFUNKTIONER & CHUNKING
 # ─────────────────────────────────────────────────────────────
-def slugify(text: str) -> str:
-    text = str(text).replace('å', 'a').replace('ä', 'a').replace('ö', 'o')
-    text = text.replace('Å', 'A').replace('Ä', 'A').replace('Ö', 'O')
-    text = re.sub(r'[^\w\s-]', '', text)
-    return re.sub(r'[-\s]+', '-', text).strip('-').lower()
 
 
 # Standard-parametrar som aldrig påverkar sidans innehåll och därför ska strippas
@@ -295,10 +292,19 @@ def normalize_url(url: str,
         return url.strip()
 
 
+def request_url(url: str) -> str:
+    """Behåll serverns sökväg och query; fragment skickas aldrig till servern."""
+    return urlparse(url.strip())._replace(fragment='').geturl()
+
+
 def get_clean_hash(text: str) -> str:
     """Stabil hash av text efter normalisering av whitespace."""
-    clean_text = re.sub(r'\s+', '', text).lower()
+    clean_text = re.sub(r'\s+', ' ', text).strip().lower()
     return hashlib.sha256(clean_text.encode('utf-8')).hexdigest()
+
+
+
+
 
 
 def stable_filename(url: str, save_format: str) -> str:
@@ -309,50 +315,54 @@ def stable_filename(url: str, save_format: str) -> str:
     return f"{path_slug}_{url_digest}{save_format}"
 
 
-def _split_long_text(text: str, max_words: int, overlap_words: int) -> List[str]:
-    """Delar en lång text radvis (bevarar tabeller, listor och stycken).
 
-    Rader längre än `max_words` delas på ord. Överlappet består av hela rader
-    från slutet av föregående del (upp till `overlap_words` ord).
-    """
-    units: List[str] = []
-    for line in text.split("\n"):
-        words = line.split()
-        if len(words) <= max_words:
-            units.append(line)
+
+
+
+
+
+def _merge_small_sections(sections: List[Dict], min_words: int, max_words: int) -> List[Dict]:
+    """Slå bara ihop intilliggande syskon inom samma dokumentdel och sida/bild."""
+    groups = []
+
+    def key(sec):
+        path = sec.get('path') or sec.get('heading', 'Huvudinnehåll')
+        return (path.rpartition(' > ')[0], sec.get('page_number'),
+                sec.get('slide_number'), sec.get('section_group'))
+
+    def size(group):
+        return sum(len(sec['text'].split()) + (len(sec.get('heading', '').split())
+                                              if len(group) > 1 else 0) for sec in group)
+
+    for original in sections:
+        if not original.get('text', '').strip():
+            continue
+        sec = dict(original)
+        if (groups and key(groups[-1][-1]) == key(sec)
+                and (size(groups[-1]) < min_words or len(sec['text'].split()) < min_words)
+                and size(groups[-1] + [sec]) <= max_words):
+            groups[-1].append(sec)
         else:
-            for i in range(0, len(words), max_words):
-                units.append(" ".join(words[i:i + max_words]))
-
-    parts: List[str] = []
-    cur: List[str] = []
-    cur_words = 0
-    new_units = 0          # enheter i `cur` som inte bara är överlapp
-    for unit in units:
-        n = len(unit.split())
-        if cur and cur_words + n > max_words and new_units:
-            parts.append("\n".join(cur).strip())
-            overlap: List[str] = []
-            ow = 0
-            for prev in reversed(cur):
-                pw = len(prev.split())
-                if ow + pw > overlap_words:
-                    break
-                overlap.insert(0, prev)
-                ow += pw
-            cur, cur_words, new_units = overlap, ow, 0
-        cur.append(unit)
-        cur_words += n
-        new_units += 1
-    if cur and new_units:
-        parts.append("\n".join(cur).strip())
-    return [p for p in parts if p]
+            groups.append([sec])
+    merged = []
+    for group in groups:
+        if len(group) == 1:
+            merged.append(group[0])
+            continue
+        paths = list(dict.fromkeys(sec.get('path') or sec.get('heading', 'Huvudinnehåll') for sec in group))
+        parent = key(group[0])[0]
+        headings = list(dict.fromkeys(sec.get('heading', 'Huvudinnehåll') for sec in group))
+        merged.append({**group[0], 'heading': ' / '.join(headings),
+                       'path': parent or ' / '.join(headings), 'heading_paths': paths,
+                       'text': '\n\n'.join(f"**{sec.get('heading', 'Huvudinnehåll')}**\n\n{sec['text'].strip()}"
+                                           for sec in group)})
+    return merged
 
 
 def semantic_chunk_text(sections: List[Dict], max_words: int = 400,
                         overlap_words: int = 50,
                         source_url: Optional[str] = None,
-                        title: str = "") -> List[Dict]:
+                        title: str = "", min_words: int = 80) -> List[Dict]:
     """Chunkar strukturerade sektioner till {heading, content, url}-objekt.
 
     `source_url` injiceras i varje chunk under nyckeln `url`. Det är harmlöst
@@ -363,15 +373,18 @@ def semantic_chunk_text(sections: List[Dict], max_words: int = 400,
     Sektioner kan ha nyckeln `path` (rubrikväg, t.ex. "Skola > Förskola").
     Den bevaras som `heading_path` och `context` ("Titel > Rubrikväg") i varje
     chunk så att en ensam chunk går att förstå utan resten av sidan.
+    Dubbleringar ("Avgifter > Avgifter") tvättas automatiskt.
+    För dokument bevaras även `page_number` och käll-URL berikas med #page=X.
     """
     if not sections:
         return []
 
     chunks = []
-    for sec in sections:
+    for sec in _merge_small_sections(sections, min(min_words, max_words), max_words):
         heading = sec.get("heading", "Huvudinnehåll")
         path = sec.get("path") or heading
         text = sec.get("text", "").strip()
+        page_num = sec.get("page_number")
         if not text:
             continue
 
@@ -381,7 +394,26 @@ def semantic_chunk_text(sections: List[Dict], max_words: int = 400,
             chunk_heading = heading if part_num == 1 else f"{heading} (del {part_num})"
             chunk = {"heading": chunk_heading, "content": piece,
                      "heading_path": path}
-            chunk["context"] = f"{title} > {path}" if title else path
+            if page_num is not None:
+                chunk["page_number"] = page_num
+            if sec.get('slide_number') is not None:
+                chunk['slide_number'] = sec['slide_number']
+            if sec.get('heading_paths'):
+                chunk['heading_paths'] = sec['heading_paths']
+
+            # Undvik stutter som "Avgifter > Avgifter" eller "Avgifter > Avgifter > Förskola"
+            if title and path:
+                clean_title = title.strip()
+                clean_path = path.strip()
+                if clean_path == clean_title:
+                    chunk["context"] = clean_title
+                elif clean_path.startswith(f"{clean_title} > "):
+                    chunk["context"] = clean_path
+                else:
+                    chunk["context"] = f"{clean_title} > {clean_path}"
+            else:
+                chunk["context"] = (title or path or "Huvudinnehåll").strip()
+
             chunks.append(chunk)
 
     total = len(chunks)
@@ -390,6 +422,9 @@ def semantic_chunk_text(sections: List[Dict], max_words: int = 400,
         chunk["total_chunks"] = total
         if source_url:
             chunk["url"] = source_url
+            p_num = chunk.get("page_number")
+            if p_num is not None:
+                chunk["page_url"] = f"{source_url}#page={p_num}" if "#page=" not in source_url else source_url
     return chunks
 
 
@@ -405,8 +440,12 @@ def markdown_to_plain(text: str) -> str:
 
 def markdown_file_to_chunks(text: str, is_document: bool = False) -> Tuple[Dict, List[Dict]]:
     """Läser en av crawlerns .md-filer och returnerar (metadata, chunks)."""
+    parts = text.split('\n---\n')
+    header = parts[0]
+
     def field(label: str) -> str:
-        m = re.search(r'^\*\*' + re.escape(label) + r':\*\*\s*(.+)$', text, re.MULTILINE)
+        # Brödtexten får inte kunna fylla i eller förfalska dokumentets metadata.
+        m = re.search(r'^\*\*' + re.escape(label) + r':\*\*[ \t]*(.+)$', header, re.MULTILINE)
         return m.group(1).strip() if m else ""
 
     title_match = re.match(r'#\s+(.+)', text)
@@ -415,9 +454,18 @@ def markdown_file_to_chunks(text: str, is_document: bool = False) -> Tuple[Dict,
     doc_url = field("Dokument-URL")
     url = doc_url if (is_document and doc_url) else source
 
+    raw_flags = field("Flaggor")
+    flags = [f.strip() for f in raw_flags.split(",") if f.strip()] if raw_flags else []
+
     # Brödtexten ligger mellan första och sista "---"-raden
-    parts = text.split("\n---\n")
     body = "\n---\n".join(parts[1:-1]) if len(parts) >= 3 else text
+    if is_document:
+        repeated = {f'**Dokument:** {title}', f'**Källa:** {source or url}',
+                    f'**Dokument-URL:** {url}'}
+        for label in ('Hämtad', 'Dokumentets ändringsdatum', 'Serverns ändringsdatum', 'Skapad'):
+            if field(label):
+                repeated.add(f'**{label}:** {field(label)}')
+        body = '\n'.join(line for line in body.splitlines() if line not in repeated)
 
     sections: List[Dict] = []
     stack: List[Tuple[int, str]] = []
@@ -434,8 +482,32 @@ def markdown_file_to_chunks(text: str, is_document: bool = False) -> Tuple[Dict,
         else:
             heading, content = "Huvudinnehåll", raw
         if content:
-            sections.append({"heading": heading, "text": content,
-                             "path": " > ".join(h[1] for h in stack) or heading})
+            page_num, slide_num = None, None
+            if is_document:
+                for heading_level, h_text in reversed(stack):
+                    if heading_level != 2:
+                        continue
+                    page_m = ((re.search(r'\s[–—-]\sSida\s+(\d+)\s*$', h_text, re.IGNORECASE)
+                               or re.match(r'^Sida\s+(\d+)\b', h_text, re.IGNORECASE))
+                              if not field('Filtyp') or 'PDF' in field('Filtyp') else None)
+                    if page_m:
+                        page_num = int(page_m.group(1))
+                        break
+                    slide_m = ((re.search(r'\s[–—-]\sBild\s+(\d+)\s*$', h_text, re.IGNORECASE)
+                                or re.match(r'^Bild\s+(\d+)\b', h_text, re.IGNORECASE))
+                               if not field('Filtyp') or 'PowerPoint' in field('Filtyp') else None)
+                    if slide_m:
+                        slide_num = int(slide_m.group(1))
+                        break
+            sec_dict = {"heading": heading, "text": content,
+                        "path": " > ".join(h[1] for h in stack) or heading}
+            if page_num is not None:
+                sec_dict["page_number"] = page_num
+            if slide_num is not None:
+                sec_dict['slide_number'] = slide_num
+            if is_document and 'Excel' in field('Filtyp') and stack:
+                sec_dict['section_group'] = stack[0][1]
+            sections.append(sec_dict)
 
     meta = {
         "url": url,
@@ -445,8 +517,33 @@ def markdown_file_to_chunks(text: str, is_document: bool = False) -> Tuple[Dict,
         "language": field("Språk"),
         "modified_date": field("Senast ändrad"),
         "crawled_at": field("Hämtad"),
+        "flags": flags,
     }
+    if is_document:
+        meta.update(document_modified_at=field('Dokumentets ändringsdatum'),
+                    server_modified_at=field('Serverns ändringsdatum'),
+                    created_at=field('Skapad'), fetched_at=field('Hämtad'))
     return meta, semantic_chunk_text(sections, source_url=url, title=title)
+
+
+def plain_file_to_chunks(text: str) -> Tuple[Dict, List[Dict]]:
+    """Läser textformatets käll- och kvalitetsmetadata utan att tappa brödtexten."""
+    parts = text.split('\n---\n')
+    header = parts[0].strip().splitlines()
+    title = header[0] if header else ''
+    fields = {}
+    for line in header[1:]:
+        key, separator, value = line.partition(':')
+        if separator:
+            fields[key.strip()] = value.strip()
+    body = '\n---\n'.join(parts[1:-1]) if len(parts) >= 3 else text
+    flags = [flag.strip() for flag in fields.get('Flaggor', '').split(',') if flag.strip()]
+    meta = {'url': fields.get('Källa', ''), 'title': title, 'source_type': 'page',
+            'referer_url': '', 'language': fields.get('Språk', ''),
+            'modified_date': fields.get('Senast ändrad', fields.get('Publicerad', '')),
+            'crawled_at': fields.get('Hämtad', ''), 'flags': flags}
+    return meta, semantic_chunk_text([{'heading': 'Huvudinnehåll', 'text': body}],
+                                     source_url=meta['url'], title=title)
 
 
 def csv_safe(value) -> str:
@@ -455,14 +552,10 @@ def csv_safe(value) -> str:
     return "'" + v if v[:1] in ("=", "+", "-", "@", "\t", "\r") else v
 
 
+
+
 # Funktionsbrevlådor är inte personuppgifter och är ofta exakt det en användare
 # av Svea letar efter. Bevaras bara om `keep_role_emails` är påslaget.
-ROLE_MAILBOX_LOCALPARTS = {
-    'info', 'kontakt', 'registrator', 'kommun', 'kommunen', 'vaxel', 'växel',
-    'support', 'kundtjanst', 'kundservice', 'medborgarservice', 'miljo',
-    'bygglov', 'socialtjanst', 'skola', 'bibliotek', 'press', 'media',
-    'webb', 'webmaster', 'servicecenter', 'diarium', 'kansli', 'hr',
-}
 
 
 def absolutize_markdown_links(text: str, base_url: str) -> str:
@@ -516,14 +609,6 @@ def strip_cms_boilerplate(text: str) -> str:
     return cleaned.strip()
 
 
-def downgrade_body_h1(text: str) -> str:
-    """Ändra alla # (H1) till ## (H2) i brödtext.
-
-    Crawlern sätter redan sin egen "# Titel" i filen, så H1-rubriker
-    i den extraherade brödtexten blir dubbletter. Nedgradering till H2
-    bevarar den visuella strukturen utan att förvirra RAG-chunkning.
-    """
-    return re.sub(r'^# ', '## ', text, flags=re.MULTILINE)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -578,6 +663,13 @@ class AsyncCrawlDatabase:
             await self.conn.execute("ALTER TABLE page_cache ADD COLUMN links_json TEXT")
         if 'filename' not in cols:
             await self.conn.execute("ALTER TABLE page_cache ADD COLUMN filename TEXT")
+        # Äldre poster saknar säker tid för en verklig HTTP-kontroll: kontrollera
+        # dem igen i stället för att ärva crawled_at från ett sitemap-hopp.
+        for name in ('fetched_at', 'checked_at', 'fetch_url', 'source_url', 'processing_profile', 'output_hash'):
+            if name not in cols:
+                await self.conn.execute(f"ALTER TABLE page_cache ADD COLUMN {name} TEXT")
+        if 'rendered' not in cols:
+            await self.conn.execute('ALTER TABLE page_cache ADD COLUMN rendered INTEGER DEFAULT 0')
         await self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_page_cache_hash ON page_cache(content_hash)")
         await self.conn.execute('''
@@ -593,12 +685,20 @@ class AsyncCrawlDatabase:
                 downloaded_at TEXT
             )
         ''')
+        async with self.conn.execute("PRAGMA table_info(doc_cache)") as cur:
+            doc_cols = {row[1] for row in await cur.fetchall()}
+        for name in ('content_hash', 'converted_hash', 'md_filename', 'conversion_profile',
+                     'fetched_at', 'conversion_context'):
+            if name not in doc_cols:
+                await self.conn.execute(f"ALTER TABLE doc_cache ADD COLUMN {name} TEXT")
         await self.conn.commit()
 
     async def get_cache(self, url: str) -> Optional[Dict]:
         async with self.conn.execute(
             "SELECT content_hash, title, crawled_at, content_length, etag, "
-            "last_modified, links_json, filename FROM page_cache WHERE url = ?", (url,)
+            "last_modified, links_json, filename, fetched_at, checked_at, "
+            "fetch_url, processing_profile, output_hash, source_url, rendered "
+            "FROM page_cache WHERE url = ?", (url,)
         ) as cursor:
             row = await cursor.fetchone()
             if row:
@@ -615,6 +715,13 @@ class AsyncCrawlDatabase:
                     'last_modified': row[5],
                     'links': links,
                     'filename': row[7],
+                    'fetched_at': row[8],
+                    'checked_at': row[9],
+                    'fetch_url': row[10],
+                    'processing_profile': row[11],
+                    'output_hash': row[12],
+                    'source_url': row[13],
+                    'rendered': bool(row[14]),
                 }
         return None
 
@@ -622,16 +729,20 @@ class AsyncCrawlDatabase:
                          length: int, etag: Optional[str] = None,
                          last_modified: Optional[str] = None,
                          links: Optional[List[Dict]] = None,
-                         filename: Optional[str] = None):
+                         filename: Optional[str] = None, fetch_url: Optional[str] = None,
+                         processing_profile: Optional[str] = None, output_hash: Optional[str] = None,
+                         source_url: Optional[str] = None, rendered: bool = False):
         await self.conn.execute(
             'INSERT OR REPLACE INTO page_cache '
             '(url, content_hash, title, crawled_at, content_length, etag, '
-            'last_modified, links_json, filename) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            'last_modified, links_json, filename, fetched_at, checked_at, '
+            'fetch_url, processing_profile, output_hash, source_url, rendered) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (url, content_hash, title, datetime.now().isoformat(),
              length, etag, last_modified,
              json.dumps(links, ensure_ascii=False) if links is not None else None,
-             filename)
+             filename, datetime.now().isoformat(), datetime.now().isoformat(),
+             fetch_url, processing_profile, output_hash, source_url, int(rendered))
         )
         await self._maybe_commit()
 
@@ -643,6 +754,16 @@ class AsyncCrawlDatabase:
         ) as cursor:
             row = await cursor.fetchone()
         return row[0] if row else None
+
+    async def mark_page_unsaved(self, url: str):
+        await self.conn.execute(
+            "UPDATE page_cache SET filename=NULL, etag=NULL, last_modified=NULL WHERE url=?", (url,))
+        await self._maybe_commit()
+
+    async def get_page_files(self):
+        async with self.conn.execute(
+                "SELECT url, filename, processing_profile FROM page_cache ORDER BY url") as cursor:
+            return await cursor.fetchall()
 
     async def delete_page(self, url: str):
         await self.conn.execute("DELETE FROM page_cache WHERE url = ?", (url,))
@@ -659,32 +780,74 @@ class AsyncCrawlDatabase:
     async def get_doc(self, url: str) -> Optional[Dict]:
         async with self.conn.execute(
             "SELECT filename, size_bytes, etag, last_modified, referer_url, "
-            "referer_title, link_text FROM doc_cache WHERE url = ?", (url,)
+            "referer_title, link_text, content_hash, converted_hash, md_filename, "
+            "conversion_profile, fetched_at, conversion_context FROM doc_cache WHERE url = ?", (url,)
         ) as cursor:
             row = await cursor.fetchone()
         if not row:
             return None
         return {'filename': row[0], 'size_bytes': row[1], 'etag': row[2],
                 'last_modified': row[3], 'referer_url': row[4] or '',
-                'referer_title': row[5] or '', 'link_text': row[6] or ''}
+                'referer_title': row[5] or '', 'link_text': row[6] or '',
+                'content_hash': row[7], 'converted_hash': row[8],
+                'md_filename': row[9], 'conversion_profile': row[10],
+                'fetched_at': row[11], 'conversion_context': row[12]}
 
     async def save_doc(self, url: str, filename: str, size_bytes: int,
                        etag: Optional[str], last_modified: Optional[str],
                        referer_url: str = "", referer_title: str = "",
-                       link_text: str = ""):
+                       link_text: str = "", content_hash: Optional[str] = None,
+                       fetched_at: Optional[str] = None):
+        prior = await self.get_doc(url)
+        same_version = bool(prior and content_hash and prior['content_hash'] == content_hash)
         await self.conn.execute(
             'INSERT OR REPLACE INTO doc_cache (url, filename, size_bytes, etag, '
-            'last_modified, referer_url, referer_title, link_text, downloaded_at) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            'last_modified, referer_url, referer_title, link_text, downloaded_at, '
+            'content_hash, converted_hash, md_filename, conversion_profile, fetched_at, conversion_context) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (url, filename, size_bytes, etag, last_modified, referer_url,
-             referer_title, link_text, datetime.now().isoformat()))
+             referer_title, link_text, datetime.now().isoformat(), content_hash,
+             prior['converted_hash'] if same_version else None,
+             prior['md_filename'] if same_version else None,
+             prior['conversion_profile'] if same_version else None,
+             datetime.now().isoformat(timespec='seconds') if fetched_at is None else fetched_at,
+             prior['conversion_context'] if same_version else None))
         await self._maybe_commit()
 
+    async def mark_doc_converted(self, url: str, content_hash: str,
+                                 md_filename: str, profile: str, context_hash: Optional[str] = None):
+        await self.conn.execute(
+            "UPDATE doc_cache SET converted_hash=?, md_filename=?, conversion_profile=?, conversion_context=? "
+            "WHERE url=? AND content_hash=?",
+            (content_hash, md_filename, profile, context_hash, url, content_hash))
+        await self._maybe_commit()
+
+    async def invalidate_doc_text(self, url: str):
+        await self.conn.execute(
+            "UPDATE doc_cache SET converted_hash=NULL, md_filename=NULL, "
+            "conversion_profile=NULL, conversion_context=NULL WHERE url=?", (url,))
+        await self._maybe_commit()
+
+    async def delete_doc(self, url: str):
+        await self.conn.execute("DELETE FROM doc_cache WHERE url=?", (url,))
+        await self._maybe_commit()
+
+    async def get_all_docs(self) -> List[Dict]:
+        keys = ('url', 'filename', 'size_bytes', 'etag', 'last_modified', 'referer_url',
+                'referer_title', 'link_text', 'content_hash', 'converted_hash',
+                'md_filename', 'conversion_profile', 'fetched_at', 'conversion_context')
+        async with self.conn.execute(
+                f"SELECT {', '.join(keys)} FROM doc_cache ORDER BY url") as cur:
+            return [dict(zip(keys, row)) for row in await cur.fetchall()]
+
     async def touch_cache(self, url: str, etag: Optional[str] = None,
-                          last_modified: Optional[str] = None):
-        """Uppdatera bara crawled_at (och ev. ETag-värden) — för 304 Not Modified."""
+                          last_modified: Optional[str] = None, checked: bool = True):
+        """Sedd tid uppdateras alltid; kontrolltid bara vid ett verkligt HTTP-svar."""
         params = [datetime.now().isoformat()]
         sql = "UPDATE page_cache SET crawled_at=?"
+        if checked:
+            sql += ", checked_at=?"
+            params.append(datetime.now().isoformat())
         if etag is not None:
             sql += ", etag=?"
             params.append(etag)
@@ -724,6 +887,7 @@ class AsyncCrawlDatabase:
         if self.conn:
             await self.flush()
             await self.conn.close()
+            self.conn = None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -736,6 +900,9 @@ class PerDomainRateLimiter:
 
     def __init__(self, requests_per_second: float):
         self.delay = 1.0 / requests_per_second if requests_per_second > 0 else 0
+        self.base_delay = self.delay
+        self.domain_minimums: Dict[str, float] = {}
+        self.domain_delays: Dict[str, float] = {}
         self.last_requests: Dict[str, datetime] = {}
         self._lock = asyncio.Lock()
 
@@ -744,8 +911,9 @@ class PerDomainRateLimiter:
             now = datetime.now()
             last_req = self.last_requests.get(domain, datetime.min)
             elapsed = (now - last_req).total_seconds()
-            if elapsed < self.delay:
-                sleep_time = self.delay - elapsed
+            delay = max(self.domain_delays.get(domain, self.delay), self.domain_minimums.get(domain, 0))
+            if elapsed < delay:
+                sleep_time = delay - elapsed
                 self.last_requests[domain] = now + timedelta(seconds=sleep_time)
             else:
                 sleep_time = 0
@@ -753,9 +921,28 @@ class PerDomainRateLimiter:
         if sleep_time > 0:
             await asyncio.sleep(sleep_time)
 
-    def slow_down(self, factor: float = 1.5):
+    def slow_down(self, factor: float = 1.5, domain: Optional[str] = None):
         """Adaptiv throttling: anropas vid 429/503 så att vi blir långsammare."""
-        self.delay = min(max(self.delay, 0.5) * factor, self.MAX_DELAY)
+        delay = self.domain_delays.get(domain, self.base_delay) if domain else self.delay
+        delay = min(max(delay, 0.5) * factor, max(self.MAX_DELAY, self.base_delay))
+        if domain:
+            self.domain_delays[domain] = delay
+        else:
+            self.delay = delay
+
+    def succeeded(self, domain: Optional[str] = None):
+        """Återgå gradvis till inställd takt; Crawl-delay är ett separat golv."""
+        delay = self.domain_delays.get(domain, self.base_delay) if domain else self.delay
+        delay = max(self.base_delay, delay * 0.9)
+        if delay - self.base_delay < 0.01:
+            delay = self.base_delay
+        if domain:
+            self.domain_delays[domain] = delay
+        else:
+            self.delay = delay
+
+    def set_minimum(self, domain: str, delay: float):
+        self.domain_minimums[domain] = max(0, delay)
 
 
 _YEAR_IN_URL_RE = re.compile(r'(?<!\d)20[0-3]\d(?!\d)')
@@ -772,6 +959,8 @@ class PriorityURLQueue:
                  penalty_words: Optional[List[str]] = None):
         self.queue: queue.PriorityQueue = queue.PriorityQueue()
         self.seen_urls: Set[str] = set()
+        self._queued: Dict[str, Tuple[int, int]] = {}
+        self._next_token = 0
         self._lock = threading.Lock()
         self.ignore_query_params = ignore_query_params
 
@@ -784,15 +973,14 @@ class PriorityURLQueue:
 
     def mark_seen(self, url: str):
         with self._lock:
-            self.seen_urls.add(normalize_url(url, self.ignore_query_params))
+            key = normalize_url(url, self.ignore_query_params)
+            self.seen_urls.add(key)
+            self._queued.pop(key, None)
 
     def add_url(self, url: str, depth: int = 0,
                 base_priority: int = CrawlPriority.MEDIUM.value) -> bool:
         normalized = normalize_url(url, self.ignore_query_params)
         with self._lock:
-            if normalized in self.seen_urls:
-                return False
-
             score = base_priority
             lower_url = normalized.lower()
             if any(w in lower_url for w in self.boost_words):
@@ -803,20 +991,34 @@ class PriorityURLQueue:
                     or _YEAR_IN_URL_RE.search(urlparse(lower_url).path)):
                 score += 5
             score += depth
-
-            self.queue.put((score, time.time(), depth, normalized))
+            if normalized in self.seen_urls:
+                queued = self._queued.get(normalized)
+                if queued is None or score >= queued[0]:
+                    return False
+            # Aktuella länkar får ersätta gamla cache-URL:er som ännu inte hämtats.
+            # En token gör den äldre köposten ogiltig utan att sortera om hela kön.
+            self._next_token += 1
+            token = self._next_token
+            self._queued[normalized] = (score, token)
+            self.queue.put((score, time.time(), depth, request_url(url), normalized, token))
             self.seen_urls.add(normalized)
             return True
 
     def get_next(self) -> Optional[Tuple[int, str]]:
-        try:
-            item = self.queue.get_nowait()
-            return (item[2], item[3])
-        except queue.Empty:
-            return None
+        with self._lock:
+            while True:
+                try:
+                    item = self.queue.get_nowait()
+                except queue.Empty:
+                    return None
+                queued = self._queued.get(item[4])
+                if queued and queued[1] == item[5]:
+                    self._queued.pop(item[4])
+                    return (item[2], item[3])
 
     def size(self) -> int:
-        return self.queue.qsize()
+        with self._lock:
+            return len(self._queued)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1014,459 +1216,6 @@ class DocumentManifest:
 # ─────────────────────────────────────────────────────────────
 #  DOKUMENT → MARKDOWN KONVERTERARE
 # ─────────────────────────────────────────────────────────────
-class DocumentConverter:
-    """Konverterar binära dokument (PDF, Word, Excel, PPTX) till Markdown.
-
-    Extraherar text och skapar en .md-fil med intranät-URL:en i toppen,
-    så att RAG-system kan citera rätt källa även för dokument-text.
-    Originaldokumentet behålls alltid i dokument/-mappen.
-    """
-
-    SUPPORTED = {
-        '.pdf': 'PDF', '.docx': 'Word', '.dotx': 'Word-mall',
-        '.xlsx': 'Excel', '.pptx': 'PowerPoint',
-    }
-    # Äldre format stöds inte direkt av Python-biblioteken. Om LibreOffice
-    # (soffice) finns på datorn konverteras de först till moderna format.
-    LEGACY_TARGETS = {
-        '.doc': 'docx', '.rtf': 'docx', '.odt': 'docx',
-        '.xls': 'xlsx', '.ods': 'xlsx',
-        '.ppt': 'pptx', '.odp': 'pptx',
-    }
-    LEGACY_NAMES = {
-        '.doc': 'Word (äldre)', '.rtf': 'RTF', '.odt': 'OpenDocument Text',
-        '.xls': 'Excel (äldre)', '.ods': 'OpenDocument Calc',
-        '.ppt': 'PowerPoint (äldre)', '.odp': 'OpenDocument Presentation',
-    }
-    MAX_XLSX_ROWS_PER_SHEET = 5000
-    LEGACY_TIMEOUT_S = 120
-
-    # Metadata-titlar som är skräp och inte ska användas som dokumenttitel.
-    _JUNK_TITLE_RE = re.compile(
-        r'^(microsoft (word|excel|powerpoint)\b.*|untitled.*|namnlöst.*|'
-        r'document\s*\d*|dokument\s*\d*|powerpoint presentation|presentation\d*|'
-        r'slide 1|bild 1|.*\.(docx?|xlsx?|pptx?|pdf|odt)|\s*)$',
-        re.IGNORECASE)
-
-    # Generiska länktexter som inte är beskrivande nog att använda som
-    # dokument-titel. Matchning sker case-insensitivt efter strip().
-    GENERIC_LINK_TEXTS = {
-        'ladda ner', 'ladda ner fil', 'ladda ned', 'ladda ned fil',
-        'hämta', 'hämta fil', 'download', 'download file',
-        'öppna', 'öppna fil', 'öppna dokument',
-        'visa', 'visa fil', 'visa dokument',
-        'klicka här', 'läs mer', 'read more', 'click here',
-        'länk', 'link', 'pdf', 'dokument', 'document',
-        '(via sitemap)', 'via sitemap',
-    }
-
-    def __init__(self, output_dir: str,
-                 log_fn=None, pii_cleaner=None, ocr: bool = True,
-                 ocr_languages: str = "swe+eng", ocr_max_pages: int = 50):
-        self.texts_dir = os.path.join(output_dir, "texter")
-        self._log = log_fn
-        self._clean_pii = pii_cleaner
-        self.ocr_enabled = ocr
-        self.ocr_languages = ocr_languages
-        self.ocr_max_pages = ocr_max_pages
-        self._ocr_ok: Optional[bool] = None
-        self.last_used_ocr = False    # True om senaste dokumentets text kommer från OCR
-        self.last_error = ""          # orsak till senaste misslyckade konvertering
-        self._soffice = (shutil.which("soffice") or shutil.which("libreoffice")
-                         or shutil.which("soffice.exe"))
-        os.makedirs(self.texts_dir, exist_ok=True)
-
-    @staticmethod
-    def md_filename(doc_url: str, filename: str) -> str:
-        """Stabilt, kollisionsfritt namn på den konverterade .md-filen.
-
-        Bygger alltid på samma två delar — en kapad slug av filnamnet och en
-        hash av dokument-URL:en — så att crawlern och konverteraren aldrig kan
-        komma överens om olika namn, och så att hashen aldrig kapas bort.
-        """
-        base = os.path.splitext(os.path.basename(filename))[0]
-        base = re.sub(r'_[0-9a-f]{6}$', '', base)          # ta bort ev. gammal hash
-        slug = slugify(base)[:40] or "dokument"
-        url_hash = hashlib.md5(doc_url.encode('utf-8')).hexdigest()[:8]
-        return f"{slug}_{url_hash}_doc.md"
-
-    def md_path_for(self, doc_url: str, filename: str) -> str:
-        return os.path.join(self.texts_dir, self.md_filename(doc_url, filename))
-
-    def can_convert(self, filepath: str) -> bool:
-        ext = os.path.splitext(filepath)[1].lower()
-        if ext in self.LEGACY_TARGETS:
-            return bool(self._soffice)
-        if ext == '.pdf' and not HAS_PYMUPDF:
-            return False
-        if ext in ('.docx', '.dotx') and not HAS_DOCX:
-            return False
-        if ext == '.xlsx' and not HAS_OPENPYXL:
-            return False
-        if ext == '.pptx' and not HAS_PPTX:
-            return False
-        return ext in self.SUPPORTED
-
-    def _legacy_to_modern(self, filepath: str, ext: str, workdir: str) -> Optional[str]:
-        """Konverterar .doc/.xls/.ppt m.fl. med LibreOffice. Returnerar sökväg eller None."""
-        target = self.LEGACY_TARGETS[ext]
-        try:
-            subprocess.run(
-                [self._soffice, "--headless", "--norestore", "--convert-to", target,
-                 "--outdir", workdir, filepath],
-                check=True, capture_output=True, timeout=self.LEGACY_TIMEOUT_S)
-        except Exception as e:
-            self.last_error = f"LibreOffice-konvertering misslyckades: {e}"
-            return None
-        out = os.path.join(workdir, os.path.splitext(os.path.basename(filepath))[0]
-                           + "." + target)
-        return out if os.path.exists(out) else None
-
-    def convert(self, filepath: str, doc_url: str,
-                referer_url: str = "", referer_title: str = "",
-                link_text: str = "") -> Optional[str]:
-        """Konverterar dokument till .md. Returnerar sökväg eller None.
-
-        Metadata bäddas in i brödtexten (inte bara i header) eftersom RAG-
-        pipelines ofta kapar de första raderna före retrieval. Källan
-        upprepas också sist i filen — om Sveas chunking splittrar dokumentet
-        i flera bitar säkrar det att åtminstone en chunk har källan med.
-        """
-        self.last_error = ""
-        self.last_used_ocr = False
-        tmpdir = None
-        ext = os.path.splitext(filepath)[1].lower()
-        src_path, src_ext = filepath, ext
-        try:
-            if ext in self.LEGACY_TARGETS:
-                if not self._soffice:
-                    self.last_error = "Äldre format kräver LibreOffice (soffice)"
-                    return None
-                tmpdir = tempfile.mkdtemp(prefix="uwc_")
-                src_path = self._legacy_to_modern(filepath, ext, tmpdir)
-                if not src_path:
-                    return None
-                src_ext = os.path.splitext(src_path)[1].lower()
-
-            extractors = {
-                '.pdf': self._extract_pdf,
-                '.docx': self._extract_docx,
-                '.dotx': self._extract_docx,
-                '.xlsx': self._extract_xlsx,
-                '.pptx': self._extract_pptx,
-            }
-            extractor = extractors.get(src_ext)
-            if not extractor:
-                self.last_error = f"Filtypen {ext} stöds inte"
-                return None
-
-            text = extractor(src_path)
-            if not text or len(text.strip()) < 20:
-                if ext == '.pdf':
-                    if self.ocr_available():
-                        self.last_error = "Ingen text i PDF:en, och OCR gav heller ingen text"
-                    else:
-                        self.last_error = ("Ingen text i PDF:en — troligen en skannad bild. "
-                                           "Installera Tesseract för OCR")
-                else:
-                    self.last_error = "För lite text i dokumentet"
-                if self._log:
-                    self._log(
-                        f"  ⚠ Konvertering gav för lite text "
-                        f"({len(text.strip()) if text else 0} tecken): "
-                        f"{os.path.basename(filepath)} — {self.last_error}",
-                        LogLevel.WARNING)
-                return None
-
-            if self._clean_pii:
-                text = self._clean_pii(text)
-
-            # Titel-prioritet (faller från bäst till sista utvägen):
-            #   1. link_text   — <a>-taggens text (t.ex. "Eko ack 2025 Januari"),
-            #                    kräver >5 tecken OCH att texten inte är generisk
-            #                    ("Ladda ner fil", "Download", etc.)
-            #   2. metadata_title — dokumentets egen title (PDF/Office metadata)
-            #   3. humaniserat filnamn ("Eko ack 2025 januari")
-            #   4. referer_title — sidans <title> (ofta för generisk,
-            #                      t.ex. "Startsida - Tyresö kommun")
-            #   5. rå slug som sista utväg
-            filename = os.path.basename(filepath)
-            base_name = os.path.splitext(filename)[0]
-            metadata_title = self._extract_doc_metadata_title(src_path, src_ext)
-            if metadata_title and self._JUNK_TITLE_RE.match(metadata_title.strip()):
-                metadata_title = ""
-            humanized = self._humanize_filename(base_name)
-            clean_link = (link_text or "").strip()
-
-            # De-duplicera dubbla länktexter ("Ladda ner fil Ladda ner fil")
-            if clean_link:
-                total_len = len(clean_link)
-                if total_len % 2 == 1:  # udda längd → testa med mellanslag i mitten
-                    mid = total_len // 2
-                    if (clean_link[mid] == ' '
-                            and clean_link[:mid] == clean_link[mid + 1:]):
-                        clean_link = clean_link[:mid]
-                elif total_len % 2 == 0:
-                    mid = total_len // 2
-                    if clean_link[:mid].rstrip() == clean_link[mid:].lstrip():
-                        clean_link = clean_link[:mid].rstrip()
-
-            def _is_usable_link_text(text: str) -> bool:
-                """True om link_text är tillräckligt beskrivande för titel."""
-                if len(text) <= 5:
-                    return False
-                return text.lower() not in self.GENERIC_LINK_TEXTS
-
-            raw_title = (
-                (clean_link if _is_usable_link_text(clean_link) else "")
-                or metadata_title
-                or humanized
-                or (referer_title.strip() if referer_title else "")
-                or base_name
-            )
-
-            # Strippa storleks-suffix som "pdf, 535.8 kB, öppnas i nytt fönster"
-            title = re.sub(
-                r'\s*(pdf|docx?|xlsx?|pptx?|pages?)?\s*,?\s*'
-                r'\d+(?:[.,]\d+)?\s*[kKmMgG]?[bB][, .].*$',
-                '', raw_title, flags=re.IGNORECASE).strip()
-            title = re.sub(r'\s*[, .]+\s*$', '', title) or raw_title
-            # Titeln kan komma från länktext/metadata som inte passerat PII-tvätten
-            if self._clean_pii:
-                title = self._clean_pii(title)
-                if self._clean_pii and referer_title:
-                    referer_title = self._clean_pii(referer_title)
-
-            file_type = (self.SUPPORTED.get(ext) or self.LEGACY_NAMES.get(ext)
-                         or "Dokument")
-
-            # Bygg metadata-block som SYNLIG brödtext (fetstil), inte ren header.
-            # Sveas chunker skippar typiskt header-text men behåller brödtext.
-            meta_lines = [f"# {title}", ""]
-            if referer_url:
-                meta_lines.append(f"**Källa:** {referer_url}")
-            if doc_url:
-                meta_lines.append(f"**Dokument-URL:** {doc_url}")
-            if filename:
-                # Visa originalfilnamnet (utan vår interna hash-suffix)
-                display_name = re.sub(r'_[0-9a-f]{6}(\.\w+)$', r'\1', filename)
-                meta_lines.append(f"**Filnamn:** {display_name}")
-            meta_lines.append(f"**Filtyp:** {file_type}")
-            if self.last_used_ocr:
-                meta_lines.append("**Textkälla:** OCR (automatisk textigenkänning — kan innehålla fel)")
-            meta_lines.append("")
-            meta_lines.append("---")
-            meta_lines.append("")
-
-            # Upprepa källan sist i filen — om dokumentet chunkas i flera
-            # bitar har åtminstone första och sista bitarna källinformation.
-            footer_lines = ["", "", "---", ""]
-            if referer_url:
-                footer_lines.append(f"**Källa:** {referer_url}")
-            if doc_url:
-                footer_lines.append(f"**Dokument-URL:** {doc_url}")
-
-            text = downgrade_body_h1(text)
-            md_content = ("\n".join(meta_lines) + text
-                          + "\n".join(footer_lines))
-
-            md_path = self.md_path_for(doc_url, filename)
-
-            with open(md_path, 'w', encoding='utf-8') as f:
-                f.write(md_content)
-            return md_path
-
-        except Exception as e:
-            self.last_error = f"Konvertering misslyckades: {e}"
-            if self._log:
-                self._log(
-                    f"  ✗ Konvertering misslyckades "
-                    f"({os.path.basename(filepath)}): {e}", LogLevel.ERROR)
-            return None
-        finally:
-            if tmpdir:
-                shutil.rmtree(tmpdir, ignore_errors=True)
-
-    # ─── Titelextraktion ────────────────────────────────────
-    @staticmethod
-    def _humanize_filename(name: str) -> str:
-        """Gör ett slug-namn läsbart: 'ansokan-om-x_ad7919' → 'Ansokan om x'.
-
-        Eftersom slugify har strippat svenska tecken (ä→a, ö→o) går det
-        inte att återskapa originalnamnet helt — men "Ansokan om
-        parkeringstillstand" är vida bättre än "ansokan-om-parkeringstillstand_ad7919".
-        """
-        # Ta bort hash-suffix
-        name = re.sub(r'_[0-9a-f]{6}$', '', name)
-        # Bindestreck och underscore → mellanslag
-        name = re.sub(r'[-_]+', ' ', name).strip()
-        # Stor första bokstav (ev. övriga ord lämnas som de är —
-        # vi vet inte vilka som är egennamn)
-        if name:
-            name = name[0].upper() + name[1:]
-        return name
-
-    def _extract_doc_metadata_title(self, filepath: str, ext: str) -> str:
-        """Plocka ut dokumenttitel ur filens egen metadata om sådan finns.
-
-        Många PDF/Office-dokument har ett `title`-fält i sin metadata som
-        ofta är mer beskrivande än filnamnet ("Ansökan om parkeringstillstånd
-        för rörelsehindrad" vs "ansokan-om-parkeringstillstand").
-        """
-        try:
-            if ext == '.pdf' and HAS_PYMUPDF:
-                doc = pymupdf.open(filepath)
-                title = (doc.metadata or {}).get('title', '')
-                doc.close()
-                return title.strip() if title else ""
-            if ext in ('.docx', '.dotx') and HAS_DOCX:
-                doc = DocxDocument(filepath)
-                title = (doc.core_properties.title or '').strip()
-                return title
-            if ext == '.xlsx' and HAS_OPENPYXL:
-                wb = xl_load_workbook(filepath, read_only=True, data_only=True)
-                title = (wb.properties.title or '').strip()
-                wb.close()
-                return title
-            if ext == '.pptx' and HAS_PPTX:
-                prs = PptxPresentation(filepath)
-                title = (prs.core_properties.title or '').strip()
-                return title
-        except Exception:
-            pass
-        return ""
-
-    def ocr_available(self) -> bool:
-        """OCR kräver att Tesseract är installerat (PyMuPDF anropar det)."""
-        if not (HAS_PYMUPDF and self.ocr_enabled):
-            return False
-        if self._ocr_ok is None:
-            try:
-                pymupdf.get_tessdata()
-                self._ocr_ok = True
-            except Exception:
-                self._ocr_ok = False
-        return self._ocr_ok
-
-    def _ocr_page(self, page) -> str:
-        """OCR på en sida. Provar önskade språk, sen enbart engelska."""
-        for lang in (self.ocr_languages, "eng"):
-            try:
-                textpage = page.get_textpage_ocr(language=lang, dpi=200, full=True)
-                return page.get_text("text", textpage=textpage)
-            except Exception:
-                continue
-        return ""
-
-    def _extract_pdf(self, filepath: str) -> str:
-        doc = pymupdf.open(filepath)
-        pages = []
-        ocr_pages = 0
-        try:
-            for i, page in enumerate(doc):
-                text = page.get_text("text")
-                if not text.strip() and ocr_pages < self.ocr_max_pages and self.ocr_available():
-                    # Sidan saknar textlager (skannad bild) → OCR
-                    text = self._ocr_page(page)
-                    if text.strip():
-                        ocr_pages += 1
-                        self.last_used_ocr = True
-                if text.strip():
-                    pages.append(f"## Sida {i + 1}\n\n{text.strip()}")
-        finally:
-            doc.close()
-        return "\n\n".join(pages)
-
-    def _extract_docx(self, filepath: str) -> str:
-        doc = DocxDocument(filepath)
-        parts = []
-
-        def para_to_md(para) -> Optional[str]:
-            text = para.text.strip()
-            if not text:
-                return None
-            style = para.style.name if para.style and para.style.name else ""
-            if style.startswith('Heading') or style.startswith('Rubrik'):
-                digits = re.findall(r'\d+', style)
-                level = int(digits[0]) if digits else 1
-                return f"{'#' * min(level + 1, 6)} {text}"
-            if style == 'Title' or style == 'Titel':
-                return f"## {text}"
-            return text
-
-        def table_to_md(table) -> Optional[str]:
-            rows = []
-            for i, row in enumerate(table.rows):
-                cells = [cell.text.strip().replace('\n', ' ') for cell in row.cells]
-                rows.append("| " + " | ".join(cells) + " |")
-                if i == 0:
-                    rows.append("|" + "|".join(["---"] * len(cells)) + "|")
-            return "\n".join(rows) if rows else None
-
-        if DocxParagraph is not None and DocxTable is not None:
-            # Gå igenom dokumentet i ordning så att tabeller hamnar där de står
-            for child in doc.element.body.iterchildren():
-                if child.tag.endswith('}p'):
-                    md = para_to_md(DocxParagraph(child, doc))
-                elif child.tag.endswith('}tbl'):
-                    md = table_to_md(DocxTable(child, doc))
-                else:
-                    continue
-                if md:
-                    parts.append(md)
-        else:
-            for para in doc.paragraphs:
-                md = para_to_md(para)
-                if md:
-                    parts.append(md)
-            for table in doc.tables:
-                md = table_to_md(table)
-                if md:
-                    parts.append(md)
-        return "\n\n".join(parts)
-
-    def _extract_xlsx(self, filepath: str) -> str:
-        wb = xl_load_workbook(filepath, read_only=True, data_only=True)
-        parts = []
-        for sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-            if getattr(ws, "sheet_state", "visible") != "visible":
-                continue                      # hoppa över dolda blad
-            parts.append(f"## {sheet_name}")
-            rows_data = []
-            truncated = False
-            for n, row in enumerate(ws.iter_rows(values_only=True)):
-                if n >= self.MAX_XLSX_ROWS_PER_SHEET:
-                    truncated = True
-                    break
-                cells = [str(c).replace('\n', ' ').replace('|', '/') if c is not None
-                         else "" for c in row]
-                if any(c for c in cells):
-                    rows_data.append("| " + " | ".join(cells) + " |")
-            if rows_data:
-                col_count = rows_data[0].count("|") - 1
-                rows_data.insert(1, "|" + "|".join(["---"] * max(col_count, 1)) + "|")
-                parts.append("\n".join(rows_data))
-            if truncated:
-                parts.append(f"_(Bladet avkortat efter {self.MAX_XLSX_ROWS_PER_SHEET} rader.)_")
-        wb.close()
-        return "\n\n".join(parts)
-
-    def _extract_pptx(self, filepath: str) -> str:
-        prs = PptxPresentation(filepath)
-        parts = []
-        for i, slide in enumerate(prs.slides):
-            slide_texts = []
-            for shape in slide.shapes:
-                if shape.has_text_frame:
-                    for para in shape.text_frame.paragraphs:
-                        text = para.text.strip()
-                        if text:
-                            slide_texts.append(text)
-            if slide_texts:
-                parts.append(
-                    f"## Bild {i + 1}\n\n" + "\n\n".join(slide_texts))
-        return "\n\n".join(parts)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1498,6 +1247,10 @@ SKIP_EXTENSIONS = {
     '.rar', '.exe', '.mp4', '.mp3', '.avi', '.mov', '.css', '.js',
     '.woff', '.woff2', '.ttf', '.otf', '.eot',
 }
+
+
+class RobotsDeniedError(Exception):
+    """En hämtning eller redirect som robots.txt inte tillåter."""
 
 
 class BlockedHostError(Exception):
@@ -1546,6 +1299,231 @@ if HAS_AIOHTTP:
             await self._inner.close()
 
 
+class _ProxySocketReader:
+    """SOCKS-ström utan Proactor-transportens felkänsliga avslut på Windows."""
+
+    def __init__(self, sock: socket.socket):
+        self.sock = sock
+
+    async def read(self, size: int = 65536) -> bytes:
+        return await asyncio.get_running_loop().sock_recv(self.sock, size)
+
+    async def readexactly(self, size: int) -> bytes:
+        parts = bytearray()
+        while len(parts) < size:
+            block = await self.read(size - len(parts))
+            if not block:
+                raise asyncio.IncompleteReadError(bytes(parts), size)
+            parts.extend(block)
+        return bytes(parts)
+
+
+class _ProxySocketWriter:
+    def __init__(self, sock: socket.socket):
+        self.sock = sock
+        self.buffer = bytearray()
+
+    def write(self, data: bytes):
+        self.buffer.extend(data)
+
+    async def drain(self):
+        if self.buffer:
+            data = bytes(self.buffer)
+            self.buffer.clear()
+            await asyncio.get_running_loop().sock_sendall(self.sock, data)
+
+    def close(self):
+        if self.sock.fileno() == -1:
+            return
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        finally:
+            self.sock.close()
+
+    async def wait_closed(self):
+        # close() stänger råsocketen synkront; ingen transportcallback väntas in.
+        return
+
+
+class BrowserEgressProxy:
+    """Lokal SOCKS5-proxy: varje TCP-mål DNS-kontrolleras och ansluts via samma IP.
+
+    Chromium skickar även redirects, popup-fönster och nedladdningar genom proxyn.
+    Till skillnad från page.route finns inget glapp mellan DNS-kontroll och
+    webbläsarens eget uppslag. TLS går oförändrat mellan Chromium och målservern.
+    """
+
+    def __init__(self, log_fn=None):
+        self.resolver = SafeResolver(allow_private=False)
+        self.server = None
+        self._accept_task = None
+        self.tasks: Set[asyncio.Task] = set()
+        self.writers: Set[_ProxySocketWriter] = set()
+        self._closing = False
+        self._log = log_fn
+        self.url = ""
+
+    async def start(self) -> str:
+        self._closing = False
+        # Python/Windows kan kasta vid transportens shutdown och aldrig frigöra
+        # Server.wait_closed. Råa async-sockets undviker både häng och läckta handles.
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            self.server.setblocking(False)
+            self.server.bind(('127.0.0.1', 0))
+            self.server.listen(socket.SOMAXCONN)
+            self.url = f"socks5://127.0.0.1:{self.server.getsockname()[1]}"
+            self._accept_task = asyncio.create_task(self._accept_clients())
+        except BaseException:
+            self.server.close()
+            raise
+        return self.url
+
+    async def _accept_clients(self):
+        loop = asyncio.get_running_loop()
+        while not self._closing:
+            try:
+                client, _ = await loop.sock_accept(self.server)
+            except OSError:
+                if self._closing:
+                    return
+                raise
+            client.setblocking(False)
+            self._accept(_ProxySocketReader(client), _ProxySocketWriter(client))
+
+    def _accept(self, reader, writer):
+        # Registrera synkront: close() kan annars missa en accepterad klient
+        # vars coroutine ännu inte börjat köras och sedan vänta på den för alltid.
+        if self._closing:
+            writer.close()
+            return
+        self.writers.add(writer)
+        task = asyncio.create_task(self._handle(reader, writer))
+        self.tasks.add(task)
+
+    async def _connect(self, host: str, port: int):
+        if not 0 < port <= 65535 or is_non_public_host(host):
+            raise BlockedHostError("Webbläsarens mål är inte publikt")
+        infos = await self.resolver.resolve(host, port, family=socket.AF_UNSPEC)
+        if not infos or any(not ipaddress.ip_address(i['host']).is_global for i in infos):
+            raise BlockedHostError("Webbläsarens DNS-mål är inte publikt")
+        last_error = None
+        for info in infos:
+            sock = socket.socket(socket.AF_INET6 if ':' in info['host'] else socket.AF_INET,
+                                 socket.SOCK_STREAM)
+            sock.setblocking(False)
+            try:
+                # Anslut till den granskade IP-adressen, aldrig till värdnamnet igen.
+                await asyncio.wait_for(asyncio.get_running_loop().sock_connect(
+                    sock, (info['host'], port)), timeout=10)
+                return _ProxySocketReader(sock), _ProxySocketWriter(sock)
+            except asyncio.CancelledError:
+                sock.close()
+                raise
+            except (OSError, asyncio.TimeoutError) as e:
+                sock.close()
+                last_error = e
+            except BaseException:
+                sock.close()
+                raise
+        raise OSError("Webbläsarens mål kunde inte nås") from last_error
+
+    async def _handle(self, reader, writer):
+        task = asyncio.current_task()
+        self.tasks.add(task)
+        remote_writer = None
+        pumps = []
+        try:
+            async with asyncio.timeout(15):
+                version, n_methods = await reader.readexactly(2)
+                methods = await reader.readexactly(n_methods)
+                if version != 5 or 0 not in methods:
+                    writer.write(b'\x05\xff')
+                    await writer.drain()
+                    return
+                writer.write(b'\x05\x00')
+                await writer.drain()
+                version, command, reserved, address_type = await reader.readexactly(4)
+                if version != 5 or command != 1 or reserved != 0:
+                    raise BlockedHostError("Otillåtet proxykommando")
+                if address_type == 1:
+                    host = str(ipaddress.ip_address(await reader.readexactly(4)))
+                elif address_type == 4:
+                    host = str(ipaddress.ip_address(await reader.readexactly(16)))
+                elif address_type == 3:
+                    length = (await reader.readexactly(1))[0]
+                    host = (await reader.readexactly(length)).decode('ascii')
+                else:
+                    raise BlockedHostError("Otillåten proxyadress")
+                port = int.from_bytes(await reader.readexactly(2), 'big')
+                remote_reader, remote_writer = await self._connect(host, port)
+                writer.write(b'\x05\x00\x00\x01' + b'\x00' * 6)
+                await writer.drain()
+
+            async def pump(src, dst):
+                while data := await asyncio.wait_for(src.read(65536), timeout=120):
+                    dst.write(data)
+                    await dst.drain()
+
+            pumps = [asyncio.create_task(pump(reader, remote_writer)),
+                     asyncio.create_task(pump(remote_reader, writer))]
+            await asyncio.wait(pumps, return_when=asyncio.FIRST_COMPLETED)
+        except (OSError, ValueError, UnicodeError, asyncio.IncompleteReadError,
+                asyncio.TimeoutError, BlockedHostError):
+            # Fel och nekade mål leder aldrig till direktanslutning som reservväg.
+            if remote_writer is None:
+                if self._log:
+                    self._log("  ⛔ Webbläsarens nätverksanslutning nekades eller misslyckades",
+                              LogLevel.DEBUG)
+                try:
+                    writer.write(b'\x05\x02\x00\x01' + b'\x00' * 6)
+                    await writer.drain()
+                except OSError:
+                    pass
+        finally:
+            for pump_task in pumps:
+                pump_task.cancel()
+            if pumps:
+                await asyncio.gather(*pumps, return_exceptions=True)
+            for stream in (remote_writer, writer):
+                if stream:
+                    stream.close()
+                    try:
+                        await asyncio.wait_for(stream.wait_closed(), timeout=3)
+                    except (OSError, asyncio.TimeoutError):
+                        pass
+            self.tasks.discard(task)
+            self.writers.discard(writer)
+
+    async def close(self):
+        self._closing = True
+        if self._accept_task:
+            self._accept_task.cancel()
+            await asyncio.gather(self._accept_task, return_exceptions=True)
+            self._accept_task = None
+        if self.server:
+            self.server.close()
+        for writer in list(self.writers):
+            writer.close()
+        # Accepterade klienter är registrerade innan accept-loopen kan avbrytas.
+        await asyncio.sleep(0)
+        tasks = list(self.tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.tasks.difference_update(tasks)
+        self.writers.clear()
+        await self.resolver.close()
+
+
+# Alla crawlerinstanser delar låset; PyMuPDF får inte köras parallellt i trådar.
+
+
+
+
 class RobotsRules:
     """Tunn adapter: Protego (stöder * och $) om installerat, annars stdlib."""
 
@@ -1588,14 +1566,16 @@ _BLOCK_PAGE_SIGNALS = (
 _SOFT_404_TITLE_RE = re.compile(
     r'\b404\b|hittades inte|kunde inte hittas|page not found|sidan saknas|'
     r'finns inte|not found$', re.IGNORECASE)
-_INJECTION_RE = re.compile(
-    r'(ignore (all |any )?(the )?(previous|prior|above) (instructions|prompts)|'
-    r'disregard (the )?(previous|above|system)|'
-    r'ignorera (alla )?(tidigare|föregående|ovanstående) (instruktioner|anvisningar)|'
-    r'you are now (a|an|in)\b|reveal (your|the) system prompt|'
-    r'nya instruktioner:|new instructions:)', re.IGNORECASE)
 _HIDDEN_STYLE_RE = re.compile(
-    r'display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0', re.IGNORECASE)
+    r'(?:display\s*:\s*none|'
+    r'visibility\s*:\s*hidden|'
+    r'font-size\s*:\s*0(?:\.0+)?(?:px|em|rem|pt|%)?|'
+    r'opacity\s*:\s*0(?:\.0+)?|'
+    r'text-indent\s*:\s*-[0-9]{4,}px|'
+    r'left\s*:\s*-[0-9]{4,}px)'
+    r'(?:\s*!important)?\s*(?:;|\b|$)',
+    re.IGNORECASE
+)
 _NOISE_CLASS_RE = re.compile(
     r'^(cookie|cookies|banner|menu|nav|navbar|navigation|sidebar|footer|share|social)'
     r'([-_].*)?$', re.IGNORECASE)
@@ -1617,7 +1597,53 @@ KNOWN_CONFIG_KEYS = {
     "sitemap_lastmod_max_age_days", "languages", "export_jsonl",
     "ocr", "ocr_languages", "ocr_max_pages",
     "login_browser_headless",      # för automatiska tester av inloggningsflödet
+    "quarantine_flagged_chunks",   # karantänsätt chunks med säkerhetsflaggor (standard True)
+    "session_check_url",          # resurs som kräver inloggning och som kontot har rätt att läsa
+    'conversion_workers', 'conversion_queue_size', 'conversion_timeout',
+    'generation_keep', 'generation_min_age_hours',
 }
+
+_FLOAT_CONFIG_RULES = {
+    'delay': (0.5, 0), 'max_page_mb': (10, 0.000001),
+    'max_download_mb': (100, 0.000001), 'sitemap_lastmod_max_age_days': (14, 0),
+    'conversion_timeout': (180, 0.1),
+    'generation_min_age_hours': (24, 0.01),
+}
+_INT_CONFIG_RULES = {
+    'max_pages': (0, 0), 'max_depth': (0, 0), 'concurrency': (10, 1),
+    'playwright_concurrency': (2, 1), 'max_path_segments': (15, 1),
+    'max_query_params': (5, 0), 'ocr_max_pages': (50, 0),
+    'conversion_workers': (2, 1), 'conversion_queue_size': (8, 1),
+    'generation_keep': (0, 0),
+}
+_LIST_CONFIG_KEYS = {
+    'allowed_domains', 'exclude_keywords', 'require_keywords', 'keep_query_params',
+    'ignore_query_params', 'boost_words', 'penalty_words',
+}
+_BOOL_CONFIG_KEYS = {
+    'find_sitemap', 'respect_robots', 'use_hybrid', 'use_trafilatura', 'download_docs',
+    'convert_docs_to_md', 'strict_domain', 'include_subdomains', 'remove_email',
+    'remove_phone', 'remove_pnr', 'remove_ip', 'keep_role_emails', 'incremental',
+    'ignore_https_errors', 'allow_private_hosts', 'respect_canonical', 'dedupe_content',
+    'use_sitemap_lastmod', 'export_jsonl', 'ocr', 'login_browser_headless',
+    'quarantine_flagged_chunks',
+}
+
+
+def normalize_site_config(site: dict) -> Dict:
+    """Gemensamma typer och standardvärden för GUI och CLI efter validering."""
+    result = dict(site)
+    result.setdefault('incremental', True)
+    for key, (default, _) in _FLOAT_CONFIG_RULES.items():
+        result[key] = float(site.get(key, default))
+    for key, (default, _) in _INT_CONFIG_RULES.items():
+        result[key] = int(float(site.get(key, default)))
+    for key in _LIST_CONFIG_KEYS:
+        if key in site:
+            result[key] = [value.strip() for value in site[key] if value.strip()]
+    for key in ('exclude_keywords', 'require_keywords'):
+        result[key] = [value.lower() for value in result.get(key, [])]
+    return result
 
 
 def validate_site_config(site: dict) -> Tuple[List[str], List[str]]:
@@ -1626,24 +1652,53 @@ def validate_site_config(site: dict) -> Tuple[List[str], List[str]]:
     if not isinstance(site, dict):
         return ["posten är inte ett JSON-objekt"], []
     url = str(site.get("start_url", "")).strip()
-    parsed = urlparse(url)
-    if not url or parsed.scheme not in ("http", "https") or not parsed.netloc:
-        errors.append(f"start_url saknas eller är ogiltig: {url!r}")
+    def valid_http_url(value):
+        try:
+            parsed = urlparse(value)
+            return (parsed.scheme in ('http', 'https') and bool(parsed.hostname)
+                    and parsed.port != 0 and not parsed.username and not parsed.password)
+        except ValueError:
+            return False
+    if not valid_http_url(url):
+        errors.append('start_url saknas eller är ogiltig (kräver http(s), värd och giltig port utan inloggningsuppgifter)')
+    if site.get('session_check_url') and not valid_http_url(str(site['session_check_url'])):
+        errors.append('session_check_url måste vara en http(s)-adress utan inloggningsuppgifter')
     for key in site:
         if key not in KNOWN_CONFIG_KEYS:
             warnings.append(f"okänd nyckel ignoreras: {key!r}")
-    for key in ("delay", "max_pages", "max_depth", "concurrency"):
+    for key, (_, minimum) in {**_FLOAT_CONFIG_RULES, **_INT_CONFIG_RULES}.items():
         if key in site:
             try:
-                float(site[key])
-            except (TypeError, ValueError):
-                errors.append(f"{key} måste vara ett tal, fick {site[key]!r}")
+                value = float(site[key])
+                if isinstance(site[key], bool) or not math.isfinite(value) or value < minimum:
+                    raise ValueError
+                if key in _INT_CONFIG_RULES and value != int(value):
+                    raise ValueError
+                if key == 'sitemap_lastmod_max_age_days' and value >= 999999999:
+                    raise ValueError
+            except (TypeError, ValueError, OverflowError):
+                kind = 'heltal' if key in _INT_CONFIG_RULES else 'tal'
+                errors.append(f"{key} måste vara ett ändligt {kind} >= {minimum}, fick {site[key]!r}")
+    for key in _LIST_CONFIG_KEYS:
+        if key in site and (not isinstance(site[key], list)
+                            or any(not isinstance(value, str) for value in site[key])):
+            errors.append(f'{key} måste vara en lista med textvärden')
+    for key in _BOOL_CONFIG_KEYS:
+        if key in site and not isinstance(site[key], bool):
+            errors.append(f'{key} måste vara true eller false')
+    if 'headless_mode' in site and site['headless_mode'] not in ('headless', 'visible', 'login_then_headless'):
+        errors.append('headless_mode måste vara headless, visible eller login_then_headless')
+    if 'languages' in site and not (isinstance(site['languages'], str)
+            or isinstance(site['languages'], list) and all(isinstance(v, str) for v in site['languages'])):
+        errors.append('languages måste vara text eller en lista med språk')
+    if 'save_format' in site and site['save_format'] not in ('.md', '.json', '.txt', 'Ingen text', 'No text'):
+        errors.append('save_format måste vara .md, .json, .txt eller Ingen text')
     return errors, warnings
 
 
 def clean_page_title(raw: str, domain: str) -> str:
     """Tar bort avslutande sajtnamn ("Avgifter - Tyresö kommun" → "Avgifter")."""
-    raw = (raw or "").strip()
+    raw = metadata_line(raw)
     parts = re.split(r'\s+[-–—|·»]\s+', raw)
     if len(parts) >= 2:
         last = parts[-1]
@@ -1654,8 +1709,6 @@ def clean_page_title(raw: str, domain: str) -> str:
     return raw
 
 
-def detect_prompt_injection(*texts: str) -> bool:
-    return any(t and _INJECTION_RE.search(t) for t in texts)
 
 
 def safe_gunzip(data: bytes, limit: int) -> bytes:
@@ -1680,11 +1733,6 @@ def magic_ok(ext: str, head: bytes) -> bool:
     return True
 
 
-def atomic_write_text(path: str, text: str):
-    tmp = path + ".tmp"
-    with open(tmp, 'w', encoding='utf-8') as f:
-        f.write(text)
-    os.replace(tmp, path)
 
 
 class AsyncWebCrawler:
@@ -1696,12 +1744,30 @@ class AsyncWebCrawler:
                                        ("aiosqlite", HAS_AIOSQLITE)) if not ok]
             raise RuntimeError(f"Saknade beroenden: {', '.join(missing)} "
                                f"(kör: pip install -r requirements.txt)")
+        config = dict(config)
+        if 'start_url' in config and '://' not in str(config['start_url']):
+            config['start_url'] = 'https://' + str(config['start_url']).strip()
+        errors, _ = validate_site_config(config)
+        if errors:
+            raise ValueError('; '.join(errors))
+        config = normalize_site_config(config)
         self.config = config
         self.msg_queue = msg_queue
         self.state = CrawlerState.RUNNING
         self.stats = CrawlStats()
         self.active_tasks = 0
         self.fatal_error: Optional[str] = None
+        self._output_root = os.path.abspath(config['output_dir'])
+        self._publication = None
+        self._export_ready = False
+        self._conversion_queue = None
+        self._conversion_tasks = []
+        self._conversion_pending = 0
+        self._crawl_loop = None
+        self._url_tasks = set()
+        self._conversion_runner = ConversionProcessRunner(
+            os.path.join(self._output_root, '.conversion_jobs'),
+            workers=config['conversion_workers'], timeout=config['conversion_timeout'])
 
         # URL-normalisering: parametrar som ska strippas kan justeras per sajt
         keep = {k.lower() for k in config.get("keep_query_params", [])}
@@ -1712,7 +1778,7 @@ class AsyncWebCrawler:
         start_url = str(config["start_url"]).strip()
         if "://" not in start_url:
             start_url = "https://" + start_url
-        self.start_url = normalize_url(start_url, self.ignore_query_params)
+        self.start_url = request_url(start_url)
         self.output_dir = config["output_dir"]
         self.delay = config["delay"]
         self.max_pages = config["max_pages"]
@@ -1738,6 +1804,11 @@ class AsyncWebCrawler:
 
         self.find_sitemap = config.get("find_sitemap", True)
         self.robot_parser: Optional[RobotsRules] = None
+        self._robots_rules: Dict[str, RobotsRules] = {}
+        self._robots_text: Dict[str, str] = {}
+        self._robots_locks: Dict[str, asyncio.Lock] = {}
+        self._robots_unreachable: Set[str] = set()
+        self._robots_denied: Set[str] = set()
 
         # Innehållskvalitet
         self.respect_canonical = bool(config.get("respect_canonical", True))
@@ -1749,8 +1820,9 @@ class AsyncWebCrawler:
             langs = [x for x in re.split(r'[,\s]+', langs) if x]
         self.languages = {str(x).lower().split('-')[0] for x in langs}
         self.sitemap_lastmod: Dict[str, str] = {}
-        self._hash_owner: Dict[str, str] = {}
         self._canonical_of: Dict[str, str] = {}
+        self._canonical_pending: Dict[str, str] = {}
+        self._initial_page_files: Set[str] = set()
 
         parsed_start = urlparse(self.start_url)
         self.domain = parsed_start.netloc.lower()
@@ -1791,11 +1863,15 @@ class AsyncWebCrawler:
         self.login_event = threading.Event()
         self.saved_cookies: List[Dict] = []
         self._login_expired_streak = 0
+        self._session_probe_cache = None
+        self._session_probe_lock = asyncio.Lock()
+        self._file_hash_cache = {}
 
         self.async_download_lock = asyncio.Lock()
         self.async_pw_lock = asyncio.Lock()
         self.async_stats_lock = asyncio.Lock()
         self.async_sitemap_lock = asyncio.Lock()
+        self._dns_allowed_cache: Dict[str, bool] = {}
 
         self.semaphore = asyncio.Semaphore(self.concurrency)
         self.playwright_semaphore = asyncio.Semaphore(self.playwright_concurrency)
@@ -1810,22 +1886,30 @@ class AsyncWebCrawler:
         self._pw = None
         self._browser = None
         self._context = None
+        self._browser_proxy: Optional[BrowserEgressProxy] = None
+        self._export_files: Optional[Set[str]] = None
 
         # Ändringslogg och rapport (skrivs som changes.jsonl / crawl_report.json)
         self.changes: List[Dict] = []
         self.counts = {"added": 0, "updated": 0, "removed": 0, "docs_added": 0,
-                       "docs_updated": 0}
+                       "docs_updated": 0, "docs_removed": 0}
         self.report: Dict[str, List] = {
             "short_pages": [], "blocked_pages": [], "soft_404": [],
             "gone_pages": [], "off_domain_redirects": [],
             "conversion_failures": [], "download_failures": [],
             "possible_prompt_injection": [], "session_expired": [],
             "duplicates": [], "canonical_skipped": [], "wrong_language": [],
-            "ocr_used": [],
+            "ocr_used": [], "gone_documents": [], "retired_text_files": [],
+            "document_version_mismatch": [],
+            "canonical_unresolved": [], "access_denied": [], "session_unverified": [],
+            "robots_unreachable": [], "robots_denied": [], "export_failures": [],
+            'publication_blocked': [],
+            'generation_cleanup': [], 'generation_cleanup_failures': [],
         }
         self._completed_naturally = False
+        self._successful_documents = 0
 
-        self.crawl_session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.crawl_session_id = datetime.now().strftime("%Y%m%d_%H%M%S") + '_' + uuid.uuid4().hex[:8]
         self.logger = logging.getLogger(f'Crawler_{id(self)}')
         self.logger.setLevel(logging.DEBUG)
         log_dir = os.path.join(self.output_dir, 'logs')
@@ -1895,7 +1979,7 @@ class AsyncWebCrawler:
 
     def _gui_update(self, url: str, status: str, title: str):
         nya_eller_sparade = self.stats.pages_visited - self.stats.pages_unchanged
-        queue_size = self.url_queue.size() + self.active_tasks
+        queue_size = self.url_queue.size() + self.active_tasks + self._conversion_pending
         pages_done = self.stats.pages_visited
 
         eta_str = "Beräknar..."
@@ -1903,7 +1987,8 @@ class AsyncWebCrawler:
             avg_time = self.stats.duration.total_seconds() / pages_done
             remaining = queue_size
             if self.max_pages > 0:
-                remaining = min(queue_size, self.max_pages - pages_done)
+                remaining = min(self.url_queue.size() + self.active_tasks,
+                                max(0, self.max_pages - pages_done)) + self._conversion_pending
             eta_sec = avg_time * remaining
             if remaining <= 0:
                 eta_str = "Klar snart"
@@ -1930,14 +2015,13 @@ class AsyncWebCrawler:
 
     # ─── URL-validering ─────────────────────────────────────
     def _domain_allowed(self, netloc: str) -> bool:
-        host = netloc.lower().split("@")[-1]
-        host = host.split(":")[0].removeprefix("www.")
-        core = self.domain.split(":")[0].removeprefix("www.")
+        host = (urlparse('//' + netloc).hostname or '').lower().rstrip('.').removeprefix('www.')
+        core = (urlparse(self.start_url).hostname or '').lower().rstrip('.').removeprefix('www.')
         if host == core or host in self.allowed_domains:
             return True
         return self.include_subdomains and host.endswith("." + core)
 
-    def is_valid_url(self, url: str) -> bool:
+    def is_valid_url(self, url: str, for_export: bool = False) -> bool:
         if len(url) > 2000:
             return False
         try:
@@ -1979,7 +2063,10 @@ class AsyncWebCrawler:
             if req_kws and not any(kw in lower_url for kw in req_kws):
                 return False
 
-            if self.robot_parser and not self.robot_parser.can_fetch(url):
+            rules = self._robots_rules.get(self._origin(url))
+            if (self.config.get('respect_robots', True) and rules
+                    and not (for_export and self._origin(url) in self._robots_unreachable)
+                    and not rules.can_fetch(url)):
                 return False
             return True
         except Exception:
@@ -2016,6 +2103,19 @@ class AsyncWebCrawler:
             raise BlockedHostError(f"Redirect till otillåtet schema: {target.scheme}")
         if not self._allow_private and is_non_public_host(target.hostname):
             raise BlockedHostError(f"Redirect till icke-publik adress: {target.hostname}")
+        # Robots-hämtningen själv måste kunna följa redirects utan rekursion.
+        obey = (getattr(ctx, 'trace_request_ctx', None) or {}).get('obey_robots', True)
+        if obey and not await self._robots_allowed(target.geturl()):
+            raise RobotsDeniedError("Redirect stoppad av robots.txt")
+        await self.rate_limiter.async_wait(target.netloc.lower())
+
+    def _check_http_target(self, url: str):
+        """IP-literaler passerar inte aiohttp-resolvern och måste kontrolleras här."""
+        target = urlparse(url)
+        if target.scheme not in ('http', 'https') or not target.hostname:
+            raise BlockedHostError("Otillåten nätverksadress")
+        if not self._allow_private and is_non_public_host(target.hostname):
+            raise BlockedHostError("Nätverksadressen är inte publik")
 
     async def _create_session(self) -> aiohttp.ClientSession:
         """Skapar aiohttp-session med riktig CookieJar och Brotli om tillgängligt.
@@ -2131,7 +2231,8 @@ class AsyncWebCrawler:
                     cached: Optional[Dict] = None,
                     max_retries: int = 3,
                     decode_text: bool = True,
-                    max_bytes: Optional[int] = None) -> Optional[FetchResult]:
+                    max_bytes: Optional[int] = None,
+                    obey_robots: bool = True) -> Optional[FetchResult]:
         """Enhetlig nätverkshämtning med retries, conditional GET och slut-URL.
 
         - method='HEAD' → bara content-type
@@ -2145,6 +2246,12 @@ class AsyncWebCrawler:
         """
         base_delay = 1.0
         limit = max_bytes or self.max_page_bytes
+        try:
+            self._check_http_target(url)
+        except BlockedHostError:
+            return None
+        if obey_robots and not await self._robots_allowed(url):
+            return None
 
         # Bygg conditional-headers från cache
         extra_headers: Dict[str, str] = {}
@@ -2160,7 +2267,7 @@ class AsyncWebCrawler:
             if retry_after.strip().isdigit():
                 wait = min(int(retry_after), 60)
             if resp.status in (429, 503):
-                self.rate_limiter.slow_down()
+                self.rate_limiter.slow_down(domain=urlparse(str(resp.url)).netloc.lower())
             await asyncio.sleep(wait)
 
         for attempt in range(max_retries + 1):
@@ -2169,11 +2276,15 @@ class AsyncWebCrawler:
                 await asyncio.sleep(0.3)
             if self.state == CrawlerState.STOPPED:
                 return None
+            await self.rate_limiter.async_wait(urlparse(url).netloc.lower())
+            if self.state == CrawlerState.STOPPED:
+                return None
 
             try:
                 if method == 'HEAD':
                     async with self.req_session.head(
                         url, allow_redirects=True,
+                        trace_request_ctx={'obey_robots': obey_robots},
                         timeout=aiohttp.ClientTimeout(total=10)
                     ) as resp:
                         if resp.status in (403, 405):
@@ -2184,11 +2295,12 @@ class AsyncWebCrawler:
                             )
                         if resp.status in (429, 500, 502, 503, 504):
                             if attempt == max_retries:
-                                return None
+                                return FetchResult(final_url=str(resp.url), status=resp.status)
                             await _backoff(resp, attempt)
                             continue
                         if resp.status >= 400:
-                            return None
+                            return FetchResult(final_url=str(resp.url), status=resp.status)
+                        self.rate_limiter.succeeded(urlparse(str(resp.url)).netloc.lower())
                         return FetchResult(
                             content_type=resp.headers.get('Content-Type', '').lower(),
                             final_url=str(resp.url),
@@ -2198,9 +2310,11 @@ class AsyncWebCrawler:
                 # GET
                 async with self.req_session.get(
                     url, headers=extra_headers,
+                    trace_request_ctx={'obey_robots': obey_robots},
                     timeout=aiohttp.ClientTimeout(total=20)
                 ) as resp:
                     if resp.status == 304:
+                        self.rate_limiter.succeeded(urlparse(str(resp.url)).netloc.lower())
                         return FetchResult(
                             final_url=str(resp.url), status=304,
                             not_modified=True,
@@ -2211,12 +2325,15 @@ class AsyncWebCrawler:
                         return FetchResult(final_url=str(resp.url), status=resp.status)
                     if resp.status in (429, 500, 502, 503, 504):
                         if attempt == max_retries:
-                            return None
+                            if resp.status in (429, 503):
+                                self.rate_limiter.slow_down(domain=urlparse(str(resp.url)).netloc.lower())
+                            return FetchResult(final_url=str(resp.url), status=resp.status)
                         await _backoff(resp, attempt)
                         continue
                     if resp.status >= 400 and resp.status not in (401, 403):
-                        # 401/403 returneras till anroparen så login-detektorn kan agera
-                        return None
+                        return FetchResult(final_url=str(resp.url), status=resp.status)
+                    if 200 <= resp.status < 300:
+                        self.rate_limiter.succeeded(urlparse(str(resp.url)).netloc.lower())
 
                     content_type = resp.headers.get('Content-Type', '').lower()
                     final_url = str(resp.url)
@@ -2261,6 +2378,8 @@ class AsyncWebCrawler:
                     )
             except asyncio.CancelledError:
                 raise
+            except RobotsDeniedError:
+                return None
             except BlockedHostError as e:
                 self._log(f"  ⛔ Blockerad: {url} ({e})", LogLevel.WARNING)
                 return None
@@ -2277,34 +2396,69 @@ class AsyncWebCrawler:
                 return None
         return None
 
+    @staticmethod
+    def _origin(url: str) -> str:
+        parsed = urlparse(url)
+        # Scheme och port är del av robots-reglernas tillämpningsområde.
+        return f'{parsed.scheme.lower()}://{parsed.netloc.lower()}'
+
+    async def _ensure_robots(self, url: str) -> RobotsRules:
+        origin = self._origin(url)
+        lock = self._robots_locks.setdefault(origin, asyncio.Lock())
+        async with lock:
+            if origin in self._robots_rules:
+                return self._robots_rules[origin]
+            try:
+                result = await self.fetch(origin + '/robots.txt', max_retries=2,
+                                          obey_robots=False)
+            except Exception:
+                result = None
+            if result and 200 <= result.status < 300:
+                text = result.text or ''
+            elif result and 400 <= result.status < 500:
+                # RFC 9309: 4xx = unavailable; 5xx/nätverksfel = unreachable.
+                text = 'User-agent: *\nAllow: /\n'
+            else:
+                text = 'User-agent: *\nDisallow: /\n'
+                self._robots_unreachable.add(origin)
+                if self.config.get('respect_robots', True):
+                    self.report['robots_unreachable'].append({'origin': origin})
+                    self._log(f'⚠ robots.txt kan inte nås; avstår från hämtning på {origin}',
+                              LogLevel.WARNING)
+            rules = RobotsRules(text, self.robots_token)
+            self._robots_rules[origin] = rules
+            self._robots_text[origin] = text
+            delay = rules.crawl_delay()
+            if delay and self.config.get('respect_robots', True):
+                self.rate_limiter.set_minimum(urlparse(origin).netloc, delay)
+            if origin == self._origin(self.start_url):
+                self.robot_parser = rules
+            return rules
+
+    async def _robots_allowed(self, url: str) -> bool:
+        if not self.config.get('respect_robots', True):
+            return True
+        rules = await self._ensure_robots(url)
+        if urlparse(url).path == '/robots.txt' or rules.can_fetch(url):
+            return True
+        if url not in self._robots_denied:
+            self._robots_denied.add(url)
+            self.report['robots_denied'].append({'url': url})
+            self._log(f'ℹ Hoppar över enligt robots.txt: {url}', LogLevel.DEBUG)
+        return False
+
     async def _load_robots_txt(self):
-        sitemaps_found = False
-        try:
-            r = await self.fetch(f"{self.base_url}/robots.txt", max_retries=1)
-            # 4xx (saknas/otillåten) betyder "allt är tillåtet" enligt RFC 9309
-            if r and r.text and r.status == 200:
-                self.robot_parser = RobotsRules(r.text, self.robots_token)
-                self._log("✓ robots.txt inläst")
-
-                delay = self.robot_parser.crawl_delay()
-                if delay:
-                    self.rate_limiter.delay = max(self.rate_limiter.delay, delay)
-                    self._log(f"ℹ Crawl-delay från robots.txt: {delay}s", LogLevel.DEBUG)
-
-                if self.find_sitemap:
-                    sitemaps = re.findall(r'(?im)^\s*sitemap:\s*(\S+)', r.text)
-                    if sitemaps:
-                        await asyncio.gather(
-                            *[self._parse_sitemap(sm) for sm in sitemaps],
-                            return_exceptions=True
-                        )
-                        sitemaps_found = True
-        except Exception as e:
-            self._log(f"Kunde inte läsa robots.txt: {e}", LogLevel.DEBUG)
-
-        if self.find_sitemap and not sitemaps_found:
-            self._log("Letar efter sitemap.xml...")
-            await self._parse_sitemap(f"{self.base_url}/sitemap.xml")
+        # Sitemap-inläsning är oberoende av om reglerna ska respekteras.
+        await self._ensure_robots(self.start_url)
+        if not self.find_sitemap:
+            return
+        if (self.config.get('respect_robots', True)
+                and self._origin(self.start_url) in self._robots_unreachable):
+            return
+        text = self._robots_text.get(self._origin(self.start_url), '')
+        sitemaps = re.findall(r'(?im)^\s*sitemap:\s*(\S+)', text)
+        for sm in sitemaps or [self.base_url + '/sitemap.xml']:
+            await self._parse_sitemap(urljoin(self.base_url + '/', sm))
 
     async def _parse_sitemap(self, url: str):
         async with self.async_sitemap_lock:
@@ -2384,7 +2538,7 @@ class AsyncWebCrawler:
                     if (self.config.get("download_docs", False)
                             and self._looks_like_document_url(s)):
                         await self.manifest.record_link(
-                            doc_url=s,
+                            doc_url=normalize_url(s, self.ignore_query_params),
                             referer_url="",          # ingen riktig sida som länkar
                             referer_title="",        # → konvertern faller till metadata/filnamn
                             link_text="(via sitemap)",
@@ -2406,12 +2560,15 @@ class AsyncWebCrawler:
                 if self._context is None:
                     self._pw = await async_playwright().start()
                     is_headless = self.config.get("headless_mode", "headless") != "visible"
-                    self._browser = await self._pw.chromium.launch(headless=is_headless)
+                    self._browser = await self._pw.chromium.launch(
+                        headless=is_headless, **await self._browser_network_options())
                     # HTTPS-fel ignoreras bara om det uttryckligen begärts i config
                     # (t.ex. intranät med egen CA) — annars riskerar inloggningscookies.
                     self._context = await self._browser.new_context(
                         ignore_https_errors=bool(self.config.get("ignore_https_errors", False)),
                         user_agent=self.user_agent,
+                        service_workers='block',
+                        accept_downloads=False,
                     )
                     if self.saved_cookies:
                         try:
@@ -2421,44 +2578,212 @@ class AsyncWebCrawler:
                                       LogLevel.DEBUG)
         return self._context
 
+    async def _browser_network_options(self) -> Dict:
+        """Publika körningar måste använda den kontrollerade utgående proxyn."""
+        if self._allow_private:
+            return {}
+        if self._browser_proxy is None:
+            self._browser_proxy = BrowserEgressProxy(self._log)
+            await self._browser_proxy.start()
+        return {
+            'proxy': {'server': self._browser_proxy.url, 'bypass': '<-loopback>'},
+            'args': ['--disable-quic',
+                     '--force-webrtc-ip-handling-policy=disable_non_proxied_udp'],
+        }
+
+    async def _check_playwright_url_allowed(self, target_url: str) -> bool:
+        """Kontrollerar om en URL är tillåten i Playwright (skydd mot SSRF)."""
+        if self._allow_private:
+            return True
+        host = urlparse(target_url).hostname
+        if not host:
+            return False
+        if is_non_public_host(host):
+            return False
+        allowed = self._dns_allowed_cache.get(host)
+        if allowed is None:
+            loop = asyncio.get_running_loop()
+            try:
+                infos = await loop.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+                allowed = all(ipaddress.ip_address(info[4][0]).is_global for info in infos)
+            except Exception:
+                allowed = False
+            self._dns_allowed_cache[host] = allowed
+        return bool(allowed)
+
     async def _render_with_playwright(self, url: str) -> Tuple[Optional[str], Optional[str]]:
         """Returnerar (html, final_url). Avbryter snabbt vid stop."""
+        result = await self._render_response_with_playwright(url)
+        return result.text, result.final_url or None
+
+    async def _install_browser_guard(self, page, filepath: Optional[str] = None) -> Dict:
+        """Kontrollera varje redirect före sändning och strömma dokument efter headers.
+
+        CDP:s response-stream hindrar Chromium från att först spara hela bilagan.
+        Varken context.request eller route.fetch får användas för dokumentkroppen.
+        """
+        cdp = await page.context.new_cdp_session(page)
+        guard = {'cdp': cdp, 'tasks': set(), 'done': asyncio.Event(),
+                 'started': False, 'success': False, 'reason': '', 'closed': False}
+
+        async def handle(event):
+            request_id = event['requestId']
+            target = event['request']['url']
+            response_stage = 'responseStatusCode' in event or 'responseErrorReason' in event
+            try:
+                if not response_stage:
+                    self._check_http_target(target)
+                    if self.state == CrawlerState.STOPPED:
+                        raise RobotsDeniedError('Körningen stoppad')
+                    if event['resourceType'] in ('Image', 'Stylesheet', 'Font', 'Media'):
+                        await cdp.send('Fetch.failRequest', {'requestId': request_id,
+                                                           'errorReason': 'Aborted'})
+                        return
+                    if event['resourceType'] == 'Document':
+                        if not await self._robots_allowed(target):
+                            raise RobotsDeniedError('Robots.txt nekar navigation')
+                        await self.rate_limiter.async_wait(urlparse(target).netloc.lower())
+                    await cdp.send('Fetch.continueRequest', {'requestId': request_id})
+                    return
+                status = event.get('responseStatusCode', 0)
+                headers = {h['name'].lower(): h['value'] for h in event.get('responseHeaders', [])}
+                content_type = headers.get('content-type', '').lower()
+                is_document = ('attachment' in headers.get('content-disposition', '').lower()
+                               or any(ct in content_type for ct in (
+                                   'application/pdf', 'application/vnd', 'application/msword',
+                                   'application/octet-stream', 'application/zip', 'text/csv',
+                                   'application/rtf', 'application/x-download')))
+                if filepath and is_document and status == 200:
+                    guard['started'] = True
+                    guard['final_url'] = target
+                    try:
+                        if (self.config.get('strict_domain', True)
+                                and not self._domain_allowed(urlparse(target).netloc)):
+                            guard['reason'] = 'omdirigerad utanför tillåtna domäner'
+                        else:
+                            guard['success'] = await self._stream_browser_document(
+                                cdp, request_id, headers, filepath, guard)
+                    finally:
+                        # En övertagen stream kan inte fortsätta som vanlig navigation.
+                        await cdp.send('Fetch.failRequest', {'requestId': request_id,
+                                                           'errorReason': 'Aborted'})
+                        guard['done'].set()
+                    return
+                await cdp.send('Fetch.continueRequest', {'requestId': request_id})
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                guard['reason'] = guard['reason'] or str(e)[:160]
+                try:
+                    await cdp.send('Fetch.failRequest', {'requestId': request_id,
+                                                       'errorReason': 'Aborted'})
+                except Exception:
+                    pass
+                if filepath and (guard['started'] or event['resourceType'] == 'Document'):
+                    guard['done'].set()
+
+        def paused(event):
+            if guard['closed']:
+                return
+            task = asyncio.create_task(handle(event))
+            guard['tasks'].add(task)
+            task.add_done_callback(guard['tasks'].discard)
+
+        guard['callback'] = paused
+        cdp.on('Fetch.requestPaused', paused)
+        patterns = [{'urlPattern': '*', 'requestStage': 'Request'}]
+        if filepath:
+            patterns.append({'urlPattern': '*', 'resourceType': 'Document',
+                             'requestStage': 'Response'})
+        await cdp.send('Fetch.enable', {'patterns': patterns})
+        return guard
+
+    async def _stream_browser_document(self, cdp, request_id: str, headers: Dict,
+                                       filepath: str, guard: Dict) -> bool:
+        """Läs högst max_download_bytes + en byte och kasta temporärt browser-lager."""
+        size_header = headers.get('content-length', '')
+        if size_header.isdigit() and int(size_header) > self.max_download_bytes:
+            guard['reason'] = 'för stort'
+            return False
+        stream = None
+        written = 0
+        success = False
+        try:
+            result = await cdp.send('Fetch.takeResponseBodyAsStream', {'requestId': request_id})
+            stream = result['stream']
+            async with asyncio.timeout(120):
+                with open(filepath, 'wb') as output:
+                    while self.state != CrawlerState.STOPPED:
+                        block = await cdp.send('IO.read', {
+                            'handle': stream, 'size': min(65536, self.max_download_bytes - written + 1)})
+                        data = (base64.b64decode(block['data']) if block.get('base64Encoded')
+                                else block['data'].encode('utf-8'))
+                        written += len(data)
+                        if written > self.max_download_bytes:
+                            guard['reason'] = 'för stort'
+                            return False
+                        output.write(data)
+                        if block.get('eof'):
+                            success = written > 0
+                            if success:
+                                self.rate_limiter.succeeded(urlparse(guard.get("final_url") or self.start_url).netloc.lower())
+                            return success
+                guard['reason'] = 'körningen stoppad'
+                return False
+        finally:
+            if stream:
+                try:
+                    await cdp.send('IO.close', {'handle': stream})
+                except Exception:
+                    pass
+            if not success and os.path.exists(filepath):
+                os.remove(filepath)
+
+    async def _close_browser_guard(self, guard: Dict):
+        guard['closed'] = True
+        cdp = guard['cdp']
+        cdp.remove_listener('Fetch.requestPaused', guard['callback'])
+        tasks = list(guard['tasks'])
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await cdp.detach()
+        except Exception:
+            pass
+
+    async def _render_response_with_playwright(self, url: str) -> FetchResult:
+        """Bevara HTTP-status även när Chromium renderar svaret."""
         async with self.playwright_semaphore:
             ctx = await self.get_playwright_context()
             if ctx is None:
-                return None, None
+                return FetchResult()
             page = await ctx.new_page()
 
-            async def intercept_route(route):
-                try:
-                    req = route.request
-                    if req.resource_type in ("image", "stylesheet", "font", "media"):
-                        await route.abort()
-                    elif (not self._allow_private
-                          and is_non_public_host(urlparse(req.url).hostname)):
-                        await route.abort()
-                    else:
-                        await route.continue_()
-                except Exception:
-                    pass
-
+            guard = None
             try:
-                await page.route("**/*", intercept_route)
+                guard = await self._install_browser_guard(page)
                 # Kort timeout — om sidan inte är klar inom 12s tar vi vad vi har
                 goto_ok = False
                 try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=12000)
+                    response = await page.goto(url, wait_until="domcontentloaded", timeout=12000)
                     goto_ok = True
                 except Exception as e:
                     self._log(f"  ⚠ Playwright kunde inte ladda {url}: {str(e)[:80]}",
                               LogLevel.DEBUG)
                 # Avbryt om goto misslyckades eller crawl stoppats
                 if not goto_ok or self.state == CrawlerState.STOPPED:
-                    return None, None
+                    return FetchResult()
                 html = await page.content()
                 final_url = page.url
-                return html, final_url
+                if response and 200 <= response.status < 300:
+                    self.rate_limiter.succeeded(urlparse(final_url).netloc.lower())
+                return FetchResult(text=html, final_url=final_url,
+                                   status=response.status if response else 200)
             finally:
+                if guard:
+                    await self._close_browser_guard(guard)
                 try:
                     await page.close()
                 except Exception:
@@ -2466,36 +2791,7 @@ class AsyncWebCrawler:
 
     # ─── PII-tvätt ──────────────────────────────────────────
     def clean_pii(self, text: str) -> str:
-        if not text:
-            return text
-        if self.config.get("remove_email"):
-            keep_role = self.config.get("keep_role_emails", False)
-
-            def _mask_email(m):
-                local = m.group(0).split('@')[0].lower()
-                if keep_role and local in ROLE_MAILBOX_LOCALPARTS:
-                    return m.group(0)
-                return '[E-POST]'
-
-            text = re.sub(
-                r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b',
-                _mask_email, text
-            )
-        if self.config.get("remove_pnr"):
-            pnr_pattern = (
-                r'(?<!\d)(?:19|20)?\d{2}(?:0[1-9]|1[0-2])'
-                r'(?:0[1-9]|[12]\d|3[01]|[6-9]\d)[\-\+]?\d{4}(?!\d)'
-            )
-            text = re.sub(pnr_pattern, '[PERSONNUMMER]', text)
-        if self.config.get("remove_phone"):
-            phone_pattern = (
-                r'(?<!\d)(?:(?:\+|00)46[\s\-]*\(?0\)?[\s\-]*[1-9]|'
-                r'0[\s\-]*\(?[1-9]\)?)[\s\-]*\d(?:[\s\-]*\d){4,8}\b'
-            )
-            text = re.sub(phone_pattern, '[TELEFON]', text)
-        if self.config.get("remove_ip"):
-            text = re.sub(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', '[IP-ADRESS]', text)
-        return text
+        return clean_pii_text(self.config, text)
 
     # ─── Innehållsextraktion ────────────────────────────────
     def extract_structured_data(self, html: str, url: str) -> Dict:
@@ -2504,21 +2800,45 @@ class AsyncWebCrawler:
         except Exception:
             soup = BeautifulSoup(html, 'html.parser')
 
+        base_tag = soup.find('base', href=True)
+        base_url = urljoin(url, base_tag['href'].strip()) if base_tag else url
+        if urlparse(base_url).scheme not in ('http', 'https'):
+            base_url = url
+
         # Dold text och kommentarer kan innehålla instruktioner riktade mot en
-        # LLM (indirekt prompt-injektion). Vi flaggar sådana sidor i rapporten.
-        hidden_texts: List[str] = []
+        # LLM (indirekt prompt-injektion). Vi undersöker dolda element och kommentarer:
+        # Om ett dolt element innehåller ett injektionsmönster raderas det så att det
+        # varken når Trafilatura eller reservvägen.
+        # Normala dolda element (accordions, FAQ-paneler, flikar, liten text) bevaras!
+        hidden_elements = []
         for el in soup.find_all(True, style=_HIDDEN_STYLE_RE):
-            hidden_texts.append(el.get_text(' ', strip=True))
+            hidden_elements.append(el)
         for el in soup.find_all(attrs={"hidden": True}):
-            hidden_texts.append(el.get_text(' ', strip=True))
-        for c in soup.find_all(string=lambda t: isinstance(t, Comment)):
-            hidden_texts.append(str(c))
+            hidden_elements.append(el)
+        for el in soup.find_all(attrs={"aria-hidden": "true"}):
+            hidden_elements.append(el)
+
+        hidden_texts: List[str] = []
+        for el in hidden_elements:
+            if el.decomposed if hasattr(el, "decomposed") else False:
+                continue
+            t = el.get_text(' ', strip=True)
+            if t:
+                hidden_texts.append(t)
+                if detect_prompt_injection(t):
+                    el.decompose()
+
+        for c in list(soup.find_all(string=lambda t: isinstance(t, Comment))):
+            c_str = str(c).strip()
+            if c_str:
+                hidden_texts.append(c_str)
+            c.extract()
 
         page_links = []
         for a_tag in soup.find_all('a', href=True):
             href = a_tag.get('href', '').strip()
             if href and not href.startswith(('#', 'javascript:', 'mailto:', 'tel:')):
-                full_url = urljoin(url, href)
+                full_url = urljoin(base_url, href)
                 a_tag['href'] = full_url
                 # Länktexten kan innehålla namn/e-post och ska tvättas som all annan text
                 link_text = self.clean_pii(a_tag.get_text(separator=' ', strip=True)[:200])
@@ -2533,7 +2853,7 @@ class AsyncWebCrawler:
         title = clean_page_title(raw_title or og_title, self.domain)
         if not title and 3 <= len(h1_text) <= 200:
             title = h1_text
-        title = self.clean_pii(title or "Okänd")
+        title = metadata_line(self.clean_pii(title or "Okänd"))
 
         keywords = []
         meta_kw = soup.find('meta', attrs={'name': re.compile(r'keywords', re.I)})
@@ -2611,16 +2931,18 @@ class AsyncWebCrawler:
         full_text = ""
         structured_sections: List[Dict] = []
 
+        cleaned_html = str(soup)
+
         if self.use_trafilatura and HAS_TRAFILATURA:
             try:
                 extracted = trafilatura.extract(
-                    html, include_links=True, include_images=False,
+                    cleaned_html, include_links=True, include_images=False,
                     include_tables=True, include_formatting=True,
                     output_format="markdown", url=url,
                 )
                 if extracted:
                     extracted = self.clean_pii(extracted)
-                    extracted = absolutize_markdown_links(extracted, url)
+                    extracted = absolutize_markdown_links(extracted, base_url)
                     raw_sections = re.split(r'(?=^#{1,6}\s)', extracted, flags=re.MULTILINE)
                     heading_stack: List[Tuple[int, str]] = []
                     for raw in raw_sections:
@@ -2646,13 +2968,6 @@ class AsyncWebCrawler:
                 self._log(f"  ⚠ Trafilatura misslyckades ({e})", LogLevel.DEBUG)
 
         if not full_text:
-            # Dolda element är aldrig synligt innehåll — bort med dem innan texten byggs
-            for el in soup.find_all(True, style=_HIDDEN_STYLE_RE):
-                el.decompose()
-            for el in soup.find_all(attrs={"hidden": True}):
-                el.decompose()
-            for el in soup.find_all(attrs={"aria-hidden": "true"}):
-                el.decompose()
             for tag in ('script', 'style', 'nav', 'footer', 'aside',
                         'iframe', 'svg', 'button', 'form'):
                 for el in soup.find_all(tag):
@@ -2771,10 +3086,10 @@ class AsyncWebCrawler:
             "url": url,
             "crawled_at": datetime.now().isoformat(),
             "author": author,
-            "published_date": pub_date,
-            "modified_date": mod_date,
-            "language": lang,
-            "canonical": urljoin(url, canonical) if canonical else "",
+            "published_date": metadata_line(self.clean_pii(pub_date)),
+            "modified_date": metadata_line(self.clean_pii(mod_date)),
+            "language": metadata_line(self.clean_pii(lang)),
+            "canonical": urljoin(base_url, canonical) if canonical else "",
             "og_type": og_type,
             "description": description,
             "keywords": keywords,
@@ -2821,8 +3136,9 @@ class AsyncWebCrawler:
         return ""
 
     # ─── Process page ───────────────────────────────────────
-    def _text_output_path(self, url: str) -> str:
-        return os.path.join(self.output_dir, "texter", stable_filename(url, self.save_format))
+    def _text_output_path(self, url: str, is_quarantined: bool = False) -> str:
+        folder = "texter_karantan" if is_quarantined else "texter"
+        return os.path.join(self.output_dir, folder, stable_filename(url, self.save_format))
 
     def _saves_text(self) -> bool:
         return self.save_format not in ("Ingen text", "No text")
@@ -2841,7 +3157,7 @@ class AsyncWebCrawler:
             if (self.config.get("download_docs", False)
                     and self._looks_like_document_url(full_url)):
                 await self.manifest.record_link(
-                    doc_url=full_url,
+                    doc_url=normalize_url(full_url, self.ignore_query_params),
                     referer_url=url,
                     referer_title=page_title,
                     link_text=link_info.get("text", ""),
@@ -2853,8 +3169,44 @@ class AsyncWebCrawler:
         """True om den sparade textfilen för en cachad sida finns (eller inte ska finnas)."""
         if not self._saves_text() or not cached or not cached.get('filename'):
             return True
-        return os.path.exists(os.path.join(
-            self.output_dir, "texter", os.path.basename(cached['filename'])))
+        fn = os.path.basename(cached['filename'])
+        return (os.path.exists(os.path.join(self.output_dir, "texter", fn)) or
+                os.path.exists(os.path.join(self.output_dir, "texter_karantan", fn)))
+
+    def _page_profile(self) -> str:
+        # Urval och hämtmotor ändrar inte hur redan sparad text har tvättats.
+        # De prövas separat, också för källor som inte hinns med denna körning.
+        keys = ('remove_email', 'remove_phone', 'remove_pnr', 'remove_ip', 'keep_role_emails',
+                'quarantine_flagged_chunks')
+        defaults = {'quarantine_flagged_chunks': True}
+        options = {key: bool(self.config.get(key, defaults.get(key, False))) for key in keys}
+        options.update(format=self.save_format,
+                       trafilatura=bool(self.use_trafilatura and HAS_TRAFILATURA),
+                       extractor_version=4)
+        return hashlib.sha256(json.dumps(options, sort_keys=True).encode('utf-8')).hexdigest()
+
+    @staticmethod
+    def _page_output_hash(data: Dict) -> str:
+        # Hämtningstid ska inte ensam skapa en ny innehållsversion. Övriga
+        # exporterade fält (inklusive titel, språk och ändringsdatum) ska göra det.
+        payload = {key: value for key, value in data.items() if key != 'crawled_at'}
+        return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode('utf-8')).hexdigest()
+
+    async def _save_page_cache(self, url: str, data: Dict, content_hash: str,
+                               etag: Optional[str], last_modified: Optional[str],
+                               links: List[Dict], filename: Optional[str], fetch_url: str,
+                               rendered: bool = False):
+        await self.db.save_cache(url, content_hash, data['title'], len(data['plain_text']),
+                                 etag=etag, last_modified=last_modified, links=links, filename=filename,
+                                 fetch_url=fetch_url, source_url=data['url'],
+                                 processing_profile=self._page_profile(), output_hash=self._page_output_hash(data),
+                                 rendered=rendered)
+
+    def _exportable_page(self, cached: Optional[Dict]) -> bool:
+        return bool(cached and cached.get('filename') and self._saves_text()
+                    and cached.get('processing_profile') == self._page_profile()
+                    and os.path.isfile(os.path.join(self.output_dir, 'texter',
+                                                    os.path.basename(cached['filename']))))
 
     async def _replay_cached(self, url: str, cached: Optional[Dict], depth: int,
                              status_text: str, etag: Optional[str] = None,
@@ -2864,7 +3216,8 @@ class AsyncWebCrawler:
         så att undersidorna ändå besöks. Returnerar False om uppspelning inte är möjlig
         (inga sparade länkar eller saknad textfil) — då måste sidan hämtas på riktigt."""
         links = cached.get('links') if cached else None
-        if links is None or not self._text_file_present(cached):
+        if (links is None or not self._text_file_present(cached)
+                or cached.get('processing_profile') != self._page_profile()):
             return False
         async with self.async_stats_lock:
             if from_sitemap:
@@ -2874,8 +3227,10 @@ class AsyncWebCrawler:
             self.stats.pages_visited += 1
         self._login_expired_streak = 0
         self._gui_update(url, status_text, cached.get('title', ''))
-        await self.db.touch_cache(url, etag=etag, last_modified=last_mod)
-        await self._enqueue_links(url, cached.get('title', ''), links, depth)
+        await self.db.touch_cache(url, etag=etag, last_modified=last_mod,
+                                  checked=not from_sitemap)
+        await self._enqueue_links(cached.get('source_url') or cached.get('fetch_url') or url,
+                                  cached.get('title', ''), links, depth)
         return True
 
     @staticmethod
@@ -2896,14 +3251,15 @@ class AsyncWebCrawler:
 
         Säkerhetsventil: sajter med felaktig lastmod upptäcks via att sidor äldre än
         `sitemap_lastmod_max_age_days` alltid kontrolleras igen med villkorlig GET."""
-        if not self.use_sitemap_lastmod or not self.sitemap_lastmod:
+        if not self.use_sitemap_lastmod or not self.sitemap_lastmod or cached.get('rendered'):
             return False
         lastmod = self.sitemap_lastmod.get(normalize_url(url, self.ignore_query_params))
-        if not lastmod or not cached.get('crawled_at'):
+        if (not lastmod or not cached.get('checked_at')
+                or cached.get('processing_profile') != self._page_profile()):
             return False
         modified = self._parse_lastmod(lastmod)
         try:
-            crawled = datetime.fromisoformat(cached['crawled_at'])
+            crawled = datetime.fromisoformat(cached['checked_at'])
         except ValueError:
             return False
         if modified is None or modified > crawled:
@@ -2926,35 +3282,37 @@ class AsyncWebCrawler:
         # Två sidor som pekar på varandra: spara båda hellre än ingen
         if self._canonical_of.get(canon) == me:
             return None
-        return canon
+        return request_url(canonical)
 
     async def _drop_saved_page(self, url: str, cached: Optional[Dict], reason: str):
         """Sidan sparas inte längre (t.ex. blev en dubblett) — ta bort en äldre sparad fil."""
         if cached and cached.get('filename'):
-            try:
-                os.remove(os.path.join(self.output_dir, "texter",
-                                       os.path.basename(cached['filename'])))
-            except OSError:
-                pass
+            fn = os.path.basename(cached['filename'])
+            for folder in ("texter", "texter_karantan"):
+                try:
+                    os.remove(os.path.join(self.output_dir, folder, fn))
+                except OSError:
+                    pass
             self.counts["removed"] += 1
             self._record_change("removed", url, reason=reason, file=cached['filename'])
 
-    async def _handle_gone(self, url: str, cached: Optional[Dict], status: int):
+    async def _handle_gone(self, url: str, cached: Optional[Dict], status: int, confirmed: bool = True):
         """404/410: sidan finns inte längre. Ta bort den sparade texten och cachen."""
         async with self.async_stats_lock:
             self.stats.pages_failed += 1
-        self.report["gone_pages"].append({"url": url, "status": status})
+        self.report["gone_pages"].append({"url": url, "status": status, 'confirmed': confirmed})
         if cached is not None:
             fn = cached.get('filename')
             if fn:
-                try:
-                    os.remove(os.path.join(self.output_dir, "texter", os.path.basename(fn)))
-                except OSError:
-                    pass
+                for folder in ("texter", "texter_karantan"):
+                    try:
+                        os.remove(os.path.join(self.output_dir, folder, os.path.basename(fn)))
+                    except OSError:
+                        pass
             await self.db.delete_page(url)
             self.counts["removed"] += 1
-            self._record_change("removed", url, reason=f"HTTP {status}",
-                                file=fn)
+            self._record_change("removed", url, reason=f"HTTP {status}" if confirmed else 'soft 404',
+                                 file=fn)
             self._gui_update(url, f"Borttagen ({status})", cached.get('title', ''))
         else:
             self._gui_update(url, f"Hittades inte ({status})", "")
@@ -2965,35 +3323,42 @@ class AsyncWebCrawler:
         while self.state == CrawlerState.PAUSED:
             await asyncio.sleep(0.3)
 
-        domain = urlparse(url).netloc
-        await self.rate_limiter.async_wait(domain)
+        fetch_url = request_url(url)
+        url = normalize_url(url, self.ignore_query_params)
+        if not await self._robots_allowed(fetch_url):
+            return False
 
         if self.state == CrawlerState.STOPPED:
             return False
 
-        cached = await self.db.get_cache(url) if self.config.get("incremental") else None
-        html, source, final_url = "", "Standard", url
+        # Filregistret behövs för städning också vid full omcrawl. Bara
+        # validatorer och innehållsåteranvändning styrs av incremental.
+        cached = await self.db.get_cache(url)
+        conditional_cache = (cached if self.config.get("incremental") and cached
+                             and cached.get('processing_profile') == self._page_profile() else None)
+        html, source, final_url = "", "Standard", fetch_url
         etag, last_mod = None, None
+        render_status = 0
 
         try:
             # ─── Dokument-URL: hoppa över HTML-flödet helt ───
             # URL-extensionen är en starkare signal än Content-Type. Sitevision
             # och andra CMS:er returnerar ofta text/html för PDF-URL:er när
             # auth-cookies finns (de serverar en förhandsvyssida).
-            if self._looks_like_document_url(url):
+            if self._looks_like_document_url(fetch_url):
                 if self.config.get("download_docs", False):
-                    await self.download_document(url)
+                    await self.download_document(fetch_url)
                 return True
 
             # ─── Sitemapens lastmod säger att sidan inte ändrats sedan vi sist hämtade den ───
-            if cached and self._sitemap_says_unchanged(url, cached):
+            if conditional_cache and self._sitemap_says_unchanged(url, cached):
                 if await self._replay_cached(url, cached, depth, "Ej ändrad (sitemap)",
                                              from_sitemap=True):
                     return True
 
             # ─── GET (med conditional headers) ───
             if self.use_hybrid:
-                result = await self.fetch(url, cached=cached)
+                result = await self.fetch(fetch_url, cached=conditional_cache)
 
                 # 304 Not Modified: sidan är oförändrad. Vi "spelar upp" de sparade
                 # länkarna så att undersidorna ändå besöks (annars stannar en
@@ -3003,7 +3368,7 @@ class AsyncWebCrawler:
                     if await self._replay_cached(url, cached, depth, "Ej ändrad (304)",
                                                  result.etag, result.last_modified):
                         return True
-                    result = await self.fetch(url, cached=None)
+                    result = await self.fetch(fetch_url, cached=None)
 
                 if result is None:
                     async with self.async_stats_lock:
@@ -3013,42 +3378,58 @@ class AsyncWebCrawler:
 
                 if result.status in (404, 410):
                     await self._handle_gone(url, cached, result.status)
+                    if url == normalize_url(self.start_url, self.ignore_query_params) and not cached:
+                        self.stats.pages_failed += 1
                     return False
 
                 # 401/403 → behandla som login-utgång eller räkna som fel
                 if result.status in (401, 403):
                     if self._login_detection_enabled:
-                        await self._handle_login_expired(url)
+                        await self._handle_login_expired(url, status=result.status)
                     else:
                         self._log(f"  ✗ HTTP {result.status}: {url}", LogLevel.DEBUG)
                         async with self.async_stats_lock:
                             self.stats.pages_failed += 1
                         self._gui_update(url, f"HTTP {result.status}", "")
+                    if result.status == 403 and self._login_detection_enabled:
+                        await self._drop_saved_page(url, cached, 'HTTP 403')
+                        await self.db.mark_page_unsaved(url)
+                    return False
+
+                if result.status >= 400:
+                    self.stats.pages_failed += 1
                     return False
 
                 # Content-typ-hantering
-                final_url = result.final_url or url
+                final_url = result.final_url or fetch_url
                 etag = result.etag
                 last_mod = result.last_modified
                 content_type = result.content_type
 
                 if any(t in content_type for t in ('image/', 'video/', 'audio/', 'font/')):
+                    await self._drop_saved_page(url, cached, 'ändrad filtyp')
+                    await self.db.mark_page_unsaved(url)
                     return False
                 if any(dt in content_type for dt in ('application/pdf', 'application/vnd',
                                                      'application/msword')):
                     if self.config.get("download_docs", False):
-                        await self.download_document(url)
+                        await self.download_document(fetch_url)
+                    await self._drop_saved_page(url, cached, 'sidan är nu ett dokument')
+                    await self.db.mark_page_unsaved(url)
                     return True
 
                 html = result.text or ""
                 if not html:
+                    self.stats.pages_failed += 1
                     return False
 
                 # JS-fallback
                 if self._needs_javascript(html):
                     if self.state == CrawlerState.STOPPED:
                         return False
-                    rendered_html, rendered_url = await self._render_with_playwright(url)
+                    rendered = await self._render_response_with_playwright(final_url)
+                    rendered_html, rendered_url = rendered.text, rendered.final_url
+                    render_status = rendered.status
                     if rendered_html:
                         html = rendered_html
                         final_url = rendered_url or final_url
@@ -3064,11 +3445,33 @@ class AsyncWebCrawler:
                 # Endast Playwright
                 if self.state == CrawlerState.STOPPED:
                     return False
-                rendered_html, rendered_url = await self._render_with_playwright(url)
+                rendered = await self._render_response_with_playwright(fetch_url)
+                rendered_html, rendered_url = rendered.text, rendered.final_url
+                render_status = rendered.status
                 if rendered_html:
                     html = rendered_html
-                    final_url = rendered_url or url
+                    final_url = rendered_url or fetch_url
                     source = "Webbläsare"
+
+            if render_status in (404, 410):
+                await self._handle_gone(url, cached, render_status)
+                if url == normalize_url(self.start_url, self.ignore_query_params) and not cached:
+                    self.stats.pages_failed += 1
+                return False
+            if render_status in (401, 403):
+                if self._login_detection_enabled:
+                    await self._handle_login_expired(url, status=render_status)
+                else:
+                    async with self.async_stats_lock:
+                        self.stats.pages_failed += 1
+                if render_status == 403 and self._login_detection_enabled:
+                    await self._drop_saved_page(url, cached, 'HTTP 403')
+                    await self.db.mark_page_unsaved(url)
+                return False
+            if render_status >= 400 or not html:
+                async with self.async_stats_lock:
+                    self.stats.pages_failed += 1
+                return False
 
             if self.state == CrawlerState.STOPPED:
                 return False
@@ -3088,6 +3491,8 @@ class AsyncWebCrawler:
 
                 if triggered:
                     await self._handle_login_expired(url)
+                    await self._drop_saved_page(url, cached, 'inloggning krävs')
+                    await self.db.mark_page_unsaved(url)
                     return False
 
             # ─── Redirect utanför domänen / bot-skydd ───
@@ -3095,6 +3500,8 @@ class AsyncWebCrawler:
                     and not self._domain_allowed(urlparse(final_url).netloc)):
                 self.report["off_domain_redirects"].append({"url": url, "final_url": final_url})
                 self._gui_update(url, "Omdirigerad utanför domän", "")
+                await self._drop_saved_page(url, cached, 'omdirigerad utanför tillåtna domäner')
+                await self.db.mark_page_unsaved(url)
                 return False
             if final_url != url:
                 # Slut-URL:en är redan besökt — undvik att hämta samma innehåll två gånger
@@ -3109,13 +3516,13 @@ class AsyncWebCrawler:
                 self._gui_update(url, "Blockerad av sajten", "")
                 return False
 
-            data = await asyncio.to_thread(self.extract_structured_data, html, url)
+            data = await asyncio.to_thread(self.extract_structured_data, html, final_url)
             content_hash = get_clean_hash(data["plain_text"])
             text_length = len(data["plain_text"])
 
             if _SOFT_404_TITLE_RE.search(data["title"]) and text_length < 1500:
                 self.report["soft_404"].append(url)
-                await self._handle_gone(url, cached, 404)
+                await self._handle_gone(url, cached, 404, confirmed=False)
                 return False
 
             if "possible_prompt_injection" in data.get("flags", []):
@@ -3131,9 +3538,9 @@ class AsyncWebCrawler:
                 if page_lang and page_lang not in self.languages:
                     self.report["wrong_language"].append({"url": url, "language": page_lang})
                     self._gui_update(url, f"Hoppar över språk ({page_lang})", data["title"])
-                    await self.db.save_cache(url, content_hash, data["title"], text_length,
-                                             etag=etag, last_modified=last_mod,
-                                             links=[], filename=None)
+                    await self._drop_saved_page(url, cached, "fel språk")
+                    await self._save_page_cache(url, data, content_hash, etag, last_mod, [], None, fetch_url,
+                                                rendered=source == 'Webbläsare')
                     async with self.async_stats_lock:
                         self.stats.pages_visited += 1
                     return True
@@ -3141,47 +3548,35 @@ class AsyncWebCrawler:
             # ─── Canonical: sidan är en kopia av en annan URL ───
             canon = self._canonical_duplicate(url, data.get("canonical"))
             if canon:
-                self._canonical_of[normalize_url(url, self.ignore_query_params)] = canon
-                self.report["canonical_skipped"].append({"url": url, "canonical": canon})
+                canon_key = normalize_url(canon, self.ignore_query_params)
+                self._canonical_of[url] = canon_key
+                self._canonical_pending[url] = canon_key
                 self.url_queue.add_url(canon, depth=depth, base_priority=CrawlPriority.HIGH.value)
-                await self._drop_saved_page(url, cached, f"canonical → {canon}")
-                self._gui_update(url, "Duplikat (canonical)", data["title"])
-                await self.db.save_cache(url, content_hash, data["title"], text_length,
-                                         etag=None, last_modified=None,
-                                         links=page_links, filename=None)
-                await self._enqueue_links(url, data.get("title", ""), page_links, depth)
-                async with self.async_stats_lock:
-                    self.stats.pages_visited += 1
-                return True
 
-            # ─── Samma innehåll på en annan URL (utskriftsversion, språkvariant …) ───
-            if self.dedupe_content and self._saves_text() and text_length >= 200:
-                dup_of = self._hash_owner.get(content_hash)
-                if dup_of == url:
-                    dup_of = None
-                elif dup_of is None:
-                    self._hash_owner[content_hash] = url
-                    other = await self.db.find_original_by_hash(content_hash, url)
-                    if other:
-                        dup_of = other
-                        self._hash_owner[content_hash] = other
-                if dup_of:
-                    self.report["duplicates"].append({"url": url, "duplicate_of": dup_of})
-                    await self._drop_saved_page(url, cached, f"duplicate_of {dup_of}")
-                    self._gui_update(url, "Duplikat av annan sida", data["title"])
-                    await self.db.save_cache(url, content_hash, data["title"], text_length,
-                                             etag=None, last_modified=None,
-                                             links=page_links, filename=None)
-                    await self._enqueue_links(url, data.get("title", ""), page_links, depth)
-                    async with self.async_stats_lock:
-                        self.stats.pages_visited += 1
-                    return True
+            # Dubblettbeslut tas först efter alla sidkontroller. Ett tidigare
+            # original kan ändras eller försvinna senare i samma körning.
 
-            out_path = self._text_output_path(url)
+            is_quarantined = bool(data.get("flags") and self.config.get("quarantine_flagged_chunks", True))
+            out_path = self._text_output_path(url, is_quarantined=is_quarantined)
             fn = os.path.basename(out_path) if self._saves_text() else None
+            clean_path = self._text_output_path(url, is_quarantined=False)
+            quarantine_path = self._text_output_path(url, is_quarantined=True)
+
+            if is_quarantined and os.path.exists(clean_path):
+                try:
+                    os.remove(clean_path)
+                except OSError:
+                    pass
+            elif not is_quarantined and os.path.exists(quarantine_path):
+                try:
+                    os.remove(quarantine_path)
+                except OSError:
+                    pass
+
             unchanged = bool(
                 self.config.get("incremental") and cached
-                and cached.get('hash') == content_hash
+                and cached.get('processing_profile') == self._page_profile()
+                and cached.get('output_hash') == self._page_output_hash(data)
                 and (not fn or os.path.exists(out_path))
             )
 
@@ -3194,24 +3589,25 @@ class AsyncWebCrawler:
 
                 if text_length > 50 and self._saves_text():
                     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-                    await asyncio.to_thread(self._write_page_file, out_path, url, data)
+                    await blocking_complete(self._write_page_file, out_path, final_url, data)
                     event = "updated" if cached else "added"
                     self.counts[event] += 1
                     self._record_change(event, url, file=fn, title=data["title"])
                 elif self._saves_text():
                     # För lite text att spara — notera det så att luckor syns i rapporten
                     fn = None
+                    await self._drop_saved_page(url, cached, "för lite text")
                     self.report["short_pages"].append({"url": url, "chars": text_length})
                     self._log(f"  ⚠ För lite text ({text_length} tecken), sparas inte: {url}",
                               LogLevel.DEBUG)
 
-            await self.db.save_cache(url, content_hash, data["title"], text_length,
-                                     etag=etag, last_modified=last_mod,
-                                     links=data.get("page_links", []), filename=fn)
+            await self._save_page_cache(url, data, content_hash, etag, last_mod,
+                                        data.get("page_links", []), fn, fetch_url,
+                                        rendered=source == 'Webbläsare')
             self._login_expired_streak = 0
 
             # ─── Länkdetektering ───
-            await self._enqueue_links(url, data.get("title", ""),
+            await self._enqueue_links(final_url, data.get("title", ""),
                                       data.get("page_links", []), depth)
 
             async with self.async_stats_lock:
@@ -3229,14 +3625,22 @@ class AsyncWebCrawler:
 
     def _write_page_file(self, out_path: str, url: str, data: Dict):
         """Skriver sidans utdatafil atomärt (körs i tråd)."""
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
         if self.save_format == ".json":
             atomic_write_text(out_path, json.dumps(data, ensure_ascii=False, indent=2))
             return
         body = downgrade_body_h1(data['plain_text'])
         if self.save_format == ".txt":
+            meta = [data['title'], '', f'Källa: {url}', f"Hämtad: {data['crawled_at'][:10]}"]
+            for key, label in (('modified_date', 'Senast ändrad'), ('published_date', 'Publicerad'),
+                               ('language', 'Språk')):
+                if data.get(key):
+                    meta.append(f'{label}: {data[key]}')
+            if data.get('flags'):
+                meta.append(f"Flaggor: {', '.join(data['flags'])}")
             atomic_write_text(
                 out_path,
-                f"{data['title']}\n\nKälla: {url}\n\n{markdown_to_plain(body)}\n\nKälla: {url}\n")
+                '\n'.join(meta) + f'\n\n---\n\n{markdown_to_plain(body)}\n\n---\n\nKälla: {url}\n')
             return
         # Markdown: bädda in URL i BRÖDTEXTEN (inte bara i header) eftersom RAG-
         # pipelines ofta kapar de första raderna före retrieval. Upprepa källan
@@ -3250,15 +3654,27 @@ class AsyncWebCrawler:
         meta.append(f"**Hämtad:** {data['crawled_at'][:10]}")
         if data.get('language'):
             meta.append(f"**Språk:** {data['language']}")
+        if data.get('flags'):
+            meta.append(f"**Flaggor:** {', '.join(data['flags'])}")
         atomic_write_text(
             out_path,
             "\n".join(meta) + f"\n\n---\n\n{body}\n\n---\n\n**Källa:** {url}\n")
 
-    async def _handle_login_expired(self, url: str):
-        self._log(f"⚠ Session utgången — inloggningssida detekterad för: {url}",
-                  LogLevel.WARNING)
+    async def _handle_login_expired(self, url: str, status: Optional[int] = None):
+        verified = await self._verify_login()
         async with self.async_stats_lock:
             self.stats.pages_failed += 1
+        if verified is not False:
+            self._login_expired_streak = 0
+            entry = {'url': url, 'status': status}
+            if verified is None:
+                self.report['session_unverified'].append(entry)
+            else:
+                self.report['access_denied'].append(entry)
+            self._gui_update(url, f'HTTP {status}' if status else 'Inloggning krävs', '')
+            return
+        self._log(f"⚠ Session utgången — bekräftad vid sessionskontroll för: {url}",
+                  LogLevel.WARNING)
         self.report["session_expired"].append(url)
         self._gui_update(url, "Session utgången", "")
         self._login_expired_streak += 1
@@ -3270,31 +3686,178 @@ class AsyncWebCrawler:
             self.stop()
 
     # ─── Dokument ───────────────────────────────────────────
+    def _conversion_profile(self) -> str:
+        """Inställningar som avgör om en tidigare dokumenttext kan återanvändas."""
+        keys = ('remove_email', 'remove_phone', 'remove_pnr', 'remove_ip', 'keep_role_emails')
+        options = {key: bool(self.config.get(key, False)) for key in keys}
+        options.update(ocr=bool(self.config.get('ocr', True)),
+                       ocr_languages=str(self.config.get('ocr_languages', 'swe+eng')),
+                       ocr_max_pages=int(self.config.get('ocr_max_pages', 50)),
+                       quarantine=bool(self.config.get('quarantine_flagged_chunks', True)),
+                       converter_version=5)
+        return hashlib.sha256(json.dumps(options, sort_keys=True).encode('utf-8')).hexdigest()
+
+    def _conversion_context(self, ref: Dict, last_modified: Optional[str]) -> str:
+        values = {key: metadata_line(self.clean_pii(ref.get(key, '') or ''))
+                  for key in ('referer_url', 'referer_title', 'link_text')}
+        values['server_modified'] = DocumentConverter._parse_date(last_modified, http=True)
+        return hashlib.sha256(json.dumps(values, sort_keys=True).encode('utf-8')).hexdigest()
+
+    async def _invalidate_document_text(self, url: str, prior: Optional[Dict]):
+        """En gammal konvertering får aldrig leva vidare som text för en ny version."""
+        names = set()
+        if prior:
+            if prior.get('md_filename'):
+                names.add(os.path.basename(prior['md_filename']))
+            if prior.get('filename'):
+                names.add(DocumentConverter.md_filename(url, prior['filename']))
+        await self.db.invalidate_doc_text(url)
+        # Spara invalidationen före filbyte/konvertering också vid avbruten körning.
+        await self.db.flush()
+        for name in names:
+            for folder in ('texter', 'texter_karantan'):
+                path = os.path.join(self.output_dir, folder, name)
+                if os.path.isfile(path):
+                    os.remove(path)
+                    self._record_change('document_text_removed', url, file=name)
+
+    async def _handle_gone_document(self, url: str, prior: Optional[Dict], status: int):
+        await self._invalidate_document_text(url, prior)
+        await self.db.delete_doc(url)
+        if prior and prior.get('filename'):
+            path = os.path.join(self.output_dir, 'dokument', os.path.basename(prior['filename']))
+            if os.path.isfile(path):
+                os.remove(path)
+            self.counts['docs_removed'] += 1
+            self._record_change('document_removed', url, file=prior['filename'],
+                                reason=f'HTTP {status}')
+        self.manifest._downloads.pop(url, None)
+        self.report['gone_documents'].append({'url': url, 'status': status})
+
     async def _convert_document(self, url: str, filepath: str, filename: str,
                                 ref: Dict) -> Optional[str]:
-        if not (self.converter and self.converter.can_convert(filepath)):
+        if not self.converter:
             return None
-        md_path = await asyncio.to_thread(
-            self.converter.convert, filepath, url,
-            referer_url=ref.get('referer_url', ''),
-            referer_title=ref.get('referer_title', ''),
-            link_text=ref.get('link_text', ''),
-        )
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext not in DocumentConverter.SUPPORTED and ext not in DocumentConverter.LEGACY_TARGETS:
+            return None
+        keys = ('remove_email', 'remove_phone', 'remove_pnr', 'remove_ip', 'keep_role_emails',
+                'ocr', 'ocr_languages', 'ocr_max_pages')
+        options = {key: self.config[key] for key in keys if key in self.config}
+        md_name = DocumentConverter.md_filename(url, filename)
+        result = await self._conversion_runner.run(
+            filepath, url, ref, options, md_name, self.max_download_bytes,
+            expected_hash=ref.get('_content_hash'))
+        md_path = None
+        if result.get('text'):
+            md_path = os.path.join(self.output_dir, 'texter', md_name)
+            os.makedirs(os.path.dirname(md_path), exist_ok=True)
+            await blocking_complete(atomic_write_text, md_path, result['text'])
         if md_path:
+            with open(md_path, encoding='utf-8') as f:
+                meta, _ = markdown_file_to_chunks(f.read(), is_document=True)
+            if 'possible_prompt_injection' in meta['flags']:
+                self.report['possible_prompt_injection'].append(url)
+                if self.config.get('quarantine_flagged_chunks', True):
+                    folder = os.path.join(self.output_dir, 'texter_karantan')
+                    os.makedirs(folder, exist_ok=True)
+                    target = os.path.join(folder, os.path.basename(md_path))
+                    os.replace(md_path, target)
+                    md_path = target
             self._log(f"  📄 Konverterad till .md: {os.path.basename(md_path)}",
                       LogLevel.DEBUG)
-            if self.converter.last_used_ocr:
+            if result['ocr']:
                 self.report["ocr_used"].append({"url": url, "file": filename})
         else:
-            reason = self.converter.last_error or "okänd orsak"
+            reason = result['error'] or "okänd orsak"
             self.report["conversion_failures"].append(
                 {"url": url, "file": filename, "reason": reason})
         return md_path
 
+    def _start_conversion_queue(self):
+        if self._conversion_queue is not None or not self.converter:
+            return
+        self._conversion_queue = asyncio.Queue(maxsize=self.config['conversion_queue_size'])
+
+        async def worker():
+            while True:
+                job = await self._conversion_queue.get()
+                try:
+                    if job is None:
+                        return
+                    while self.state == CrawlerState.PAUSED:
+                        await asyncio.sleep(0.3)
+                    if self.state != CrawlerState.STOPPED:
+                        await self._complete_conversion(job)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    self.report['conversion_failures'].append({
+                        'url': job['url'], 'file': job['filename'], 'reason': str(error)[:200]})
+                    self._log(f'⚠ Konverteringsjobb misslyckades: {error}', LogLevel.ERROR)
+                finally:
+                    if job is not None:
+                        self._conversion_pending -= 1
+                    self._conversion_queue.task_done()
+
+        self._conversion_tasks = [asyncio.create_task(worker())
+                                  for _ in range(self.config['conversion_workers'])]
+
+    async def _complete_conversion(self, job: Dict):
+        ref = {**job['ref'], '_content_hash': job['content_hash']}
+        md_path = await self._convert_document(job['url'], job['filepath'], job['filename'], ref)
+        if not md_path:
+            return
+        current = await self.db.get_doc(job['url'])
+        if (not current or current['content_hash'] != job['content_hash']
+                or self._conversion_context(current, current['last_modified']) != job['context_hash']):
+            os.remove(md_path)
+            self.report['conversion_failures'].append({'url': job['url'], 'file': job['filename'],
+                                                       'reason': 'Originalversion eller metadata ändrades under konverteringen'})
+            return
+        await self.db.mark_doc_converted(job['url'], job['content_hash'], os.path.basename(md_path),
+                                         job['profile'], job['context_hash'])
+        self._record_change('document_converted', job['url'], file=os.path.basename(md_path),
+                            content_hash=job['content_hash'])
+
+    async def _queue_conversion(self, job: Dict):
+        ext = os.path.splitext(job['filepath'])[1].lower()
+        if ext not in DocumentConverter.SUPPORTED and ext not in DocumentConverter.LEGACY_TARGETS:
+            return
+        if self._conversion_queue is None:
+            await self._complete_conversion(job)
+            return
+        self._conversion_pending += 1
+        try:
+            await self._conversion_queue.put(job)
+        except BaseException:
+            self._conversion_pending -= 1
+            raise
+
+    async def _close_conversion_queue(self, cancel: bool = False):
+        if not self._conversion_tasks:
+            return
+        if cancel:
+            for task in self._conversion_tasks:
+                if not task.cancelling():
+                    task.cancel()
+        else:
+            await self._conversion_queue.join()
+            for _ in self._conversion_tasks:
+                await self._conversion_queue.put(None)
+        await asyncio.gather(*self._conversion_tasks, return_exceptions=True)
+        self._conversion_tasks = []
+        if cancel:
+            while not self._conversion_queue.empty():
+                job = self._conversion_queue.get_nowait()
+                if job is not None:
+                    self._conversion_pending -= 1
+                self._conversion_queue.task_done()
+
     async def _download_via_aiohttp(self, url: str, docs_dir: str, default_name: str,
                                     url_ext: str, slug_base: str, url_hash: str,
                                     headers: Dict[str, str],
-                                    prior_path: Optional[str]) -> Dict:
+                                    prior_path: Optional[str], prior_hash: Optional[str] = None) -> Dict:
         """Strömmar ett dokument till <fil>.part och byter atomärt till slutnamnet.
 
         Returnerar dict med "status": ok | not_modified | same | too_large |
@@ -3302,15 +3865,29 @@ class AsyncWebCrawler:
         """
         part_path = None
         try:
+            self._check_http_target(url)
             async with self.req_session.get(
                 url, headers=headers, timeout=aiohttp.ClientTimeout(total=120)
             ) as resp:
+                if resp.status in (429, 503):
+                    self.rate_limiter.slow_down(domain=urlparse(str(resp.url)).netloc.lower())
+                elif resp.status in (200, 304):
+                    self.rate_limiter.succeeded(urlparse(str(resp.url)).netloc.lower())
                 if resp.status == 304:
-                    return {"status": "not_modified"}
+                    return {"status": "not_modified", 'etag': resp.headers.get('ETag'),
+                            'last_modified': resp.headers.get('Last-Modified')}
+                if resp.status in (404, 410):
+                    return {"status": "gone", "http_status": resp.status}
                 if resp.status != 200:
                     self._log(f"  ⚠ aiohttp HTTP {resp.status} för dokument: {url}",
                               LogLevel.DEBUG)
-                    return {"status": "failed"}
+                    return {"status": "failed", "browser_retry": resp.status in (401, 403)}
+
+                if (self.config.get('strict_domain', True)
+                        and not self._domain_allowed(resp.url.raw_authority)):
+                    self.report['off_domain_redirects'].append(
+                        {'url': url, 'final_url': str(resp.url)})
+                    return {"status": "blocked"}
 
                 content_type = resp.headers.get('Content-Type', '').lower()
                 cd_raw = resp.headers.get('Content-Disposition', '')
@@ -3328,7 +3905,7 @@ class AsyncWebCrawler:
                 if not looks_like_doc and 'text/html' in content_type:
                     self._log(f"  ⚠ Servern svarar HTML istället för dokument: {url}",
                               LogLevel.DEBUG)
-                    return {"status": "failed"}
+                    return {"status": "failed", "browser_retry": True}
 
                 if (resp.content_length is not None
                         and resp.content_length > self.max_download_bytes):
@@ -3378,16 +3955,10 @@ class AsyncWebCrawler:
                 final_ext = os.path.splitext(filename)[1]
                 final_path = os.path.join(docs_dir, filename)
 
-                # Servern ignorerade villkorsheadrar (eller vi har inga): samma storlek
-                # som den sparade filen och inga validatorer → anta oförändrad.
-                if (prior_path and not headers and resp.content_length is not None
-                        and resp.content_length == os.path.getsize(prior_path)):
-                    return {"status": "same", "filename": filename,
-                            "etag": etag, "last_modified": last_mod}
-
                 part_path = final_path + ".part"
                 written = 0
                 first = True
+                digest = hashlib.sha256()
                 with open(part_path, 'wb') as f:
                     async for chunk in resp.content.iter_chunked(65536):
                         if self.state == CrawlerState.STOPPED:
@@ -3405,12 +3976,22 @@ class AsyncWebCrawler:
                                       LogLevel.WARNING)
                             return {"status": "too_large"}
                         f.write(chunk)
+                        digest.update(chunk)
                 if written == 0:
                     return {"status": "failed"}
+                content_hash = digest.hexdigest()
+                if prior_path and prior_hash == content_hash:
+                    return {"status": "same", "filename": filename, "content_hash": content_hash,
+                            "etag": etag, "last_modified": last_mod}
+                if prior_path:
+                    cache_url = normalize_url(url, self.ignore_query_params)
+                    await self._invalidate_document_text(cache_url, await self.db.get_doc(cache_url))
                 os.replace(part_path, final_path)
                 part_path = None
                 return {"status": "ok", "filename": filename,
-                        "etag": etag, "last_modified": last_mod}
+                        "etag": etag, "last_modified": last_mod, "content_hash": content_hash}
+        except BlockedHostError:
+            return {"status": "blocked"}
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             self._log(f"  ⚠ aiohttp-fel vid dokumentnedladdning: {e}", LogLevel.DEBUG)
             return {"status": "failed"}
@@ -3427,7 +4008,17 @@ class AsyncWebCrawler:
         return ext if _SAFE_DOC_EXT_RE.match(ext) else ""
 
     async def download_document(self, url: str):
+        fetch_url = request_url(url)
+        url = normalize_url(url, self.ignore_query_params)
         if self.state == CrawlerState.STOPPED:
+            return
+        # Ett blockerat nätverksmål ska inte felrapporteras som ett robots-fel.
+        try:
+            self._check_http_target(fetch_url)
+        except BlockedHostError:
+            self.report['download_failures'].append({'url': url, 'reason': 'blocked'})
+            return
+        if not await self._robots_allowed(fetch_url):
             return
         while self.state == CrawlerState.PAUSED:
             await asyncio.sleep(0.3)
@@ -3451,6 +4042,7 @@ class AsyncWebCrawler:
                 cand = os.path.join(docs_dir, os.path.basename(prior['filename']))
                 if os.path.isfile(cand):
                     prior_path = cand
+            prior_hash = await self._original_hash(prior_path) if prior_path else None
 
             # Stabilt namn från URL:en (används om inget tidigare namn finns)
             url_basename = os.path.basename(unquote(urlparse(url).path)) or ""
@@ -3461,16 +4053,21 @@ class AsyncWebCrawler:
 
             # Villkorlig GET: uppdaterade dokument hämtas om, oförändrade hoppas över
             headers: Dict[str, str] = {}
-            if prior_path:
+            if (prior_path and (not prior.get('content_hash')
+                                or prior['content_hash'] == prior_hash)):
                 if prior['etag']:
                     headers['If-None-Match'] = prior['etag']
                 if prior['last_modified']:
                     headers['If-Modified-Since'] = prior['last_modified']
 
             outcome = await self._download_via_aiohttp(
-                url, docs_dir, default_name, url_ext, slug_base, url_hash,
-                headers, prior_path)
+                fetch_url, docs_dir, default_name, url_ext, slug_base, url_hash,
+                headers, prior_path, prior_hash)
             status = outcome["status"]
+
+            if status == 'gone':
+                await self._handle_gone_document(url, prior, outcome['http_status'])
+                return
 
             if status == "aborted":
                 async with self.async_download_lock:
@@ -3478,22 +4075,27 @@ class AsyncWebCrawler:
                 return
 
             # ─── Playwright-fallback (SAML-skyddade dokument) ───
-            if status == "failed" and HAS_PLAYWRIGHT and not prior_path:
+            if (status == "failed" and outcome.get('browser_retry') and HAS_PLAYWRIGHT
+                    and self._login_detection_enabled):
                 self._log(f"  🔄 Försöker Playwright-fallback för: {url}", LogLevel.DEBUG)
-                filename = default_name
+                filename = os.path.basename(prior_path) if prior_path else default_name
                 final_path = os.path.join(docs_dir, filename)
                 part_path = final_path + ".part"
-                ok = await self._download_via_playwright(url, part_path)
+                ok = await self._download_via_playwright(fetch_url, part_path)
                 if ok and os.path.exists(part_path):
                     with open(part_path, 'rb') as fh:
                         head = fh.read(1024)
                     size = os.path.getsize(part_path)
                     if (magic_ok(os.path.splitext(filename)[1], head)
                             and 0 < size <= self.max_download_bytes):
+                        incoming_hash = await asyncio.to_thread(file_sha256, part_path)
+                        if prior_path and incoming_hash != prior_hash:
+                            await self._invalidate_document_text(url, prior)
                         os.replace(part_path, final_path)
-                        outcome = {"status": "ok", "filename": filename,
-                                   "etag": None, "last_modified": None}
-                        status = "ok"
+                        outcome = {"status": "same" if prior_hash == incoming_hash else "ok", "filename": filename,
+                                   "etag": None, "last_modified": None,
+                                   "content_hash": incoming_hash}
+                        status = outcome['status']
                 if os.path.exists(part_path):
                     try:
                         os.remove(part_path)
@@ -3508,9 +4110,34 @@ class AsyncWebCrawler:
                        'link_text': prior['link_text']}
 
             if status in ("ok", "not_modified", "same"):
+                self._successful_documents += 1
                 filename = outcome.get("filename") or os.path.basename(prior_path or default_name)
                 filepath = os.path.join(docs_dir, filename)
                 size = os.path.getsize(filepath)
+                content_hash = outcome.get('content_hash') or prior_hash
+                if not content_hash:
+                    content_hash = await asyncio.to_thread(file_sha256, filepath)
+                profile = self._conversion_profile()
+                lm = outcome.get('last_modified') or (prior or {}).get('last_modified')
+                context_hash = self._conversion_context(ref, lm)
+                if status == 'not_modified':
+                    fetched_at = (prior or {}).get('fetched_at') or ''
+                elif status == 'same' and (prior or {}).get('fetched_at'):
+                    fetched_at = prior['fetched_at']
+                else:
+                    fetched_at = datetime.now().isoformat(timespec='seconds')
+                ref.update(fetched_at=fetched_at, server_last_modified=lm or '')
+                conversion_valid = bool(
+                    prior and prior.get('converted_hash') == content_hash
+                    and prior.get('conversion_profile') == profile
+                    and prior.get('conversion_context') == context_hash
+                    and prior.get('md_filename')
+                    and any(os.path.isfile(os.path.join(self.output_dir, folder,
+                                                       os.path.basename(prior['md_filename'])))
+                            for folder in ('texter', 'texter_karantan'))
+                )
+                if not conversion_valid:
+                    await self._invalidate_document_text(url, prior)
 
                 if status == "ok":
                     async with self.async_stats_lock:
@@ -3532,13 +4159,14 @@ class AsyncWebCrawler:
                 await self.db.save_doc(url, filename, size, etag, lm,
                                        ref.get('referer_url', ''),
                                        ref.get('referer_title', ''),
-                                       ref.get('link_text', ''))
+                                       ref.get('link_text', ''), content_hash=content_hash,
+                                       fetched_at=fetched_at)
 
-                # Konvertera nya/ändrade dokument alltid; oförändrade bara om .md saknas
-                if self.converter:
-                    md_exists = os.path.exists(self.converter.md_path_for(url, filename))
-                    if status == "ok" or not md_exists:
-                        await self._convert_document(url, filepath, filename, ref)
+                # Även 304 måste försöka igen efter ett tidigare konverteringsfel.
+                if self.converter and not conversion_valid:
+                    await self._queue_conversion({'url': url, 'filepath': filepath, 'filename': filename,
+                                                 'ref': dict(ref), 'content_hash': content_hash,
+                                                 'profile': profile, 'context_hash': context_hash})
                 return
 
             # Misslyckades. Finns en tidigare version behålls den och registreras.
@@ -3554,19 +4182,15 @@ class AsyncWebCrawler:
                     size_bytes=os.path.getsize(prior_path))
         except Exception as e:
             self._log(f"  ✗ Filnedladdning misslyckades: {url}, {e}", LogLevel.ERROR)
+            self.report['download_failures'].append({'url': url, 'reason': str(e)[:160]})
             async with self.async_download_lock:
                 self.downloaded_files.discard(url)
 
     async def _download_via_playwright(self, url: str, filepath: str) -> bool:
         """Fallback-nedladdning via Playwright för SAML-skyddade dokument.
 
-        Anropas när aiohttp misslyckas (HTTP-fel eller SAML-redirect till
-        login-sida). Playwright har den fulla browser-sessionen med
-        SAML-cookies och klarar de redirect-kedjor som aiohttp missar.
-
-        Två strategier:
-          1. expect_download — servern skickar Content-Disposition: attachment
-          2. context.request.get — inline-dokument (PDF i browsern)
+        Browser-sessionen följer SAML-flödet. Bilagor och inline-dokument
+        avlyssnas efter headers och strömmas med en strikt storleksgräns.
         """
         async with self.playwright_semaphore:
             ctx = await self.get_playwright_context()
@@ -3574,66 +4198,290 @@ class AsyncWebCrawler:
                 return False
 
             page = await ctx.new_page()
+            guard = None
             try:
-                # Strategi 1: Fånga en download-händelse
+                guard = await self._install_browser_guard(page, filepath)
                 try:
-                    async with page.expect_download(timeout=15000) as dl_info:
-                        try:
-                            await page.goto(url, wait_until="commit", timeout=15000)
-                        except Exception:
-                            # Chromium kastar "Download is starting" när svaret är en
-                            # nedladdning — då är det inget fel, nedladdningen fångas nedan.
-                            # Om ingen nedladdning startar time-outar dl_info.value istället.
-                            pass
-                    download = await dl_info.value
-                    await download.save_as(filepath)
-                    self._log(
-                        f"  🔄 Playwright-download lyckades: "
-                        f"{os.path.basename(filepath)}", LogLevel.DEBUG)
-                    return True
+                    await page.goto(url, wait_until='commit', timeout=15000)
                 except Exception:
+                    # Navigationen avbryts avsiktligt när dokumentstreamen tas över.
                     pass
-
-                # Strategi 2: API-request med browser-cookies
                 try:
-                    api_resp = await ctx.request.get(url, timeout=20000)
-                    if api_resp.ok:
-                        ct = (api_resp.headers.get('content-type') or '').lower()
-                        if 'text/html' not in ct:
-                            body = await api_resp.body()
-                            if body and len(body) > 100:
-                                with open(filepath, 'wb') as f:
-                                    f.write(body)
-                                self._log(
-                                    f"  🔄 Playwright-API lyckades: "
-                                    f"{os.path.basename(filepath)}",
-                                    LogLevel.DEBUG)
-                                return True
-                except Exception:
-                    pass
-
-                return False
+                    await asyncio.wait_for(guard['done'].wait(), 120 if guard['started'] else 15)
+                except asyncio.TimeoutError:
+                    guard['reason'] = 'tidsgränsen överskreds'
+                if not guard['success']:
+                    self._log(f"  ⚠ Browser-nedladdning misslyckades: {guard['reason'] or 'inget dokument'}",
+                              LogLevel.DEBUG)
+                return guard['success']
             finally:
+                if guard:
+                    await self._close_browser_guard(guard)
                 try:
                     await page.close()
                 except Exception:
                     pass
 
     # ─── Filer som skrivs vid körningens slut ───────────────
+    async def _drop_duplicate_page(self, url: str, cached: Optional[Dict], reason: str):
+        if url in self._initial_page_files:
+            await self._drop_saved_page(url, cached, reason)
+        elif cached and cached.get('filename'):
+            # En ny provisorisk kopia publicerades aldrig i korpusen. Räkna
+            # därför inte dess borttagning som en borttagen publicerad källa.
+            path = os.path.join(self.output_dir, 'texter', os.path.basename(cached['filename']))
+            if os.path.isfile(path):
+                os.remove(path)
+            provisional = [change for change in self.changes
+                           if change['url'] == url and change['event'] in ('added', 'updated')]
+            for change in provisional:
+                self.counts[change['event']] -= 1
+                self.changes.remove(change)
+        await self.db.mark_page_unsaved(url)
+
+    async def _finalize_page_duplicates(self):
+        """Canonical får ersätta källan först när målet bekräftats och sparats."""
+        for source, target in self._canonical_pending.items():
+            visited = {source}
+            while target in self._canonical_pending and target not in visited:
+                visited.add(target)
+                target = self._canonical_pending[target]
+            if target in visited:
+                target = min(visited)  # behåll en deterministisk kopia vid en cykel
+            if source == target:
+                continue
+            target_cache = await self.db.get_cache(target)
+            confirmed = bool(target_cache and target_cache.get('crawled_at', '')
+                             >= self.stats.start_time.isoformat())
+            if confirmed and self.is_valid_url(target) and self._exportable_page(target_cache):
+                source_cache = await self.db.get_cache(source)
+                await self._drop_duplicate_page(source, source_cache, f'canonical → {target}')
+                self.report['canonical_skipped'].append({'url': source, 'canonical': target})
+                self._gui_update(source, 'Duplikat (canonical)', (source_cache or {}).get('title', ''))
+            else:
+                self.report['canonical_unresolved'].append({'url': source, 'canonical': target})
+
+        if not self.dedupe_content:
+            return
+        owners = {}
+        unresolved = {entry['url'] for entry in self.report['canonical_unresolved']}
+        records = sorted(await self.db.get_all_records(),
+                         key=lambda row: (row[0] not in self._initial_page_files, row[0]))
+        for url, _, _, content_hash, _ in records:
+            cached = await self.db.get_cache(url)
+            if (not self.is_valid_url(url) or not self._exportable_page(cached)
+                    or (cached.get('content_length') or 0) < 200):
+                continue
+            if url in unresolved:
+                owners.setdefault(content_hash, url)
+                continue
+            if content_hash in owners:
+                await self._drop_duplicate_page(url, cached, f'duplicate_of {owners[content_hash]}')
+                self.report['duplicates'].append({'url': url, 'duplicate_of': owners[content_hash]})
+            else:
+                owners[content_hash] = url
+
+    async def _enqueue_cached_urls(self):
+        """Återkontrollera kända URL:er sist, även när de försvunnit ur navigeringen.
+
+        Djupbegränsade körningar saknar säker djupinformation för gamla URL:er.
+        De återkontrolleras först i nästa körning utan djupbegränsning.
+        """
+        if not self.config.get('incremental') or self.max_depth != 0:
+            return
+        for url, *_ in await self.db.get_all_records():
+            if self.is_valid_url(url):
+                cached = await self.db.get_cache(url)
+                self.url_queue.add_url(cached.get('fetch_url') or url, depth=0,
+                                       base_priority=CrawlPriority.LOW.value)
+        if self.config.get('download_docs', False):
+            for doc in await self.db.get_all_docs():
+                if self.is_valid_url(doc['url']):
+                    self.url_queue.add_url(doc['url'], depth=0,
+                                           base_priority=CrawlPriority.LOW.value)
+
+    async def _original_hash(self, path: str) -> str:
+        """Verifiera originalet minst en gång per körning, återanvänd inom körningen.
+
+        Storlek/filmetadata ensamma får inte intyga en tidigare körnings version.
+        Atomiska filbyten och ändrad metadata ogiltigförklarar den lokala cachen.
+        """
+        stat = os.stat(path)
+        identity = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+        key = os.path.abspath(path)
+        cached = self._file_hash_cache.get(key)
+        if cached and cached[0] == identity:
+            return cached[1]
+        digest = await asyncio.to_thread(file_sha256, path)
+        after = os.stat(path)
+        if identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise RuntimeError('Dokumentoriginalet ändrades under hashkontrollen')
+        self._file_hash_cache[key] = (identity, digest)
+        return digest
+
+    async def _prepare_export(self):
+        """Exportera bara registrerade texter, och bara rätt version av dokumenttext.
+
+        Äldre filer utan aktiv registrering flyttas ut ur Sveas textmappar till
+        texter_utgangna. De raderas inte eftersom de kan komma från äldre körningar.
+        """
+        allowed = set()
+        self._intentional_export_exclusions = set()
+        # Äldre generationer saknar profilbeskrivning. Då ska ett begränsat
+        # migrationsförsök inte tyst ersätta dem med nästan tomma utdata.
+        known_previous_profile = False
+        known_previous_doc_profile = False
+        if self._publication and self._publication.previous_directory:
+            old_report = os.path.join(self._publication.previous_directory, 'crawl_report.json')
+            if os.path.isfile(old_report):
+                with open(old_report, encoding='utf-8') as source:
+                    previous_report = json.load(source)
+                    known_previous_profile = bool(previous_report.get('page_processing_profile'))
+                    known_previous_doc_profile = bool(previous_report.get('document_processing_profile'))
+        for url, filename, profile in await self.db.get_page_files():
+            if not filename:
+                continue
+            name = os.path.basename(filename)
+            if (not self._saves_text() or not self.is_valid_url(url, for_export=True)
+                    or profile != self._page_profile()):
+                if (not self._saves_text() or not self.is_valid_url(url, for_export=True)
+                        or known_previous_profile):
+                    self._intentional_export_exclusions.add(name)
+                continue
+            if self.languages:
+                path = next((os.path.join(self.output_dir, folder, name)
+                             for folder in ('texter', 'texter_karantan')
+                             if os.path.isfile(os.path.join(self.output_dir, folder, name))), None)
+                if path:
+                    with open(path, encoding='utf-8') as source:
+                        raw = source.read()
+                    if name.endswith('.json'):
+                        language = json.loads(raw).get('language', '')
+                    elif name.endswith('.txt'):
+                        language = plain_file_to_chunks(raw)[0].get('language', '')
+                    else:
+                        language = markdown_file_to_chunks(raw)[0].get('language', '')
+                    language = language.lower().replace('_', '-').split('-')[0]
+                    if language and language not in self.languages:
+                        self._intentional_export_exclusions.add(name)
+                        self.report['wrong_language'].append({'url': url, 'language': language})
+                        continue
+            allowed.add(name)
+        for doc in await self.db.get_all_docs():
+            if not doc['filename'] or not self.is_valid_url(doc['url'], for_export=True):
+                if doc.get('md_filename'):
+                    self._intentional_export_exclusions.add(os.path.basename(doc['md_filename']))
+                continue
+            original = os.path.join(self.output_dir, 'dokument', os.path.basename(doc['filename']))
+            if os.path.isfile(original):
+                await self.manifest.record_download(doc['url'], doc['filename'],
+                                                    os.path.getsize(original))
+                await self.manifest.record_link(doc['url'], doc.get('referer_url') or '',
+                                               doc.get('referer_title') or '',
+                                               doc.get('link_text') or '')
+            if not (self.convert_docs and doc['md_filename'] and doc['content_hash']
+                    and doc['converted_hash'] == doc['content_hash']
+                    and doc['conversion_profile'] == self._conversion_profile()
+                    and os.path.isfile(original)):
+                if doc.get('md_filename') and (not self.convert_docs
+                        or known_previous_doc_profile and doc['conversion_profile'] != self._conversion_profile()):
+                    self._intentional_export_exclusions.add(os.path.basename(doc['md_filename']))
+                continue
+            if (doc.get('conversion_context') is not None
+                    and doc['conversion_context'] != self._conversion_context(doc, doc.get('last_modified'))):
+                continue
+            actual_hash = await self._original_hash(original)
+            if actual_hash == doc['content_hash']:
+                allowed.add(os.path.basename(doc['md_filename']))
+                quarantine_file = os.path.join(self.output_dir, 'texter_karantan',
+                                               os.path.basename(doc['md_filename']))
+                if (os.path.isfile(quarantine_file)
+                        and doc['url'] not in self.report['possible_prompt_injection']):
+                    self.report['possible_prompt_injection'].append(doc['url'])
+            else:
+                self.report['document_version_mismatch'].append(
+                    {'url': doc['url'], 'file': doc['filename']})
+        self._export_files = allowed
+        retired = await blocking_complete(self._retire_unregistered_texts, allowed)
+        self.report['retired_text_files'].extend(retired)
+
+    def _check_publication_loss(self):
+        """Stoppa stort oförklarat bortfall, även när några hämtningar lyckats."""
+        previous = self._publication.previous_directory if self._publication else None
+        if not previous:
+            return
+        directory = os.path.join(previous, 'texter')
+        if not os.path.isdir(directory):
+            return
+        before = {name for name in os.listdir(directory) if name.endswith(('.md', '.json', '.txt'))}
+        now = {name for name in (self._export_files or set())
+               if os.path.isfile(os.path.join(self.output_dir, 'texter', name))}
+        explained = set(self._intentional_export_exclusions)
+        # Stabil URL-hash identifierar samma källa efter format-/filnamnsbyte,
+        # också när en HTML-resurs nu levereras som konverterat dokument.
+        def source_identity(name):
+            match = re.search(r'_([0-9a-f]{8})(?:_doc)?\.(?:md|json|txt)$', name)
+            return match.group(1) if match else name
+        identities = {source_identity(name) for name in now}
+        for name in before:
+            if source_identity(name) in identities or (not self._saves_text() and not name.endswith('_doc.md')):
+                explained.add(name)
+        for change in self.changes:
+            if change.get('reason') in ('HTTP 404', 'HTTP 410', 'fel språk', 'HTTP 403'):
+                if change.get('file'):
+                    explained.add(os.path.basename(change['file']))
+        # Bekräftade canonical-/dubblettbeslut och karantän är avsiktliga.
+        for name in before:
+            if os.path.isfile(os.path.join(self.output_dir, 'texter_karantan', name)):
+                explained.add(name)
+        for entry in self.report['duplicates'] + self.report['canonical_skipped']:
+            url = entry.get('url') if isinstance(entry, dict) else entry
+            if url:
+                explained.add(stable_filename(url, self.save_format))
+        lost = before - now - explained
+        if lost and len(lost) > len(before) * 0.5:
+            self.report['publication_blocked'].append(
+                {'reason': 'oförklarat korpusbortfall', 'before': len(before),
+                 'after': len(now), 'unexplained': len(lost), 'files': sorted(lost)[:200]})
+            self.fatal_error = self.fatal_error or (
+                f'Publicering stoppad: {len(lost)} av {len(before)} källfiler saknas utan belagd borttagning')
+            self._log(self.fatal_error, LogLevel.ERROR)
+
+    def _retire_unregistered_texts(self, allowed: Set[str]) -> List[Dict]:
+        retired = []
+        for folder in ('texter', 'texter_karantan'):
+            directory = os.path.join(self.output_dir, folder)
+            if not os.path.isdir(directory):
+                continue
+            for name in os.listdir(directory):
+                path = os.path.join(directory, name)
+                if (name in allowed or not os.path.isfile(path)
+                        or not name.endswith(('.md', '.json', '.txt'))):
+                    continue
+                archive = os.path.join(self.output_dir, 'texter_utgangna', folder)
+                os.makedirs(archive, exist_ok=True)
+                # Unikt arkivnamn så att tidigare versioner också kan återställas.
+                target = os.path.join(archive, f'{time.time_ns()}_{name}')
+                os.replace(path, target)
+                retired.append({'file': name, 'from': folder,
+                                'archive': os.path.relpath(target, self.output_dir)})
+        return retired
+
     async def _generate_index(self):
         self._log("📊 Skapar index-fil (index.csv)...")
         try:
             records = await self.db.get_all_records()
             texts_dir = os.path.join(self.output_dir, "texter")
-            with open(os.path.join(self.output_dir, "index.csv"),
-                      'w', newline='', encoding='utf-8-sig') as f:
-                writer = csv.writer(f)
-                writer.writerow(['URL', 'Titel', 'Hämtad_Datum', 'Filnamn'])
-                for url, title, date, content_hash, filename in records:
-                    fn = filename if (filename and os.path.exists(
-                        os.path.join(texts_dir, os.path.basename(filename)))) else ""
-                    writer.writerow([csv_safe(url), csv_safe(title), date, fn])
+            output = io.StringIO(newline='')
+            writer = csv.writer(output)
+            writer.writerow(['URL', 'Titel', 'Hämtad_Datum', 'Filnamn'])
+            for url, title, date, content_hash, filename in records:
+                fn = filename if (filename and os.path.exists(
+                    os.path.join(texts_dir, os.path.basename(filename)))) else ""
+                writer.writerow([csv_safe(url), csv_safe(title), date, fn])
+            atomic_write_text(os.path.join(self.output_dir, 'index.csv'), '\ufeff' + output.getvalue())
         except Exception as e:
+            self._export_failed('index.csv', e)
             self._log(f"⚠ Fel vid skapande av index.csv: {e}", LogLevel.ERROR)
 
     async def _generate_manifest(self):
@@ -3646,81 +4494,173 @@ class AsyncWebCrawler:
         try:
             manifest_data = self.manifest.build(domain=self.domain)
             count = manifest_data.get("document_count", 0)
-            if count == 0:
-                # Inga dokument laddades ner — ingen anledning att skapa manifest
-                return
+            # Även ett tomt manifest måste ersätta föregående körnings dokumentlista.
             manifest_filename = f"manifest_{slugify(self.domain)}.json"
             manifest_path = os.path.join(self.output_dir, manifest_filename)
             atomic_write_text(manifest_path,
                               json.dumps(manifest_data, ensure_ascii=False, indent=2))
+            for name in os.listdir(self.output_dir):
+                if name.startswith('manifest_') and name.endswith('.json') and name != manifest_filename:
+                    os.remove(os.path.join(self.output_dir, name))
             orphans = manifest_data.get("orphan_count", 0)
             msg = f"📋 Manifest skapad: {count} dokument"
             if orphans:
                 msg += f" ({orphans} länkade men ej nedladdade)"
             self._log(msg)
         except Exception as e:
+            self._export_failed('manifest', e)
             self._log(f"⚠ Fel vid skapande av manifest-fil: {e}", LogLevel.ERROR)
+
+    def _export_failed(self, artifact: str, error: Exception):
+        self.report['export_failures'].append({'artifact': artifact, 'reason': str(error)[:160]})
+        message = (f'JSONL-export misslyckades: {error}' if artifact == 'chunks.jsonl'
+                   else f'Export av {artifact} misslyckades: {error}')
+        self.fatal_error = self.fatal_error or message
+
+    def delivery_status(self) -> str:
+        """Skilj körfel från normala borttagningar och avsiktliga urvalsgränser."""
+        if self.fatal_error:
+            return 'failed'
+        # 404/410 är belagda borttagningar, inte driftfel. Startsidan utan
+        # tidigare cache räknas redan separat som fel i process_page.
+        errors = (max(0, self.stats.pages_failed - len(self.report['gone_pages']))
+                  + len(self.report['download_failures'])
+                  + len(self.report['conversion_failures'])
+                  + len(self.report['robots_unreachable'])
+                  + len(self.report['document_version_mismatch'])
+                  + len(self.report['export_failures']))
+        if self.state == CrawlerState.STOPPED or errors:
+            return 'partial' if self.stats.pages_visited or self._successful_documents else 'failed'
+        return 'success'
 
     def _write_chunks_jsonl(self) -> int:
         """Bygger chunks.jsonl (en chunk per rad) av ALLA sparade sidor och dokument.
 
         Läser från disk i stället för från minnet, så att filen blir komplett även vid
         inkrementella körningar där oförändrade sidor inte bearbetas om. Färdig att läsas
-        in i en vektordatabas: varje rad har id, url, titel, rubrikväg, kontext och text."""
+        in i en vektordatabas: varje rad har id, url, titel, rubrikväg, kontext och text.
+        Flaggade sidor (t.ex. möjlig prompt-injektion) karantänsätts i chunks_quarantine.jsonl."""
         texts_dir = os.path.join(self.output_dir, "texter")
-        if not os.path.isdir(texts_dir):
-            return 0
+        quarantine_dir = os.path.join(self.output_dir, "texter_karantan")
         out_path = os.path.join(self.output_dir, "chunks.jsonl")
+        quarantine_path = os.path.join(self.output_dir, "chunks_quarantine.jsonl")
         tmp_path = out_path + ".tmp"
+        tmp_quarantine = quarantine_path + ".tmp"
         written = 0
-        with open(tmp_path, 'w', encoding='utf-8') as out:
+        quarantine_written = 0
+        quarantine_enabled = bool(self.config.get("quarantine_flagged_chunks", True))
+
+        sources: List[Tuple[str, str, bool]] = []
+        if os.path.isdir(texts_dir):
             for name in sorted(os.listdir(texts_dir)):
-                path = os.path.join(texts_dir, name)
+                if self._export_files is None or name in self._export_files:
+                    sources.append((texts_dir, name, False))
+        if os.path.isdir(quarantine_dir):
+            for name in sorted(os.listdir(quarantine_dir)):
+                if self._export_files is None or name in self._export_files:
+                    sources.append((quarantine_dir, name, True))
+
+        with open(tmp_path, 'w', encoding='utf-8') as out, \
+             open(tmp_quarantine, 'w', encoding='utf-8') as q_out:
+            for sdir, name, force_quarantine in sources:
+                path = os.path.join(sdir, name)
                 try:
                     with open(path, 'r', encoding='utf-8') as f:
                         raw = f.read()
                     if name.endswith('.json'):
                         data = json.loads(raw)
+                        flags = data.get("flags") or []
                         meta = {"url": data.get("url", ""), "title": data.get("title", ""),
                                 "source_type": "page", "referer_url": "",
                                 "language": data.get("language", ""),
                                 "modified_date": data.get("modified_date", ""),
-                                "crawled_at": data.get("crawled_at", "")}
+                                "crawled_at": data.get("crawled_at", ""),
+                                "flags": flags}
                         chunks = data.get("chunks", [])
                     elif name.endswith('.md'):
                         meta, chunks = markdown_file_to_chunks(raw, is_document=name.endswith('_doc.md'))
+                        flags = meta.get("flags") or []
+                    elif name.endswith('.txt'):
+                        meta, chunks = plain_file_to_chunks(raw)
+                        flags = meta.get('flags') or []
                     else:
                         continue
                 except Exception as e:
+                    if self._export_files is not None:
+                        raise RuntimeError(f'Registrerad källfil kunde inte exporteras: {name}') from e
                     self._log(f"  ⚠ Hoppar över {name} i chunks.jsonl: {e}", LogLevel.DEBUG)
                     continue
+
+                if force_quarantine and not flags:
+                    flags = ["quarantined"]
+                    meta["flags"] = flags
+
                 key = hashlib.md5((meta.get("url") or name).encode('utf-8')).hexdigest()[:10]
+                is_quarantined = bool((flags or force_quarantine) and quarantine_enabled)
+                target_out = q_out if is_quarantined else out
+
                 for ch in chunks:
+                    chunk_url = ch.get("url") or meta.get("url", "")
                     record = {
                         "id": f"{key}-{ch.get('chunk_index', 0)}",
                         **meta,
+                        "url": chunk_url,
                         "heading": ch.get("heading", ""),
                         "heading_path": ch.get("heading_path", ""),
                         "context": ch.get("context", ""),
                         "content": ch.get("content", ""),
                         "chunk_index": ch.get("chunk_index", 0),
                         "total_chunks": ch.get("total_chunks", 0),
+                        "flags": flags,
                     }
-                    out.write(json.dumps(record, ensure_ascii=False) + "\n")
-                    written += 1
+                    if "page_number" in ch and ch["page_number"] is not None:
+                        record["page_number"] = ch["page_number"]
+                        record["page_url"] = ch.get("page_url", f"{record['url']}#page={ch['page_number']}")
+                    for field_name in ('heading_paths', 'slide_number'):
+                        if field_name in ch:
+                            record[field_name] = ch[field_name]
+
+                    target_out.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    if is_quarantined:
+                        quarantine_written += 1
+                    else:
+                        written += 1
+
         os.replace(tmp_path, out_path)
+        if quarantine_written > 0:
+            os.replace(tmp_quarantine, quarantine_path)
+            self._log(f"🛡️ {quarantine_written} chunks sattes i karantän i chunks_quarantine.jsonl "
+                      f"(flaggade för säkerhetsrisker)", LogLevel.WARNING)
+        else:
+            if os.path.exists(tmp_quarantine):
+                try:
+                    os.remove(tmp_quarantine)
+                except OSError:
+                    pass
+            if os.path.exists(quarantine_path):
+                try:
+                    os.remove(quarantine_path)
+                except OSError:
+                    pass
+
         return written
 
     async def _generate_report(self):
         """Skriver changes.jsonl (append) och crawl_report.json (överskrivs)."""
+        if self.changes:
+            try:
+                path = os.path.join(self.output_dir, 'changes.jsonl')
+                with open(path + '.tmp', 'wb') as output:
+                    if os.path.exists(path):
+                        with open(path, 'rb') as previous:
+                            shutil.copyfileobj(previous, output)
+                    for change in self.changes:
+                        output.write((json.dumps({**change, 'run': self.crawl_session_id},
+                                                 ensure_ascii=False) + '\n').encode('utf-8'))
+                os.replace(path + '.tmp', path)
+            except Exception as e:
+                self._export_failed('changes.jsonl', e)
         try:
-            if self.changes:
-                with open(os.path.join(self.output_dir, "changes.jsonl"),
-                          'a', encoding='utf-8') as f:
-                    for ch in self.changes:
-                        f.write(json.dumps({**ch, "run": self.crawl_session_id},
-                                           ensure_ascii=False) + "\n")
-
             not_seen: List[Dict] = []
             if self._completed_naturally:
                 # Sidor som fanns i cachen men inte nåddes den här gången. Bara
@@ -3735,10 +4675,15 @@ class AsyncWebCrawler:
                 "run": self.crawl_session_id,
                 "domain": self.domain,
                 "version": VERSION,
+                'page_processing_profile': self._page_profile(),
+                'document_processing_profile': self._conversion_profile(),
                 "started_at": self.stats.start_time.isoformat(timespec="seconds"),
                 "finished_at": datetime.now().isoformat(timespec="seconds"),
                 "completed_naturally": self._completed_naturally,
+                "status": self.delivery_status(),
+                "stopped": self.state == CrawlerState.STOPPED,
                 "fatal_error": self.fatal_error,
+                'attempt_generation': self._publication.generation_id if self._publication else None,
                 "stats": {
                     "pages_visited": self.stats.pages_visited,
                     "pages_unchanged": self.stats.pages_unchanged,
@@ -3755,9 +4700,16 @@ class AsyncWebCrawler:
             for key, items in self.report.items():
                 report[key + "_count"] = len(items)
                 report[key] = items[:200]
-            atomic_write_text(os.path.join(self.output_dir, "crawl_report.json"),
+            report_path = os.path.join(self.output_dir, 'crawl_report.json')
+            if self._publication is None and self.fatal_error:
+                # En nekad parallell körning får inte skriva över den aktiva körningens rapport.
+                reports = os.path.join(self._output_root, 'reports')
+                os.makedirs(reports, exist_ok=True)
+                report_path = os.path.join(reports, self.crawl_session_id + '.json')
+            atomic_write_text(report_path,
                               json.dumps(report, ensure_ascii=False, indent=2))
         except Exception as e:
+            self._export_failed('crawl_report.json', e)
             self._log(f"⚠ Fel vid skapande av crawl_report.json: {e}", LogLevel.ERROR)
 
     def summary_text(self) -> str:
@@ -3765,9 +4717,15 @@ class AsyncWebCrawler:
         parts = [f"{s.pages_visited} sidor besökta",
                  f"{self.counts['added']} nya", f"{self.counts['updated']} ändrade",
                  f"{self.counts['removed']} borttagna",
-                 f"{s.documents_downloaded} dokument", f"{s.pages_failed} fel"]
-        text = "Klart: " + ", ".join(parts) + "."
+                 f"{s.documents_downloaded} dokument", f"{s.pages_failed} sidfel"]
+        label = {'success': 'Lyckad körning', 'partial': 'Partiell körning',
+                 'failed': 'Misslyckad körning'}[self.delivery_status()]
+        text = label + ': ' + ", ".join(parts) + "."
         warn = []
+        if self.report['download_failures']:
+            warn.append(f"{len(self.report['download_failures'])} dokument kunde inte hämtas")
+        if self.report['robots_unreachable']:
+            warn.append(f"robots.txt kunde inte nås på {len(self.report['robots_unreachable'])} värdar")
         if self.report["conversion_failures"]:
             warn.append(f"{len(self.report['conversion_failures'])} dokument gick inte att konvertera")
         if self.report["short_pages"]:
@@ -3793,6 +4751,13 @@ class AsyncWebCrawler:
         self.state = CrawlerState.STOPPED
         self._log("🛑 Avbryter crawl (väntar på aktiva processer)...")
         self.login_event.set()
+        if self._crawl_loop and self._crawl_loop.is_running():
+            self._crawl_loop.call_soon_threadsafe(self._cancel_current_work)
+
+    def _cancel_current_work(self):
+        for task in list(self._url_tasks) + self._conversion_tasks:
+            if not task.done() and not task.cancelling():
+                task.cancel()
 
     # ─── Inloggning ─────────────────────────────────────────
     def _load_cookie_file(self) -> bool:
@@ -3844,9 +4809,11 @@ class AsyncWebCrawler:
         self.login_event.clear()
         async with async_playwright() as p:
             browser = await p.chromium.launch(
-                headless=bool(self.config.get("login_browser_headless", False)))
+                headless=bool(self.config.get("login_browser_headless", False)),
+                **await self._browser_network_options())
             context = await browser.new_context(
-                ignore_https_errors=bool(self.config.get("ignore_https_errors", False)))
+                ignore_https_errors=bool(self.config.get("ignore_https_errors", False)),
+                service_workers='block', user_agent=self.user_agent)
             page = await context.new_page()
 
             self._log("👤 Navigerar till start-URL för manuell inloggning...")
@@ -3866,27 +4833,135 @@ class AsyncWebCrawler:
         self._save_cookie_file()
         return True
 
-    async def _verify_login(self) -> bool:
-        """True om startsidan inte ser ut som en inloggningssida (eller om vi inte kan avgöra)."""
-        r = await self.fetch(self.start_url, max_retries=1)
+    async def _verify_login(self) -> Optional[bool]:
+        # Samtidiga behörighetsfel ska bara göra en skyddad sessionskontroll.
+        async with self._session_probe_lock:
+            now = time.monotonic()
+            if self._session_probe_cache and now - self._session_probe_cache[0] < 60:
+                return self._session_probe_cache[1]
+            result = await self._verify_login_uncached()
+            self._session_probe_cache = (time.monotonic(), result)
+            return result
+
+    async def _verify_login_uncached(self) -> Optional[bool]:
+        """True=åtkomlig resurs, False=inloggning krävs, None=kontroll kunde inte göras.
+
+        Ange session_check_url till en skyddad resurs om startsidan är publik.
+        Nätverksfel får aldrig användas som bevis för en fungerande session.
+        """
+        probe = self.config.get('session_check_url') or self.start_url
+        if not self._domain_allowed(urlparse(probe).netloc):
+            return None
+        r = await self.fetch(probe, max_retries=1)
         if r is None:
-            return True
-        return not self.login_detector.detect(self.start_url, r.final_url, r.status, r.text)
+            return None
+        if r.status in (401, 403):
+            return False
+        if r.status != 200:
+            return None
+        return not self.login_detector.detect(probe, r.final_url, r.status, r.text)
 
     # ─── Huvudloopen ────────────────────────────────────────
+    async def _begin_publication(self):
+        publication = PublicationWorkspace(self._output_root, os.path.basename(self.db.db_path),
+                                             self.crawl_session_id)
+        task = asyncio.create_task(asyncio.to_thread(publication.begin))
+        try:
+            working = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await task
+            await asyncio.to_thread(publication.abort)
+            raise
+        self._publication = publication
+        self.output_dir = working
+        self.db = AsyncCrawlDatabase(os.path.join(working, publication.cache_name))
+        if self.converter:
+            self.converter.texts_dir = os.path.join(working, 'texter')
+            os.makedirs(self.converter.texts_dir, exist_ok=True)
+        self._conversion_runner.work_root = os.path.join(working, '.conversion_jobs')
+
+    async def _finish_publication(self):
+        publication = self._publication
+        if not publication:
+            return
+        latest_report = {'run': self.crawl_session_id, 'domain': self.domain,
+                         'started_at': self.stats.start_time.isoformat(),
+                         'finished_at': datetime.now().isoformat(), 'attempt_generation': publication.generation_id,
+                         'export_failures': self.report['export_failures']}
+        try:
+            await self.db.close()
+            report_path = os.path.join(self.output_dir, 'crawl_report.json')
+            if os.path.isfile(report_path):
+                with open(report_path, encoding='utf-8') as report_file:
+                    candidate_report = json.load(report_file)
+                if candidate_report.get('run') == self.crawl_session_id:
+                    latest_report = candidate_report
+            if (self._export_ready and self.delivery_status() != 'failed'
+                    and self.state != CrawlerState.STOPPED):
+                task = asyncio.create_task(asyncio.to_thread(publication.publish, self.delivery_status()))
+                # Publiceringens enda commit måste avslutas även om GUI:t avbryter väntan.
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    await task
+                    raise
+                if publication.mirror_errors:
+                    self._export_failed('kompatibilitetskopior', RuntimeError(publication.mirror_errors[0]))
+                try:
+                    removed = await blocking_complete(publication.prune, self.config['generation_keep'],
+                                                     self.config['generation_min_age_hours'])
+                    self.report['generation_cleanup'].extend(removed)
+                except Exception as error:
+                    self.report['generation_cleanup_failures'].append({'reason': str(error)[:160]})
+                    self._log(f'⚠ Generationsstädning misslyckades: {error}', LogLevel.WARNING)
+            current = publication.current()
+            latest_report.update(status=self.delivery_status(), fatal_error=self.fatal_error,
+                                 published_generation=current['generation'] if current else None,
+                                 publication_committed=publication.published,
+                                 generation_cleanup=self.report['generation_cleanup'],
+                                 generation_cleanup_count=len(self.report['generation_cleanup']),
+                                 generation_cleanup_failures=self.report['generation_cleanup_failures'],
+                                 generation_cleanup_failures_count=len(self.report['generation_cleanup_failures']),
+                                 export_failures=self.report['export_failures'][:200],
+                                 export_failures_count=len(self.report['export_failures']))
+            atomic_write_text(os.path.join(self._output_root, 'crawl_report.json'),
+                              json.dumps(latest_report, ensure_ascii=False, indent=2))
+        except Exception as error:
+            self._export_failed('publicering', error)
+            if latest_report:
+                latest_report.update(status='failed', fatal_error=self.fatal_error,
+                                     publication_committed=publication.published,
+                                     export_failures=self.report['export_failures'][:200],
+                                     export_failures_count=len(self.report['export_failures']))
+                atomic_write_text(os.path.join(self._output_root, 'crawl_report.json'),
+                                  json.dumps(latest_report, ensure_ascii=False, indent=2))
+        finally:
+            await blocking_complete(publication.abort)
+            self.output_dir = self._output_root
+            self.db.db_path = os.path.join(self._output_root, publication.cache_name)
+            if self.converter:
+                self.converter.texts_dir = os.path.join(self._output_root, 'texter')
+
     async def crawl(self):
         """Kör hela crawlen. Fångar alla fel så att GUI/CLI alltid får ett slutmeddelande."""
         try:
+            self._crawl_loop = asyncio.get_running_loop()
+            await self._begin_publication()
             await self._crawl_inner()
         except asyncio.CancelledError:
+            self.state = CrawlerState.STOPPED
             raise
         except Exception as e:
             self.fatal_error = f"{type(e).__name__}: {e}"
             self._log(f"💥 Crawlen avbröts av ett oväntat fel: {self.fatal_error}",
                       LogLevel.ERROR)
         finally:
-            await self._shutdown()
             self.stats.end_time = datetime.now()
+            try:
+                await self._generate_report()
+                await self._finish_publication()
+            finally:
+                await self._shutdown()
             rate = self.stats.pages_per_second
             self._log(f"Färdig! Total tid: {self.stats.duration} "
                       f"({rate:.1f} sidor/sek, "
@@ -3899,6 +4974,11 @@ class AsyncWebCrawler:
                 self.msg_queue.put(("done", "Klar"))
 
     async def _shutdown(self):
+        await self._close_conversion_queue(cancel=True)
+        await self._conversion_runner.close()
+        # Bryt kvarvarande nätverksväntan innan Chromium/Playwright avslutas.
+        if self._browser_proxy:
+            await self._browser_proxy.close()
         try:
             if self.req_session and not self.req_session.closed:
                 await self.req_session.close()
@@ -3921,6 +5001,10 @@ class AsyncWebCrawler:
 
     async def _crawl_inner(self):
         await self.db.connect()
+        self._initial_page_files = {
+            url for url, _, _, _, filename in await self.db.get_all_records()
+            if filename and os.path.isfile(os.path.join(self.output_dir, 'texter', os.path.basename(filename)))
+        }
         await self._resolve_private_policy()
 
         if self.config.get("headless_mode") == "login_then_headless":
@@ -3928,7 +5012,7 @@ class AsyncWebCrawler:
             if not loaded and not await self._interactive_login():
                 return
             self.req_session = await self._create_session()
-            if not await self._verify_login():
+            if await self._verify_login() is False:
                 if loaded and self.msg_queue is not None:
                     self._log("⚠ De sparade cookies har gått ut — loggar in på nytt",
                               LogLevel.WARNING)
@@ -3947,11 +5031,14 @@ class AsyncWebCrawler:
         else:
             self.req_session = await self._create_session()
 
-        if self.config.get("respect_robots", True):
+        if self.config.get("respect_robots", True) or self.find_sitemap:
             await self._load_robots_txt()
+
+        await self._enqueue_cached_urls()
 
         self.stats.start_time = datetime.now()
         self.active_tasks = 0
+        self._start_conversion_queue()
 
         async def bounded_process(url, depth):
             try:
@@ -3968,6 +5055,7 @@ class AsyncWebCrawler:
             except asyncio.CancelledError:
                 pass
             except Exception as e:
+                self.stats.pages_failed += 1
                 self._log(f"💥 Oväntat fel i bounded_process ({url}): {e}",
                           LogLevel.ERROR)
             finally:
@@ -4003,22 +5091,37 @@ class AsyncWebCrawler:
                         continue
 
                     self.active_tasks += 1
-                    tg.create_task(bounded_process(queue_item[1], queue_item[0]))
+                    task = tg.create_task(bounded_process(queue_item[1], queue_item[0]))
+                    self._url_tasks.add(task)
+                    task.add_done_callback(self._url_tasks.discard)
+        except asyncio.CancelledError:
+            self.state = CrawlerState.STOPPED
+            raise
         except Exception as e:
             self.fatal_error = self.fatal_error or f"{type(e).__name__}: {e}"
             self._log(f"💥 Oväntat fel i async crawl: {e}", LogLevel.ERROR)
         finally:
+            await self._close_conversion_queue(cancel=self.state == CrawlerState.STOPPED)
             if self.state == CrawlerState.STOPPED:
                 self._completed_naturally = False
+            await self._finalize_page_duplicates()
+            await self._prepare_export()
+            self._check_publication_loss()
             await self._generate_index()
             await self._generate_manifest()
-            await self._generate_report()
             if self.config.get("export_jsonl", True):
                 try:
-                    n = await asyncio.to_thread(self._write_chunks_jsonl)
+                    n = await blocking_complete(self._write_chunks_jsonl)
                     self._log(f"📦 chunks.jsonl skapad: {n} chunks")
                 except Exception as e:
+                    self._export_failed('chunks.jsonl', e)
                     self._log(f"⚠ Fel vid skapande av chunks.jsonl: {e}", LogLevel.ERROR)
+            else:
+                for name in ('chunks.jsonl', 'chunks_quarantine.jsonl'):
+                    path = os.path.join(self.output_dir, name)
+                    if os.path.isfile(path):
+                        os.remove(path)
+            self._export_ready = not bool(self.report['export_failures'])
 
 
 # ─────────────────────────────────────────────────────────────
@@ -4101,8 +5204,8 @@ async def run_cli_mode(config_file: str, webhook_url: Optional[str] = None,
         else:
             name, c = r
             summary_lines.append(f" - {name}: {c.summary_text()}")
-            if c.fatal_error:
-                failures.append(f"{name}: {c.fatal_error}")
+            if c.delivery_status() != 'success':
+                failures.append(f"{name}: {c.fatal_error or c.delivery_status()}")
     summary_lines.extend(f" - {f}" for f in config_failures)
     summary = "\n".join(summary_lines)
     status = "✅ Klart" if not failures else "⚠ Klart med fel"
@@ -4121,6 +5224,10 @@ class AppGUI:
         self.root = root
         self.lang = "sv"
         self.texts = {
+            "status_login_required": {"sv": "Inloggning krävs", "en": "Login required"},
+            "run_success": {"sv": "Lyckad körning", "en": "Successful run"},
+            "run_partial": {"sv": "Partiell körning", "en": "Partial run"},
+            "run_failed": {"sv": "Misslyckad körning", "en": "Failed run"},
             "window_title": {"sv": f"Webbdammsugare Pro (v{VERSION})", "en": f"Web Crawler Pro (v{VERSION})"},
             "tab_basic": {"sv": "⚙️ Grundinställningar", "en": "⚙️ Basic Settings"},
             "tab_adv": {"sv": "🔧 Avancerat", "en": "🔧 Advanced"},
@@ -4585,11 +5692,15 @@ class AppGUI:
     def _apply_template(self, choice):
         none_label = self.texts["template_none"][self.lang]
         if choice == none_label:
+            self._template_conversion_options = {}
             return
 
         site = self.templates.get(choice)
         if not site:
             return
+        self._template_conversion_options = {key: site[key] for key in (
+            'conversion_workers', 'conversion_queue_size', 'conversion_timeout',
+            'generation_keep', 'generation_min_age_hours') if key in site}
 
         if site.get("start_url"):
             self.url_entry.delete(0, tk.END)
@@ -4955,6 +6066,8 @@ class AppGUI:
                         if int(self.log_area.index('end-1c').split('.')[0]) > 500:
                             self.log_area.delete("1.0", "2.0")
                     elif msg_type == "table":
+                        if data[1] == self.texts['status_login_required']['sv']:
+                            data = (data[0], self.texts['status_login_required'][self.lang], data[2])
                         self.tree.insert('', 0, values=data)
                         if len(self.tree.get_children()) > 100:
                             self.tree.delete(self.tree.get_children()[-1])
@@ -4977,6 +6090,11 @@ class AppGUI:
                             else:
                                 self.crawler_instance.login_event.set()
                     elif msg_type == "summary":
+                        for key in ('run_success', 'run_partial', 'run_failed'):
+                            prefix = self.texts[key]['sv'] + ':'
+                            if data.startswith(prefix):
+                                data = self.texts[key][self.lang] + ':' + data[len(prefix):]
+                                break
                         self.stats_label.configure(text=data)
                         self._log_to_gui(data)
                     elif msg_type == "done":
@@ -5024,6 +6142,7 @@ class AppGUI:
         inverted_map = {v[self.lang]: k for k, v in self.texts["run_modes"].items()}
 
         config = {
+            **getattr(self, '_template_conversion_options', {}),
             "start_url": url,
             "output_dir": self.dir_var.get(),
             "delay": delay_val,
@@ -5110,7 +6229,12 @@ def main():
     parser.add_argument("--webhook", type=str,
                         help="Webhook-URL för färdig-notis (eller env WEBHOOK_URL)")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    parser.add_argument('--conversion-worker', nargs=2, help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    if args.conversion_worker:
+        from conversion_worker import main as run_document_worker
+        sys.exit(run_document_worker(*args.conversion_worker, converter_module=sys.modules[__name__]))
 
     # Windows-konsoler och omdirigerad utdata (Task Scheduler) är ofta cp1252 och
     # kraschar på emoji i loggraderna. pythonw.exe har ingen stdout alls.

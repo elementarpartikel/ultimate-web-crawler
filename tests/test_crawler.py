@@ -142,6 +142,14 @@ def texts(out):
     return sorted(os.listdir(d)) if os.path.isdir(d) else []
 
 
+def published(out):
+    """Pinna den officiella generationen; äldre testutdata har ingen pointer."""
+    from pathlib import Path
+    folder = Path(out)
+    pointer = folder / 'current.json'
+    return folder / json.loads(pointer.read_text(encoding='utf-8'))['generation'] if pointer.exists() else folder
+
+
 # ───────────────────────── enhetstester ─────────────────────────
 def test_chunking_preserves_lines_and_adds_path():
     table = "\n".join(f"| rad {i} | värde {i} |" for i in range(300))

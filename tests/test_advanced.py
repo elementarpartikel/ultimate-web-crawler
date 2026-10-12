@@ -196,7 +196,10 @@ def test_document_download_falls_back_to_playwright(tmp_path):
         site.files["/d/rapport.pdf"] = (make_pdf("Rapporten som bara webbläsare får hämta"), None)
         runner, base = await serve(site)
         try:
-            return await run_crawl(base, tmp_path)
+            cookie_file = tmp_path / 'cookies.json'
+            cookie_file.write_text(json.dumps([{'name': 'session', 'value': 'test', 'url': base}]))
+            return await run_crawl(base, tmp_path, headless_mode='login_then_headless',
+                                   cookie_file=str(cookie_file))
         finally:
             await runner.cleanup()
     c = run(go())
