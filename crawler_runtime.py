@@ -11,6 +11,7 @@ from pathlib import Path
 import shutil
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -28,8 +29,26 @@ def contained_path(root: str, path: str) -> str:
 
 def remove_tree(root: str, path: str):
     target = contained_path(root, path)
-    if os.path.exists(target):
+    if not os.path.exists(target):
+        return
+    if os.name != 'nt':
         shutil.rmtree(target)
+        return
+
+    def remove_readonly_directory(function, name, exc_info):
+        error = exc_info[1]
+        if function is not os.rmdir or not isinstance(error, PermissionError):
+            raise error
+        attributes = os.lstat(name).st_file_attributes
+        if not attributes & stat.FILE_ATTRIBUTE_READONLY or attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            raise error
+        # LibreOffice kan märka en katalog i sin temporära hemkatalog som skrivskyddad.
+        # Ändra bara kataloger. En fil kan vara hårdlänkad till en tidigare generation.
+        contained_path(root, name)
+        os.chmod(name, stat.S_IWRITE)
+        function(name)
+
+    shutil.rmtree(target, onerror=remove_readonly_directory)
 
 
 def write_json(path: str, value, retry_replace: bool = False):
@@ -60,9 +79,95 @@ async def blocking_complete(function, *args, **kwargs):
         raise
 
 
+def write_private_json(path: str, value):
+    """Skapa hemlig utdata med privat åtkomst redan vid öppning och byt atomärt."""
+    path = os.path.abspath(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary = path + '.' + uuid.uuid4().hex + '.tmp'
+    descriptor = None
+    try:
+        if os.name == 'nt':
+            import msvcrt
+            from ctypes import wintypes as wt
+
+            class SecurityAttributes(ctypes.Structure):
+                _fields_ = [('length', wt.DWORD), ('descriptor', wt.LPVOID), ('inherit', wt.BOOL)]
+
+            advapi = ctypes.WinDLL('advapi32', use_last_error=True)
+            kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+            advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+                wt.LPCWSTR, wt.DWORD, ctypes.POINTER(wt.LPVOID), ctypes.POINTER(wt.DWORD)]
+            advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wt.BOOL
+            kernel.CreateFileW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD,
+                                          ctypes.POINTER(SecurityAttributes), wt.DWORD, wt.DWORD, wt.HANDLE]
+            kernel.CreateFileW.restype = wt.HANDLE
+            kernel.LocalFree.argtypes = [wt.LPVOID]
+            kernel.LocalFree.restype = wt.LPVOID
+            kernel.CloseHandle.argtypes = [wt.HANDLE]
+            kernel.CloseHandle.restype = wt.BOOL
+            security = wt.LPVOID()
+            # Skyddad DACL: endast filägaren och SYSTEM, inga ärvda läsrättigheter.
+            if not advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    'D:P(A;;FA;;;OW)(A;;FA;;;SY)', 1, ctypes.byref(security), None):
+                raise ctypes.WinError(ctypes.get_last_error())
+            try:
+                attributes = SecurityAttributes(ctypes.sizeof(SecurityAttributes), security, False)
+                handle = kernel.CreateFileW(temporary, 0x40000000, 0, ctypes.byref(attributes), 1, 0x80, None)
+                if handle == wt.HANDLE(-1).value:
+                    raise ctypes.WinError(ctypes.get_last_error())
+                try:
+                    descriptor = msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
+                except BaseException:
+                    kernel.CloseHandle(handle)
+                    raise
+            finally:
+                kernel.LocalFree(security)
+        else:
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as output:
+            descriptor = None
+            json.dump(value, output, ensure_ascii=False)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if os.path.exists(temporary):
+            os.remove(temporary)
+
+
+def limit_worker_memory(max_bytes: int):
+    """POSIX-gränsen ärvs av LibreOffice/OCR; Windows skyddas av jobbobjektet."""
+    if os.name != 'nt':
+        import resource
+        _, hard = resource.getrlimit(resource.RLIMIT_AS)
+        budget = min(max_bytes, hard) if hard != resource.RLIM_INFINITY else max_bytes
+        resource.setrlimit(resource.RLIMIT_AS, (budget, budget))
+
+
+def document_process_environment(directory: str) -> dict[str, str]:
+    """Låt dokumentverktyg hitta systemfiler och språkdata med en egen profil."""
+    allowed = {'PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TESSDATA_PREFIX'}
+    if os.name == 'nt':
+        allowed.update({'SYSTEMROOT', 'WINDIR', 'SYSTEMDRIVE', 'COMSPEC', 'PATHEXT'})
+    environment = {name: os.environ[name] for name in allowed if name in os.environ}
+    for name in ('TEMP', 'TMP', 'TMPDIR', 'HOME'):
+        environment[name] = directory
+    if os.name == 'nt':
+        for name in ('USERPROFILE', 'APPDATA', 'LOCALAPPDATA'):
+            environment[name] = directory
+        drive, path = os.path.splitdrive(directory)
+        environment.update(HOMEDRIVE=drive, HOMEPATH=path)
+    else:
+        for name in ('XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME'):
+            environment[name] = directory
+    return environment
+
+
 class WindowsProcessJob:
     """Stängning av job-handle avslutar också workerprocessens barnprocesser."""
-    def __init__(self, pid: int):
+    def __init__(self, pid: int, memory_bytes: int = 1024 * 1024 * 1024):
         from ctypes import wintypes as wt
 
         class BasicLimits(ctypes.Structure):
@@ -97,7 +202,8 @@ class WindowsProcessJob:
             if not self.handle:
                 raise ctypes.WinError(ctypes.get_last_error())
             limits = ExtendedLimits()
-            limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            limits.basic.flags = 0x2000 | 0x100 | 0x200  # KILL_ON_JOB_CLOSE | PROCESS_MEMORY | JOB_MEMORY
+            limits.process_memory = limits.job_memory = memory_bytes
             if not kernel.SetInformationJobObject(self.handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
                 raise ctypes.WinError(ctypes.get_last_error())
             process = kernel.OpenProcess(0x0101, False, pid)  # SET_QUOTA | TERMINATE
@@ -119,11 +225,14 @@ class WindowsProcessJob:
 class ConversionProcessRunner:
     """En process per dokument, begränsad samtidighet och en verklig avslutningsbar timeout."""
     def __init__(self, work_root: str, workers: int = 2, timeout: float = 180,
-                 worker_script: str | None = None):
+                 worker_script: str | None = None, memory_mb: float = 1024):
         self.work_root = os.path.abspath(work_root)
         self.timeout = timeout
+        if not math.isfinite(memory_mb) or memory_mb < 64:
+            raise ValueError('Dokumentprocessens minnesgräns måste vara minst 64 MiB')
+        self.memory_bytes = int(memory_mb * 1024 * 1024)
         self.semaphore = asyncio.Semaphore(workers)
-        self.worker_script = worker_script or str(Path(__file__).with_name('conversion_worker.py'))
+        self.worker_script = os.path.abspath(worker_script or Path(__file__).with_name('conversion_worker.py'))
         self.active = set()
         self.closed = False
 
@@ -168,23 +277,26 @@ class ConversionProcessRunner:
                     await copy_task
                     raise
                 request = {'input': input_path, 'url': url, 'ref': ref, 'options': options,
-                           'output': os.path.join(directory, 'output'), 'expected_hash': expected_hash}
+                           'output': os.path.join(directory, 'output'), 'expected_hash': expected_hash,
+                           'memory_bytes': self.memory_bytes}
                 job_path, result_path = os.path.join(directory, 'job.json'), os.path.join(directory, 'result.json')
                 request['go_file'] = os.path.join(directory, 'go')
                 write_json(job_path, request)
-                environment = dict(os.environ)
-                environment.pop('SSLKEYLOGFILE', None)
-                for name in ('TEMP', 'TMP', 'TMPDIR'):
-                    environment[name] = directory
                 kwargs = ({'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt'
                           else {'start_new_session': True})
                 process = await asyncio.create_subprocess_exec(
                     *self.command(job_path, result_path),
                     stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL, env=environment, **kwargs)
+                    stderr=asyncio.subprocess.DEVNULL, cwd=directory,
+                    env=document_process_environment(directory), **kwargs)
                 self.active.add(process)
                 if os.name == 'nt':
-                    job = WindowsProcessJob(process.pid)
+                    job = WindowsProcessJob(process.pid, self.memory_bytes)
+                else:
+                    import resource
+                    if hasattr(resource, 'prlimit'):
+                        # Linux skyddar också alternativa workers innan starttecknet.
+                        resource.prlimit(process.pid, resource.RLIMIT_AS, (self.memory_bytes, self.memory_bytes))
                 # Workern väntar på starttecknet tills processgruppen/jobbet skyddats.
                 write_json(request['go_file'], True)
                 # Textbaserade test-/verktygsworkers kan också använda stdin.
@@ -243,6 +355,7 @@ class PublicationWorkspace:
     som behöver en sammanhängande leverans måste pinna generationen från current.json.
     """
     DIRECTORIES = ('texter', 'texter_karantan', 'dokument', 'texter_utgangna')
+    CHUNK_INDEX = '.chunk-export.json'
 
     def __init__(self, root: str, cache_name: str, run: str):
         self.root = os.path.abspath(root)
@@ -391,8 +504,10 @@ class PublicationWorkspace:
                             os.remove(path)
         names = self._artifact_names(self.generation_dir) + [self.cache_name]
         for name in names:
-            if os.path.isfile(os.path.join(self.generation_dir, name)):
-                self._atomic_copy(os.path.join(self.generation_dir, name), os.path.join(self.root, name))
+            source_file = os.path.join(self.generation_dir, name)
+            target_file = os.path.join(self.root, name)
+            if os.path.isfile(source_file) and not self._unchanged_legacy_copy(source_file, target_file):
+                self._atomic_copy(source_file, target_file)
         for name in self._artifact_names(self.root):
             if name not in names and name != 'crawl_report.json':
                 os.remove(contained_path(self.root, os.path.join(self.root, name)))
@@ -413,7 +528,7 @@ class PublicationWorkspace:
                 if name.endswith(('.tmp', '.part', '-wal', '-shm')):
                     raise ValueError('Ofärdiga arbetsfiler får inte publiceras')
                 relative = os.path.relpath(path, self.workdir).replace(os.sep, '/')
-                if not relative.startswith('texter_utgangna/') and relative != self.cache_name:
+                if not relative.startswith('texter_utgangna/') and relative not in (self.cache_name, self.CHUNK_INDEX):
                     artifacts.append(relative)
         pointer = {'schema': 1, 'generation': '.generations/' + self.generation_id,
                    'run': self.run, 'status': status, 'artifacts': sorted(artifacts),

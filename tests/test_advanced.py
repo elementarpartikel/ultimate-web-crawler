@@ -220,15 +220,20 @@ def test_legacy_format_conversion_plumbing(tmp_path, monkeypatch):
     d.save(template)
 
     calls = []
+    monkeypatch.setenv('OPENAI_API_KEY', 'syntetisk-hemlighet')
+    monkeypatch.setenv('HTTPS_PROXY', 'http://user:pass@proxy.invalid')
 
     def fake_run(cmd, **kw):
         calls.append(cmd)
         outdir = cmd[cmd.index("--outdir") + 1]
+        assert kw['cwd'] == outdir
+        assert kw['env']['HOME'] == outdir
+        assert 'OPENAI_API_KEY' not in kw['env'] and 'HTTPS_PROXY' not in kw['env']
         base = os.path.splitext(os.path.basename(cmd[-1]))[0]
         shutil.copy(template, os.path.join(outdir, base + ".docx"))
 
     monkeypatch.setattr(uwc.subprocess, "run", fake_run)
-    conv = uwc.DocumentConverter(str(tmp_path / "out"))
+    conv = uwc.DocumentConverter(str(tmp_path / "out"), allow_libreoffice=True)
     conv._soffice = "soffice"
     src = tmp_path / "gammalt_dokument.doc"
     src.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"0" * 100)
@@ -259,7 +264,7 @@ def test_scanned_pdf_uses_ocr_when_available_else_reports(tmp_path, monkeypatch)
     assert "Tesseract" in conv.last_error
 
     monkeypatch.setattr(conv, "ocr_available", lambda: True)
-    monkeypatch.setattr(conv, "_ocr_page", lambda page: "Text som OCR läste ur den skannade sidan.")
+    monkeypatch.setattr(conv, "_ocr_page", lambda page, **kwargs: "Text som OCR läste ur den skannade sidan.")
     md = conv.convert(str(pdf), "http://x/skannad.pdf", referer_url="http://x/sida")
     assert md
     text = open(md, encoding="utf-8").read()

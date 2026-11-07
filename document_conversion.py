@@ -9,15 +9,22 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import unicodedata
+from bisect import bisect_right
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from difflib import SequenceMatcher
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from crawler_runtime import remove_tree
-from crawler_text import (LogLevel, slugify, metadata_line, file_sha256, markdown_table,
+from crawler_runtime import document_process_environment, remove_tree
+from crawler_text import (LogLevel, slugify, metadata_line, file_sha256, markdown_table, add_table_row_text,
                           downgrade_body_h1, atomic_write_text, detect_prompt_injection, clean_pii_text,
-                          _split_long_text)
+                          pdf_page_reference, _split_long_text)
+from pdf_source_corrections import verified_pdf_tables
+from pdf_scan_tables import scan_table_items
+from pdf_dense_currency import read_dense_currency_table
 
 HAS_PYMUPDF = bool(importlib.util.find_spec('pymupdf') or importlib.util.find_spec('fitz'))
 HAS_DOCX = bool(importlib.util.find_spec('docx'))
@@ -111,7 +118,7 @@ class DocumentConverter:
     def __init__(self, output_dir: str,
                  log_fn=None, pii_cleaner=None, ocr: bool = True,
                  ocr_languages: str = "swe+eng", ocr_max_pages: int = 50,
-                 work_dir: Optional[str] = None):
+                 work_dir: Optional[str] = None, allow_libreoffice: bool = False):
         self.texts_dir = os.path.join(output_dir, "texter")
         self._log = log_fn
         self._clean_pii = pii_cleaner
@@ -123,8 +130,9 @@ class DocumentConverter:
         self.last_used_ocr = False    # True om senaste dokumentets text kommer från OCR
         self.last_error = ""          # orsak till senaste misslyckade konvertering
         self.last_raw_injection = False
+        self.allow_libreoffice = allow_libreoffice
         self._soffice = (shutil.which("soffice") or shutil.which("libreoffice")
-                         or shutil.which("soffice.exe"))
+                         or shutil.which("soffice.exe")) if allow_libreoffice else None
         os.makedirs(self.texts_dir, exist_ok=True)
 
     @staticmethod
@@ -147,7 +155,7 @@ class DocumentConverter:
     def can_convert(self, filepath: str) -> bool:
         ext = os.path.splitext(filepath)[1].lower()
         if ext in self.LEGACY_TARGETS:
-            return bool(self._soffice)
+            return self.allow_libreoffice and bool(self._soffice)
         if ext == '.pdf' and not HAS_PYMUPDF:
             return False
         if ext in ('.docx', '.dotx') and not HAS_DOCX:
@@ -160,6 +168,9 @@ class DocumentConverter:
 
     def _legacy_to_modern(self, filepath: str, ext: str, workdir: str) -> Optional[str]:
         """Konverterar .doc/.xls/.ppt m.fl. med LibreOffice. Returnerar sökväg eller None."""
+        if not self.allow_libreoffice:
+            self.last_error = 'LibreOffice-konvertering är avstängd'
+            return None
         target = self.LEGACY_TARGETS[ext]
         try:
             subprocess.run(
@@ -167,7 +178,8 @@ class DocumentConverter:
                     os.path.join(workdir, 'lo-profile')).as_uri(),
                  "--headless", "--norestore", "--convert-to", target,
                  "--outdir", workdir, filepath],
-                check=True, capture_output=True, timeout=self.LEGACY_TIMEOUT_S)
+                check=True, capture_output=True, timeout=self.LEGACY_TIMEOUT_S,
+                cwd=workdir, env=document_process_environment(workdir))
         except Exception as e:
             self.last_error = f"LibreOffice-konvertering misslyckades: {e}"
             return None
@@ -183,7 +195,7 @@ class DocumentConverter:
 
         Metadata bäddas in i brödtexten (inte bara i header) eftersom RAG-
         pipelines ofta kapar de första raderna före retrieval. Källan
-        upprepas också sist i filen — om Sveas chunking splittrar dokumentet
+        upprepas också sist i filen — om RAG-tjänstens chunkning delar dokumentet
         i flera bitar säkrar det att åtminstone en chunk har källan med.
         """
         self.last_error = ""
@@ -194,6 +206,9 @@ class DocumentConverter:
         src_path, src_ext = filepath, ext
         try:
             if ext in self.LEGACY_TARGETS:
+                if not self.allow_libreoffice:
+                    self.last_error = 'LibreOffice-konvertering är avstängd'
+                    return None
                 if not self._soffice:
                     self.last_error = "Äldre format kräver LibreOffice (soffice)"
                     return None
@@ -215,7 +230,9 @@ class DocumentConverter:
                 self.last_error = f"Filtypen {ext} stöds inte"
                 return None
 
-            text = extractor(src_path)
+            office_metadata = {}
+            text = (extractor(src_path) if src_ext == '.pdf'
+                    else extractor(src_path, metadata=office_metadata))
             if not text or len(text.strip()) < 20:
                 if ext == '.pdf':
                     if self.ocr_available():
@@ -233,6 +250,8 @@ class DocumentConverter:
                         LogLevel.WARNING)
                 return None
 
+            self.last_raw_injection |= detect_prompt_injection(text)
+            text = add_table_row_text(text)
             if self._clean_pii:
                 text = self._clean_pii(text)
 
@@ -247,7 +266,8 @@ class DocumentConverter:
             #   5. rå slug som sista utväg
             filename = os.path.basename(filepath)
             base_name = os.path.splitext(filename)[0]
-            metadata_title = self._extract_doc_metadata_title(src_path, src_ext)
+            metadata_title = (self._extract_pdf_metadata_title(src_path) if src_ext == '.pdf'
+                              else office_metadata.get('title', ''))
             if metadata_title and self._JUNK_TITLE_RE.match(metadata_title.strip()):
                 metadata_title = ""
             humanized = self._humanize_filename(base_name)
@@ -297,7 +317,7 @@ class DocumentConverter:
                          or "Dokument")
 
             # Bygg metadata-block som SYNLIG brödtext (fetstil), inte ren header.
-            # Sveas chunker skippar typiskt header-text men behåller brödtext.
+            # RAG-tjänsters chunkning hoppar ofta över rubriktext men behåller brödtext.
             meta_lines = [f"# {title}", ""]
             meta_lines.append(f"**Källa:** {referer_url or doc_url}")
             if doc_url:
@@ -309,7 +329,9 @@ class DocumentConverter:
                 meta_lines.append(f"**Filnamn:** {display_name}")
             meta_lines.append(f"**Filtyp:** {file_type}")
             # LibreOffice kan ändra temporärfilens metadata under konverteringen.
-            dates = self._extract_doc_dates(src_path, src_ext) if src_path == filepath else {}
+            dates = {}
+            if src_path == filepath:
+                dates = self._extract_pdf_dates(src_path) if src_ext == '.pdf' else office_metadata
             fetched = datetime.now().isoformat(timespec='seconds') if fetched_at is None else fetched_at
             server_modified = self._parse_date(server_last_modified, http=True)
             date_lines = []
@@ -318,7 +340,7 @@ class DocumentConverter:
                 if value:
                     date_lines.append(f'**{label}:** {metadata_line(str(value))}')
             meta_lines.extend(date_lines)
-            if self.last_raw_injection or detect_prompt_injection(text, title):
+            if self.last_raw_injection or detect_prompt_injection(text, *meta_lines):
                 meta_lines.append('**Flaggor:** possible_prompt_injection')
             if self.last_used_ocr:
                 meta_lines.append("**Textkälla:** OCR (automatisk textigenkänning — kan innehålla fel)")
@@ -335,7 +357,8 @@ class DocumentConverter:
 
             text = downgrade_body_h1(text)
             # Gör varje sida/bild och långa avsnitt begripliga också vid extern chunkning.
-            text = self._repeat_document_context(text, title, doc_url, referer_url, date_lines)
+            text = self._repeat_document_context(text, title, doc_url, referer_url, date_lines,
+                                                 is_pdf=src_ext == '.pdf')
             md_content = ("\n".join(meta_lines) + text
                           + "\n".join(footer_lines))
 
@@ -358,7 +381,7 @@ class DocumentConverter:
     # ─── Titelextraktion ────────────────────────────────────
     @staticmethod
     def _repeat_document_context(text: str, title: str, doc_url: str,
-                                  referer_url: str, dates: List[str]) -> str:
+                                  referer_url: str, dates: List[str], *, is_pdf: bool = False) -> str:
         context = '\n'.join([f'**Dokument:** {title}', f'**Källa:** {referer_url or doc_url}',
                              f'**Dokument-URL:** {doc_url}', *dates])
         result = []
@@ -370,10 +393,13 @@ class DocumentConverter:
             heading = match.group(1).strip() if match else title
             body = part[match.end():].strip() if match else part
             unit = re.match(r'^(Sida|Bild)\s+(\d+)\b', heading, re.IGNORECASE)
+            section_context = context
             if unit:
+                if is_pdf and match and unit[1].lower() == 'sida' and unit.end() == len(heading):
+                    section_context += '\n\n' + pdf_page_reference(doc_url, int(unit[2]))
                 heading = f'{title} – {unit.group(1).lower()} {unit.group(2)}'
             for piece in _split_long_text(body, 400, 0) if body else ['']:
-                result.append(f'## {heading}\n\n{context}\n\n{piece}')
+                result.append(f'## {heading}\n\n{section_context}\n\n{piece}')
         return '\n\n'.join(result)
 
     @staticmethod
@@ -408,31 +434,31 @@ class DocumentConverter:
         except (ValueError, TypeError, OverflowError):
             return ''
 
-    def _extract_doc_dates(self, filepath: str, ext: str) -> Dict:
+    def _extract_pdf_dates(self, filepath: str) -> Dict:
         # Metadata beskriver filens tekniska historik, aldrig taxans giltighet.
         try:
-            _load_parser(ext)
-            if ext == '.pdf' and HAS_PYMUPDF:
-                with pymupdf.open(filepath) as doc:
-                    meta = doc.metadata or {}
-                    return {'created': self._parse_date(meta.get('creationDate')),
-                            'modified': self._parse_date(meta.get('modDate'))}
-            if ext in ('.docx', '.dotx'):
-                props = DocxDocument(filepath).core_properties
-            elif ext == '.pptx':
-                props = PptxPresentation(filepath).core_properties
-            elif ext == '.xlsx':
-                wb = xl_load_workbook(filepath, read_only=True, data_only=True)
-                try:
-                    return {'created': self._parse_date(wb.properties.created),
-                            'modified': self._parse_date(wb.properties.modified)}
-                finally:
-                    wb.close()
-            else:
-                return {}
-            return {'created': self._parse_date(props.created), 'modified': self._parse_date(props.modified)}
+            with pymupdf.open(filepath) as doc:
+                meta = doc.metadata or {}
+                return {'created': self._parse_date(meta.get('creationDate')),
+                        'modified': self._parse_date(meta.get('modDate'))}
         except Exception:
             return {}
+
+    def _read_office_metadata(self, document, attribute: str, metadata: Optional[Dict]):
+        if metadata is None:
+            return
+        try:
+            props = getattr(document, attribute)
+        except Exception:
+            return
+        try:
+            metadata['title'] = (props.title or '').strip()
+        except Exception:
+            pass
+        try:
+            metadata.update(created=self._parse_date(props.created), modified=self._parse_date(props.modified))
+        except Exception:
+            pass
 
     @staticmethod
     def _humanize_filename(name: str) -> str:
@@ -452,36 +478,13 @@ class DocumentConverter:
             name = name[0].upper() + name[1:]
         return name
 
-    def _extract_doc_metadata_title(self, filepath: str, ext: str) -> str:
-        """Plocka ut dokumenttitel ur filens egen metadata om sådan finns.
-
-        Många PDF/Office-dokument har ett `title`-fält i sin metadata som
-        ofta är mer beskrivande än filnamnet ("Ansökan om parkeringstillstånd
-        för rörelsehindrad" vs "ansokan-om-parkeringstillstand").
-        """
+    def _extract_pdf_metadata_title(self, filepath: str) -> str:
         try:
-            _load_parser(ext)
-            if ext == '.pdf' and HAS_PYMUPDF:
-                doc = pymupdf.open(filepath)
+            with pymupdf.open(filepath) as doc:
                 title = (doc.metadata or {}).get('title', '')
-                doc.close()
                 return title.strip() if title else ""
-            if ext in ('.docx', '.dotx') and HAS_DOCX:
-                doc = DocxDocument(filepath)
-                title = (doc.core_properties.title or '').strip()
-                return title
-            if ext == '.xlsx' and HAS_OPENPYXL:
-                wb = xl_load_workbook(filepath, read_only=True, data_only=True)
-                title = (wb.properties.title or '').strip()
-                wb.close()
-                return title
-            if ext == '.pptx' and HAS_PPTX:
-                prs = PptxPresentation(filepath)
-                title = (prs.core_properties.title or '').strip()
-                return title
         except Exception:
-            pass
-        return ""
+            return ""
 
     def ocr_available(self) -> bool:
         """OCR kräver att Tesseract är installerat (PyMuPDF anropar det)."""
@@ -496,85 +499,341 @@ class DocumentConverter:
                 self._ocr_ok = False
         return self._ocr_ok
 
-    def _ocr_page(self, page) -> str:
-        """OCR på en sida. Provar önskade språk, sen enbart engelska."""
-        for lang in (self.ocr_languages, "eng"):
+    def _ocr_page(self, page, verified_tables=(), *, reread=None) -> str:
+        textpage = self._ocr_textpage(page, full=True)
+        text = ''
+        try:
+            if textpage is None:
+                return ''
+            text = page.get_text('text', textpage=textpage)
+            self.last_raw_injection |= detect_prompt_injection(text)
+            if verified_tables or (not page.rotation and self._pdf_scan_images(page, page.rect)):
+                blocks = page.get_text('dict', textpage=textpage)['blocks']
+                lines = [line for block in blocks for line in block.get('lines', ())]
+                if verified_tables and text.strip():
+                    return self._pdf_replace_ocr_regions(lines, verified_tables)
+                words = page.get_text('words', textpage=textpage)
+                if reread is not None:
+                    try:
+                        dense = read_dense_currency_table(page, pymupdf, words, reread)
+                        if dense is not None:
+                            left, top, right, bottom = dense[0]
+                            if not any(top <= (y0+y1)/2 <= bottom and x0 < right and x1 > left
+                                       and (x0 < left-2 or x1 > right+2)
+                                       for x0, y0, x1, y1 in (line['bbox'] for line in lines)):
+                                return self._pdf_replace_ocr_regions(lines, (dense,))
+                    except Exception:
+                        # Vid misslyckad omläsning återstår helsidans OCR-text.
+                        pass
+                tables = self._pdf_scan_table_items(words, lines)
+                if tables:
+                    items = tables + [{'bbox': line['bbox'], 'text': self._pdf_line_text(line['spans'])}
+                                      for line in lines if not self._pdf_scan_line_covered(line, tables)]
+                    return '\n\n'.join(item['text'] for item in self._pdf_reading_order(items, page.rect.width))
+        except Exception:
+            # Fel i tabellanalysen får inte ta bort den lästa råtexten.
+            if text.strip() and verified_tables:
+                return '\n\n'.join((text.strip(), *(table for _, table in verified_tables)))
+        return text
+
+    def _pdf_replace_ocr_regions(self, lines, verified_tables):
+        """Byt tabelltexten i OCR-resultatet och behåll läsordningen utanför bildområdena."""
+        output = []
+        emitted = set()
+        for line in lines:
+            x0, y0, x1, y1 = line['bbox']
+            cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+            for index, ((left, top, right, bottom), table) in enumerate(verified_tables):
+                if left <= cx <= right and top <= cy <= bottom:
+                    if index not in emitted:
+                        output.append(f'\n{table}\n')
+                        emitted.add(index)
+                    break
+            else:
+                output.append(self._pdf_line_text(line['spans']))
+        output.extend(f'\n{table}\n' for index, (_, table) in enumerate(verified_tables)
+                      if index not in emitted)
+        return '\n'.join(output)
+
+    @staticmethod
+    def _pdf_scan_images(page, bounds):
+        return [area for kind, bbox in page.get_bboxlog() if kind == 'fill-image'
+                if (area := pymupdf.Rect(bbox) & bounds).get_area() >= bounds.get_area() * 0.8]
+
+    @staticmethod
+    def _pdf_scan_line_covered(line, tables):
+        box = pymupdf.Rect(line['bbox'])
+        return any((pymupdf.Rect(table['bbox']) + (-2, -2, 2, 2)).contains(box) for table in tables)
+
+    def _pdf_scan_table_items(self, words, lines, *, excluded=()):
+        tables = []
+        for table in scan_table_items(words):
+            area = pymupdf.Rect(table['bbox'])
+            if any(area.intersects(rect) for rect in excluded):
+                continue
+            # Ersätt bara hela rader. En rad som korsar tabellgränsen kan bära annan text.
+            if any(area.intersects(pymupdf.Rect(line['bbox']))
+                   and not self._pdf_scan_line_covered(line, [table]) for line in lines):
+                continue
+            tables.append(table)
+        return tables
+
+    def _pdf_native_scan_tables(self, page, bounds, lines, excluded):
+        if page.rotation or not (scans := self._pdf_scan_images(page, bounds)):
+            return []
+        traces = [span for span in page.get_texttrace() if span['chars']]
+        if not any(span['type'] == 3 for span in traces):
+            return []
+        painted = [pymupdf.Rect(span['bbox']) for span in traces if span['type'] != 3]
+        words = [word for word in page.get_text('words')
+                 if any(scan.contains(pymupdf.Rect(word[:4])) for scan in scans)]
+        return self._pdf_scan_table_items(words, lines, excluded=(*excluded, *painted))
+
+    def _ocr_textpage(self, page, *, full: bool, dpi: int = 200):
+        for lang in dict.fromkeys((self.ocr_languages, 'eng')):
             try:
-                textpage = page.get_textpage_ocr(language=lang, dpi=200, full=True)
-                return page.get_text("text", textpage=textpage)
+                return page.get_textpage_ocr(language=lang, dpi=dpi, full=full)
             except Exception:
                 continue
-        return ""
+        return None
+
+    @staticmethod
+    def _pdf_image_regions(page, blocks, bounds):
+        """Välj större bildytor som saknar ett täckande textlager."""
+        native = [(pymupdf.Rect(line['bbox']), sum(len(span.get('text', '').split())
+                                                  for span in line.get('spans', ())))
+                  for block in blocks for line in block.get('lines', ())]
+        images = []
+        for kind, bbox in page.get_bboxlog():
+            if kind != 'fill-image':
+                continue
+            area = pymupdf.Rect(bbox) & bounds
+            if (area.get_area() >= bounds.get_area() * 0.08 and area.width >= bounds.width * 0.2
+                    and area.height >= bounds.height * 0.1
+                    and sum(words for rect, words in native if area.contains((rect.tl + rect.br) / 2)) < 20):
+                images.append(area)
+        return images
+
+    def _pdf_mixed_ocr_lines(self, page, regions, native):
+        textpage = self._ocr_textpage(page, full=False)
+        if textpage is None:
+            return []
+        existing = {(span['text'], span['bbox']) for line in native for span in line['spans']}
+        lines = []
+        for block in page.get_text('dict', textpage=textpage)['blocks']:
+            for line in block.get('lines', ()):
+                rect = pymupdf.Rect(line['bbox'])
+                if any(area.contains((rect.tl + rect.br) / 2) for area in regions):
+                    spans = [span for span in line['spans'] if span.get('font') == 'GlyphLessFont'
+                             and (span['text'], span['bbox']) not in existing]
+                    if spans:
+                        lines.append({**line, 'spans': spans})
+        return lines
+
+    @staticmethod
+    def _pdf_ocr_defects(text):
+        # Synliga felmönster, inte ordlista. Äldre stavning ska kunna bevaras.
+        symbols = sum(c == '\ufffd' or (c not in '\t\r\n' and unicodedata.category(c) in ('Cc', 'Co'))
+                      for c in text)
+        broken_words = re.findall(
+            r'(?<=[^\W\d_])[~&]-?(?=[^\W\d_])|(?<!\w)%(?=[a-zåäö]{2}\b)'
+            r'|(?<=[^\W\d_])([^\W\d_])\1{2,}(?=[^\W\d_])', text)
+        return symbols + len(broken_words)
+
+    def _pdf_legacy_ocr_candidates(self, page, native, bounds):
+        suspicious = [(i, self._pdf_line_text(line['spans'])) for i, line in enumerate(native)]
+        suspicious = [(i, text) for i, text in suspicious if len(text) <= 512 and self._pdf_ocr_defects(text)]
+        if not suspicious:
+            return []
+        scans = self._pdf_scan_images(page, bounds)
+        if not scans:
+            return []
+
+        traces = page.get_texttrace()
+        hidden = [span for span in traces if span['type'] == 3]
+        painted = [pymupdf.Rect(span['bbox']) for span in traces if span['type'] != 3 and span['chars']]
+        if not hidden:
+            return []
+        hidden_boxes = [pymupdf.Rect(span['bbox']) for span in hidden if span['chars']]
+        candidates = []
+        for i, text in suspicious:
+            rect = pymupdf.Rect(native[i]['bbox'])
+            if (not rect.is_empty and any((rect & scan).get_area() >= rect.get_area() * 0.8 for scan in scans)
+                    and any((rect & box).get_area() >= rect.get_area() * 0.25 for box in hidden_boxes)
+                    and not any(not (rect & box).is_empty for box in painted)):
+                candidates.append((i, text, rect))
+        return candidates
+
+    def _pdf_repair_legacy_ocr(self, page, native, candidates):
+        """Rätta belagda radfel med ny OCR utan att byta ut sidans textlager."""
+        textpage = self._ocr_textpage(page, full=True, dpi=300)
+        if textpage is None:
+            return
+        fresh = page.get_text('text', textpage=textpage)
+        self.last_raw_injection |= detect_prompt_injection(fresh)
+        words = page.get_text('words', textpage=textpage)
+        numbers = r'[+−–-]?\d+(?:[.,:/-]\d+)*(?:[ \u00a0]*[%‰](?![^\W\d_]))?'
+        anchors = r'[^\W\d_]{3,}'
+        for i, original, rect in candidates:
+            cy = (rect.y0 + rect.y1) / 2
+            tolerance = min(rect.height * 0.45, 4.0)
+            aligned = sorted(word for word in words if rect.x0 <= (word[0] + word[2]) / 2 < rect.x1
+                             and abs((word[1] + word[3]) / 2 - cy) <= tolerance)
+            if not aligned or any(a[2] > b[0] + 1 for a, b in zip(aligned, aligned[1:])):
+                continue
+            replacement = ' '.join(word[4] for word in aligned)
+            old = ' '.join(original.lower().split())
+            new = replacement.lower()
+            if (len(new) > 512 or not set(re.findall(anchors, old)).intersection(re.findall(anchors, new))
+                    or set(re.findall(r'(?<!\S)[|=~_]+(?!\S)', new)) - set(re.findall(r'(?<!\S)[|=~_]+(?!\S)', old))):
+                continue
+            similarity = SequenceMatcher(None, old, new,
+                                         autojunk=False).ratio()
+            if (similarity < 0.82 or self._pdf_ocr_defects(replacement) >= self._pdf_ocr_defects(original)
+                    or re.findall(numbers, original) != re.findall(numbers, replacement)):
+                continue
+            native[i] = {**native[i], 'spans': [{**native[i]['spans'][0], 'text': replacement}]}
+            self.last_used_ocr = True
 
     def _extract_pdf(self, filepath: str) -> str:
         _load_parser('.pdf')
+        source_tables = verified_pdf_tables(filepath)
         doc = pymupdf.open(filepath)
         pages, font_weights = [], Counter()
         margin_counts = Counter()
         ocr_attempts = 0
+
+        def reread(sheet):
+            nonlocal ocr_attempts
+            ocr_attempts += 1
+            textpage = self._ocr_textpage(sheet, full=True, dpi=288)
+            if textpage is not None:
+                self.last_raw_injection |= detect_prompt_injection(sheet.get_text('text', textpage=textpage))
+            return textpage
+
         try:
             for i, page in enumerate(doc):
+                bounds = page.rect * page.derotation_matrix
+                verified_tables = source_tables.get(i + 1, ())
+
+                def in_verified_region(bbox):
+                    x0, y0, x1, y1 = bbox
+                    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+                    return any(left <= cx <= right and top <= cy <= bottom
+                               for (left, top, right, bottom), _ in verified_tables)
+
                 text = page.get_text('text', sort=True)
                 self.last_raw_injection |= detect_prompt_injection(text)
                 if not text.strip() and ocr_attempts < self.ocr_max_pages and self.ocr_available():
                     # Sidan saknar textlager (skannad bild) → OCR
                     ocr_attempts += 1
-                    text = self._ocr_page(page)
+                    if verified_tables:
+                        text = self._ocr_page(page, verified_tables)
+                    elif ocr_attempts < self.ocr_max_pages:
+                        text = self._ocr_page(page, reread=reread)
+                    else:
+                        text = self._ocr_page(page)
                     if text.strip():
                         self.last_used_ocr = True
                         self.last_raw_injection |= detect_prompt_injection(text)
+                    elif verified_tables:
+                        text = '\n\n'.join(table for _, table in verified_tables)
                     pages.append({'number': i + 1, 'items': [], 'fallback': text.strip(),
-                                  'width': page.rect.width})
+                                  'width': bounds.width, 'height': bounds.height})
                     continue
-                items, covered = [], []
+                items = []
                 try:
-                    tables = page.find_tables().tables
-                    for table in tables:
-                        rows = table.extract()
-                        if not rows or table.col_count < 2 or table.row_count < 2:
+                    blocks = page.get_text('dict', flags=pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES,
+                                           sort=True)['blocks']
+                    native = [line for block in blocks for line in block.get('lines', ())]
+                    repaired_scan_attempted = False
+                    if self.ocr_enabled and ocr_attempts < self.ocr_max_pages and not page.rotation:
+                        try:
+                            candidates = self._pdf_legacy_ocr_candidates(page, native, bounds)
+                            if candidates and self.ocr_available():
+                                ocr_attempts += 1
+                                repaired_scan_attempted = True
+                                self._pdf_repair_legacy_ocr(page, native, candidates)
+                        except Exception:
+                            # Vid OCR-fel behålls det befintliga textlagret.
+                            pass
+                    try:
+                        items = self._pdf_tables(page, native)
+                    except Exception:
+                        # Misslyckad tabellidentifiering får inte ta bort råtexten.
+                        items = []
+                    if verified_tables:
+                        items = [item for item in items if not in_verified_region(item['bbox'])]
+                    if items:
+                        gutters = self._pdf_column_gutters([{'bbox': line['bbox']} for line in native],
+                                                           bounds.width, max_line_width=0.30)
+                        if len(gutters) >= 2:
+                            # Grafiska paneler kan se ut som en tabell för linjedetektorn.
+                            items = [item for item in items if not (
+                                any(item['bbox'][0] < cut < item['bbox'][2] for cut in gutters)
+                                and any((cell or '').count('\n') >= 3 for cell in item['header'])
+                                and not any(re.fullmatch(r'[\d\s.,%]+', cell or '')
+                                            for row in item['rows'] for cell in row if cell and cell.strip()))]
+                    covered = [rect for item in items for rect in (item['bbox'], item['header_bbox']) if rect]
+                    scan_tables = []
+                    try:
+                        excluded = [pymupdf.Rect(rect) for rect in covered]
+                        excluded.extend(pymupdf.Rect(bbox) for bbox, _ in verified_tables)
+                        scan_tables = self._pdf_native_scan_tables(page, bounds, native, excluded)
+                    except Exception:
+                        # Vid osäker geometri används textlagret som vanligt.
+                        pass
+                    ocr_lines = []
+                    if self.ocr_enabled and ocr_attempts < self.ocr_max_pages and not repaired_scan_attempted:
+                        try:
+                            regions = self._pdf_image_regions(page, blocks, bounds)
+                            if regions and self.ocr_available():
+                                ocr_attempts += 1
+                                ocr_lines = self._pdf_mixed_ocr_lines(page, regions, native)
+                        except Exception:
+                            # Ett OCR-fel får inte ta bort sidans ursprungliga text.
+                            pass
+                    if ocr_lines:
+                        recognized = '\n'.join(self._pdf_line_text(line['spans']) for line in ocr_lines)
+                        self.last_raw_injection |= detect_prompt_injection(recognized)
+                        self.last_used_ocr |= bool(recognized.strip())
+                    for index, line in enumerate(native + ocr_lines):
+                        spans = line.get('spans', [])
+                        line_text = self._pdf_line_text(spans)
+                        if not line_text:
                             continue
-                        header = table.header.names if table.header.external else None
-                        table_text = markdown_table(rows, header)
-                        if not table_text:
+                        bbox = tuple(line['bbox'])
+                        cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+                        from_ocr = index >= len(native)
+                        if verified_tables and in_verified_region(bbox):
                             continue
-                        bbox = tuple(table.bbox)
-                        covered.append(bbox)
-                        if table.header.external:
-                            covered.append(tuple(table.header.bbox))
-                        items.append({'text': table_text, 'bbox': bbox, 'table': True})
-                except Exception:
-                    # Misslyckad tabellidentifiering får inte ta bort råtexten.
-                    covered = []
-                    items = []
-                try:
-                    blocks = page.get_text('dict', sort=True)['blocks']
-                    for block in blocks:
-                        for line in block.get('lines', []):
-                            spans = line.get('spans', [])
-                            line_text = self._pdf_line_text(spans)
-                            if not line_text:
-                                continue
-                            bbox = tuple(line['bbox'])
-                            cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
-                            if any(x0 <= cx <= x1 and y0 <= cy <= y1 for x0, y0, x1, y1 in covered):
-                                continue
-                            size = max((span.get('size', 0) for span in spans), default=0)
-                            bold = all(span.get('flags', 0) & 16 for span in spans if span.get('text', '').strip())
-                            margin = ('top' if bbox[3] < page.rect.height * 0.1 else
-                                      'bottom' if bbox[1] > page.rect.height * 0.9 else '')
-                            key = self._pdf_margin_key(line_text, margin)
-                            items.append({'text': line_text, 'bbox': bbox, 'size': size,
-                                          'bold': bold, 'margin_key': key})
-                            if not margin:
-                                for span in spans:
-                                    font_weights[round(span.get('size', 0), 1)] += len(span.get('text', ''))
+                        if scan_tables and self._pdf_scan_line_covered(line, scan_tables):
+                            continue
+                        if not from_ocr and any(x0 <= cx <= x1 and y0 <= cy <= y1 for x0, y0, x1, y1 in covered):
+                            continue
+                        size = 0 if from_ocr else max((span.get('size', 0) for span in spans), default=0)
+                        bold = all(span.get('flags', 0) & 16 for span in spans if span.get('text', '').strip())
+                        margin = ('top' if bbox[3] < bounds.height * 0.1 else
+                                  'bottom' if bbox[1] > bounds.height * 0.9 else '')
+                        key = self._pdf_margin_key(line_text, margin)
+                        items.append({'text': line_text, 'bbox': bbox, 'size': size,
+                                      'bold': bold, 'margin_key': key})
+                        if not margin and not from_ocr:
+                            for span in spans:
+                                font_weights[round(span.get('size', 0), 1)] += len(span.get('text', ''))
                     margin_counts.update({item['margin_key'] for item in items if item.get('margin_key')})
+                    items.extend(scan_tables)
+                    items.extend({'text': table, 'bbox': bbox, 'table': True, 'columns': ()}
+                                 for bbox, table in verified_tables)
                 except Exception:
                     items = []
+                    if verified_tables:
+                        text = '\n\n'.join((text.strip(), *(table for _, table in verified_tables)))
                 pages.append({'number': i + 1, 'items': items, 'fallback': text.strip(),
-                              'width': page.rect.width})
+                              'width': bounds.width, 'height': bounds.height})
         finally:
             doc.close()
+        self._pdf_continue_tables(pages)
         body_size = font_weights.most_common(1)[0][0] if font_weights else 11
         repeated = {key for key, count in margin_counts.items()
                     if len(pages) >= 3 and count >= max(3, math.ceil(len(pages) * 0.6))}
@@ -595,6 +854,318 @@ class DocumentConverter:
             if value.strip():
                 output.append(f"## Sida {record['number']}\n\n{value.strip()}")
         return '\n\n'.join(output)
+
+    def _pdf_tables(self, page, native):
+        detected = [(table, table.extract()) for table in page.find_tables().tables
+                    if table.col_count >= 2 and table.row_count >= 2]
+
+        def has_vat_legend(rows):
+            return any(re.search(r'grå\s+ruta\s*=\s*exkl\.\s*moms.*vit\s+ruta\s*=\s*inkl\.\s*moms',
+                                 ' '.join(value.split()), re.I)
+                       for row in rows[:3] for value in row if value)
+
+        strict = []
+        if any(has_vat_legend(rows)
+               or any(cell and cell[2] - cell[0] < 8 for row in table.rows for cell in row.cells)
+               or sum(bool(cell and cell.strip()) for cell in rows[-1]) == 1
+               for table, rows in detected if rows):
+            try:
+                strict = [(table, table.extract()) for table in page.find_tables(strategy='lines_strict').tables
+                          if table.col_count >= 2 and table.row_count >= 2]
+            except Exception:
+                pass
+        items = []
+        for table, rows in detected:
+            if not rows:
+                continue
+            if has_vat_legend(rows):
+                matrix = next((self._pdf_vat_matrix(page, candidate, values, native, rows)
+                               for candidate, values in strict
+                               if has_vat_legend(values)
+                               and all(abs(a - b) <= 3 for a, b in zip(table.bbox, candidate.bbox))), None)
+                if matrix:
+                    caption, header, body = matrix
+                    items.append({'text': caption + '\n\n' + markdown_table(body, header),
+                                  'bbox': tuple(table.bbox), 'table': True, 'columns': (),
+                                  'header': header, 'rows': body, 'header_bbox': None})
+                    continue
+            table, rows = next(((candidate, values) for candidate, values in strict
+                                if self._pdf_strict_table_matches(table, rows, candidate, values)),
+                               (table, rows))
+            geometry = table.rows
+            rows = self._pdf_restore_cell_spans(geometry, rows, native)
+            external = table.header.external
+            if external:
+                header, header_rows = table.header.names, 0
+            else:
+                header, header_rows = self._pdf_table_header(geometry, rows)
+            body = rows[header_rows:]
+            body = self._pdf_stacked_vat_rows(header, geometry[header_rows:], body, native)
+            table_text = markdown_table(body, header)
+            if not table_text:
+                continue
+            cells = max((row.cells for row in geometry), key=lambda row: sum(cell is not None for cell in row))
+            columns = tuple(cell[0] for cell in cells) if all(cells) else ()
+            items.append({'text': table_text, 'bbox': tuple(table.bbox), 'table': True,
+                          'columns': columns, 'header': header, 'rows': body,
+                          'extracted_rows': rows, 'header_rows': header_rows,
+                          'header_bbox': tuple(table.header.bbox) if external else None})
+        return items
+
+    @staticmethod
+    def _pdf_amount(value, *, currency=False):
+        suffix = r'\s+kr' if currency else ''
+        return bool(re.fullmatch(r'\d+(?:[ \u00a0]\d{3})*(?:,\d{1,2})?' + suffix, value))
+
+    def _pdf_vat_matrix(self, page, table, rows, native, original):
+        """Koppla varje beloppspar till de mätarklasser som cellen verkligen täcker."""
+        if len(rows) < 5 or rows[-2][0] != 'Mätarinstallation' or rows[-1][0] != 'Mätarklass':
+            return None
+        installations, classes = rows[-2][2:], rows[-1][2:]
+        foot = table.rows[-1].cells[2:]
+        if (not all(foot) or not all(installations) or not all(classes)
+                or len(foot) != len(installations) or len(foot) != len(classes)
+                or len(set(classes)) != len(classes)):
+            return None
+        fills = [(path['rect'], path['fill']) for path in page.get_drawings()
+                 if path.get('fill') and path['rect'].width > 3 and path['rect'].height > 3]
+        spans = [span for line in native for span in line['spans']
+                 if self._pdf_amount(' '.join(span['text'].split()), currency=True)]
+        body, seen = [], []
+        for geometry, row in zip(table.rows[2:-2], rows[2:-2]):
+            if not row[0] or not row[0].isdigit() or not row[1] or not self._pdf_amount(row[1]):
+                return None
+            assigned = set()
+            for cell, value in zip(geometry.cells[2:], row[2:]):
+                if not value or not value.strip():
+                    continue
+                pair = [' '.join(line.split()) for line in value.splitlines() if line.strip()]
+                if not cell or len(pair) != 2 or not all(self._pdf_amount(v, currency=True) for v in pair):
+                    return None
+                in_cell = []
+                for span in spans:
+                    x = (span['bbox'][0] + span['bbox'][2]) / 2
+                    y = span['origin'][1] - span['size'] * 0.35
+                    if cell[0] <= x < cell[2] and cell[1] <= y < cell[3]:
+                        color = next((fill for rect, fill in reversed(fills) if rect.contains((x, y))), (1, 1, 1))
+                        shade = ('grey' if min(color) >= 0.55 and max(color) <= 0.97
+                                 and max(color) - min(color) <= 0.03 else
+                                 'white' if min(color) >= 0.98 else '')
+                        in_cell.append((y, ' '.join(span['text'].split()), shade))
+                if [(value, shade) for _, value, shade in sorted(in_cell)] != [(pair[0], 'grey'), (pair[1], 'white')]:
+                    return None
+                covered = [i for i, rect in enumerate(foot)
+                           if cell[0] - 2 <= rect[0] and rect[2] <= cell[2] + 2]
+                if (not covered or assigned.intersection(covered)
+                        or abs(foot[covered[0]][0] - cell[0]) > 2
+                        or abs(foot[covered[-1]][2] - cell[2]) > 2):
+                    return None
+                assigned.update(covered)
+                seen.extend(pair)
+                body.extend([row[0], row[1], classes[i], installations[i], *pair] for i in covered)
+            if not assigned:
+                return None
+        amounts = [' '.join(line.split()) for row in original[2:-2] for value in row if value
+                   for line in value.splitlines() if self._pdf_amount(' '.join(line.split()), currency=True)]
+        if not body or Counter(amounts) != Counter(seen):
+            return None
+        return rows[0][0], ['Prisklass', 'Max volym per år (m³)', 'Mätarklass',
+                            'Mätarinstallation', 'Exkl. moms', 'Inkl. moms'], body
+
+    def _pdf_stacked_vat_rows(self, header, geometry, rows, native):
+        """Lägg till rader för säkra baslinjeträffar i celler med flera belopp."""
+        if (len(header) != 4 or not re.match(r'ex(?:kl)?\.\s*moms\b', header[2] or '', re.I)
+                or not re.match(r'in(?:k|kl)\.\s*moms\b', header[3] or '', re.I)):
+            return rows
+        output = []
+        for row, shape in zip(rows, geometry):
+            output.append(row)
+            if len(row) != 4 or not all(shape.cells) or not all(row[2:]):
+                continue
+            prices = [[value.strip() for value in cell.splitlines() if value.strip()] for cell in row[2:]]
+            if min(sum(self._pdf_amount(value) for value in values) for values in prices) < 2:
+                continue
+            columns = [[] for _ in row]
+            for line in native:
+                for index, cell in enumerate(shape.cells):
+                    spans = [span for span in line['spans'] if span['text'].strip()
+                             and cell[0] <= (span['bbox'][0] + span['bbox'][2]) / 2 < cell[2]
+                             and cell[1] <= span['origin'][1] < cell[3]]
+                    if spans:
+                        main = max(spans, key=lambda span: span['size'])
+                        columns[index].append((main['origin'][1], main['size'], self._pdf_line_text(spans)))
+            for column in columns:
+                column.sort()
+            amounts = [[(y, size, value) for y, size, value in col if self._pdf_amount(value)]
+                       for col in columns[2:]]
+            if any([value for _, _, value in col] != [value for value in old if self._pdf_amount(value)]
+                   for col, old in zip(amounts, prices)):
+                continue
+            def group_lines(entries):
+                groups = []
+                for entry in entries:
+                    if not groups or entry[0] - groups[-1][-1][0] > 1.65 * entry[1]:
+                        groups.append([])
+                    groups[-1].append(entry)
+                return groups
+
+            groups = group_lines(columns[0])
+            unit_groups = group_lines(columns[1])
+            linked = []
+            labels_used, left_used, right_used = set(), set(), set()
+            for left_index, (y, size, ex) in enumerate(amounts[0]):
+                rhs = [(index, inc) for index, (ry, _, inc) in enumerate(amounts[1]) if abs(ry - y) <= 1]
+                labels = [(group, index) for group in groups for index, (ly, _, label) in enumerate(group)
+                          if abs(ly - y) <= 0.6 * size and not label.startswith('*')]
+                if len(rhs) != 1 or len(labels) != 1:
+                    continue
+                right_index, inc = rhs[0]
+                group, label_index = labels[0]
+                prefix_y, _, prefix = group[0]
+                ly, _, label = group[label_index]
+                if ly in labels_used or right_index in right_used:
+                    continue
+                if label.startswith('('):
+                    # En beräkningsrad får ärva beskrivningen ovanför först när
+                    # det utskrivna uttrycket verifierar beloppet utan moms.
+                    calculation = re.fullmatch(
+                        r'\(\s*(\d{1,9})\s*m[³3]\s*[x×]\s*(\d{1,9}(?:,\d{1,2})?)'
+                        r'\s*kr\s*/\s*m[³3]\s*,\s*exkl\.?\s*moms\s*\)', label, re.I)
+                    preceding = next((entry for entry in reversed(columns[0]) if entry[0] < ly), None)
+                    if (not preceding or not calculation
+                            or Decimal(calculation[1]) * Decimal(calculation[2].replace(',', '.'))
+                            != Decimal(ex.replace(' ', '').replace('\u00a0', '').replace(',', '.'))):
+                        continue
+                    prefix_y, _, prefix = preceding
+                    if ly - prefix_y > 1.8 * size or prefix_y in labels_used or prefix.startswith(('*', '(')):
+                        continue
+                    labels_used.add(prefix_y)
+                elif prefix_y in labels_used or prefix.startswith(('*', '(')):
+                    prefix = label
+                labels_used.add(ly)
+                left_used.add(left_index)
+                right_used.add(right_index)
+                unit = ''
+                nearby = [group for group in unit_groups if any(abs(uy - y) <= 0.6 * size for uy, _, _ in group)]
+                if len(nearby) == 1:
+                    unit_lines = nearby[0]
+                    if all(sum(abs(other - uy) <= abs(y - uy) for other, _, _ in amounts[0]) == 1
+                           for uy, _, _ in unit_lines):
+                        unit = '\n'.join(value for _, _, value in unit_lines)
+                    else:
+                        aligned = [value for uy, _, value in unit_lines if abs(uy - y) <= 0.6 * size]
+                        if len(aligned) == 1:
+                            unit = aligned[0]
+                linked.append(['\n'.join(dict.fromkeys((prefix, label))), unit, ex, inc])
+            if len(linked) >= 2:
+                remaining = []
+                for values, used in zip(prices, (left_used, right_used)):
+                    kept = []
+                    index = 0
+                    for value in values:
+                        if not self._pdf_amount(value):
+                            kept.append(value)
+                            continue
+                        if index not in used:
+                            kept.append(value)
+                        index += 1
+                    remaining.append('\n'.join(kept))
+                note = 'Tabelltext och belopp utan entydig radkoppling'
+                output[-1] = [note + '\n' + (row[0] or ''), row[1], *remaining]
+                output.extend(linked)
+        return output
+
+    def _pdf_strict_table_matches(self, table, rows, candidate, values):
+        """Välj bort falska kolumner bara när den striktare geometrin bevarar dataraderna."""
+        if (candidate.col_count >= table.col_count or candidate.bbox[3] > table.bbox[3] + 3
+                or any(abs(candidate.bbox[i] - table.bbox[i]) > 3 for i in range(3))
+                or candidate.header.external != table.header.external):
+            return False
+        candidate_rows = candidate.rows
+        bands = [row.bbox[1] for row in candidate_rows]
+        matched = set()
+        for geometry, row in zip(table.rows, rows):
+            cells = [cell for cell in row if cell and cell.strip()]
+            cy = (geometry.bbox[1] + geometry.bbox[3]) / 2
+            numbers = [' '.join(cell.split()) for cell in cells if self._pdf_table_value(cell)]
+            if len(cells) < 2 and not numbers:
+                continue
+            index = bisect_right(bands, cy) - 1
+            if (index < 0 or index in matched or cy >= candidate_rows[index].bbox[3]
+                    or sum(bool(cell and cell.strip()) for cell in values[index]) < 2):
+                return False
+            if numbers != [' '.join(cell.split()) for cell in values[index]
+                           if cell and self._pdf_table_value(cell)]:
+                return False
+            matched.add(index)
+        return True
+
+    def _pdf_restore_cell_spans(self, geometry, rows, native):
+        """Behåll en hel textsekvens när dess geometri entydigt hör till en cell."""
+        bands = [row.bbox[1] for row in geometry]
+        by_row = [{} for _ in rows]
+        ambiguous = set()
+        for line_index, line in enumerate(native):
+            for span in line['spans']:
+                if not span['text'].strip():
+                    continue
+                x0, y0, x1, y1 = span['bbox']
+                cy = (y0 + y1) / 2
+                index = bisect_right(bands, cy) - 1
+                if index < 0:
+                    continue
+                row = geometry[index]
+                if cy >= row.bbox[3] or not row.bbox[0] <= (x0 + x1) / 2 < row.bbox[2]:
+                    continue
+                cell_index = next((col for col, cell in enumerate(row.cells)
+                                   if cell and cell[0] - 0.5 <= x0 and x1 <= cell[2] + 0.5
+                                   and cell[1] <= cy < cell[3]), None)
+                if cell_index is None:
+                    ambiguous.add(index)
+                else:
+                    by_row[index].setdefault(cell_index, {}).setdefault(line_index, []).append(span)
+
+        def normalized(value):
+            return ' '.join((value or '').split())
+
+        for index, groups in enumerate(by_row):
+            original = rows[index]
+            if index in ambiguous or not any(
+                    len(normalized(span['text'])) >= len(normalized(original[col])) + 6
+                    for col, lines in groups.items() for spans in lines.values() for span in spans):
+                continue
+            repaired = list(original)
+            for col, lines in groups.items():
+                repaired[col] = '\n'.join(self._pdf_line_text(sorted(spans, key=lambda span: span['bbox'][0]))
+                                          for spans in lines.values())
+            if all(not normalized(before) or (col in groups and normalized(after)
+                    and (not self._pdf_table_value(before) or normalized(before) == normalized(after)))
+                   for col, (before, after) in enumerate(zip(original, repaired))):
+                rows[index] = repaired
+        return rows
+
+    def _pdf_table_header(self, geometry, rows):
+        """Platta ut en bekräftad grupprubrik så varje kolumn bär hela rubrikvägen."""
+        first = rows[0]
+        if len(rows) < 3:
+            return first, 1
+        parents = [(cell, value) for cell, value in zip(geometry[0].cells, first) if cell]
+        children = geometry[1].cells
+        lower = rows[1]
+        if (len(parents) < 2 or len(children) != len(first) or len(lower) != len(children) or not all(children)
+                or sum(bool(value and value.strip()) for value in lower) < 2
+                or any(self._pdf_table_value(value) for value in lower if value)):
+            return first, 1
+        owners = [next((index for index, (cell, _) in enumerate(parents)
+                        if cell[0] <= child[0] + 0.5 and child[2] <= cell[2] + 0.5), None)
+                  for child in children]
+        if None in owners or len(set(owners)) == len(children):
+            return first, 1
+        spans = Counter(owners)
+        if any(spans[owner] > 1 and not value for owner, value in zip(owners, lower)):
+            return first, 1
+        return ['\n'.join(dict.fromkeys(value for value in (parents[owner][1], child) if value))
+                for owner, child in zip(owners, lower)], 2
 
     @staticmethod
     def _pdf_line_text(spans: List[Dict]) -> str:
@@ -619,11 +1190,138 @@ class DocumentConverter:
         return margin + ':' + key
 
     @staticmethod
+    def _pdf_continue_tables(pages: List[Dict]):
+        def table_at_edge(page, *, first):
+            content = [item for item in page['items'] if not item.get('margin_key')]
+            if not content:
+                return None
+            key = 1 if first else 3
+            item = (min if first else max)(content, key=lambda item: item['bbox'][key])
+            return item if item.get('table') and item['columns'] else None
+
+        def normalized(row):
+            return [' '.join((cell or '').lower().split()) for cell in row]
+
+        def blank(cell):
+            return normalized([cell])[0] in ('', 'blank cell')
+
+        def numbers(row):
+            return {i for i, cell in enumerate(row) if re.match(r'^\s*[+−-]?\d', cell or '')}
+
+        for previous, page in zip(pages, pages[1:]):
+            tail, head = table_at_edge(previous, first=False), table_at_edge(page, first=True)
+            if (not tail or not head or head['bbox'][1] > page['height'] * 0.30
+                    or tail['bbox'][3] < previous['height'] * 0.72
+                    or len(tail['columns']) != len(head['columns'])):
+                continue
+            tolerance = max(3, page['width'] * 0.01)
+            if (abs(tail['bbox'][2] - head['bbox'][2]) > tolerance
+                    or any(abs(a - b) > tolerance for a, b in zip(tail['columns'], head['columns']))):
+                continue
+
+            header = tail['header']
+            if normalized(header) == normalized(head['header']):
+                body = head['rows']
+            elif head['header_rows'] == 1:
+                # En datarad får inte bli tabellhuvud och upprepas i varje chunk.
+                first_row = head['extracted_rows'][0]
+                tail_numbers = set().union(*(numbers(row) for row in tail['rows'][-6:]))
+                evidence = (numbers(first_row) & tail_numbers) - numbers(header)
+                if not any(not re.fullmatch(r'(?:19|20)\d{2}', first_row[i].strip()) for i in evidence):
+                    continue
+                body = head['extracted_rows']
+            else:
+                continue
+
+            body = [list(row) for row in body]
+            if body and not blank(header[0]) and any(blank(row[0]) for row in tail['rows'][-6:]):
+                label = next((row[0] for row in reversed(tail['rows']) if not blank(row[0])), '')
+                if label and not numbers([label]):
+                    for row in body:
+                        if not blank(row[0]) or not any(not blank(cell) for cell in row[1:]):
+                            break
+                        row[0] = label
+            head.update(header=header, rows=body, text=markdown_table(body, header))
+
+    @staticmethod
+    def _pdf_column_gutters(items: List[Dict], width: float, max_line_width: float = 0.48) -> List[float]:
+        # Breda rubriker och tabeller får dela sidan i band men bestämmer inte spalterna.
+        intervals = sorted((item['bbox'][0], item['bbox'][2], item['bbox'][1], item['bbox'][3])
+                           for item in items if not item.get('table') and not item.get('margin_key')
+                           and item['bbox'][2] - item['bbox'][0] < width * max_line_width)
+        groups = []
+        for start, end, top, bottom in intervals:
+            if groups and start <= groups[-1][1] + width * 0.008:
+                group = groups[-1]
+                group[1] = max(group[1], end)
+                group[2] = min(group[2], top)
+                group[3] = max(group[3], bottom)
+                group[4] += 1
+            else:
+                groups.append([start, end, top, bottom, 1])
+        columns = [group for group in groups if group[4] >= 3 and group[1] - group[0] >= width * 0.07]
+        return [(left[1] + right[0]) / 2 for left, right in zip(columns, columns[1:])
+                if right[0] - left[1] >= width * 0.012
+                and min(left[3], right[3]) - max(left[2], right[2]) >= 12]
+
+    @staticmethod
+    def _pdf_order_column_bands(items: List[Dict], gutters: List[float]) -> List[Dict]:
+        pending, ordered = [], []
+        for item in sorted(items, key=lambda item: (item['bbox'][1], item['bbox'][0])):
+            x0, _, x1, _ = item['bbox']
+            if item.get('margin_key') or any(x0 < cut < x1 for cut in gutters):
+                ordered.extend(entry for _, entry in sorted(pending, key=lambda pair: pair[0]))
+                pending.clear()
+                ordered.append(item)
+            else:
+                pending.append((sum(cut <= x0 for cut in gutters), item))
+        ordered.extend(entry for _, entry in sorted(pending, key=lambda pair: pair[0]))
+        return ordered
+
+    @staticmethod
+    def _pdf_table_value(text: str) -> bool:
+        return bool(re.fullmatch(r'[\d\s.,/%€$:+−–-]+(?:\s*(?:kr|sek|eur|m²|m2|st|kg))?|ja|nej|yes|no',
+                                 text.strip(), re.I))
+
+    @staticmethod
+    def _pdf_aligned_rows(items: List[Dict], gutters: List[float]) -> List[Dict]:
+        # Kantlösa tabeller med flera värdekolumner ska också läsas radvis.
+        bands = []
+        for item in sorted(items, key=lambda item: item['bbox'][3]):
+            x0, _, x1, baseline = item['bbox']
+            if item.get('table') or item.get('margin_key') or any(x0 < cut < x1 for cut in gutters):
+                continue
+            if not bands or baseline - bands[-1][0] > 3:
+                bands.append((baseline, []))
+            bands[-1][1].append((sum(cut <= x0 for cut in gutters), item))
+        rows = []
+        for _, cells in bands:
+            cells.sort(key=lambda cell: cell[0])
+            columns = [col for col, _ in cells]
+            if (len(columns) >= 3 and columns[0] == 0 and len(set(columns)) == len(columns)
+                    and all(DocumentConverter._pdf_table_value(item['text']) for _, item in cells[1:])):
+                rows.append([item for _, item in cells])
+        if len(rows) < 3:
+            return items
+        used = {id(item) for row in rows for item in row}
+        merged = [{'text': ' | '.join(item['text'] for item in row), 'table': True,
+                   'bbox': (row[0]['bbox'][0], min(item['bbox'][1] for item in row),
+                            row[-1]['bbox'][2], max(item['bbox'][3] for item in row))}
+                  for row in rows]
+        return merged + [item for item in items if id(item) not in used]
+
+    @staticmethod
     def _pdf_reading_order(items: List[Dict], width: float) -> List[Dict]:
-        """Läs tydliga tvåspaltsband spaltvis, med breda rubriker/tabeller emellan."""
-        mid = width / 2
-        left = [item for item in items if item['bbox'][2] < mid and not item.get('margin_key')]
-        right = [item for item in items if item['bbox'][0] > mid and not item.get('margin_key')]
+        """Läs spaltvis inom band, med breda rubriker och tabeller emellan."""
+        gutters = DocumentConverter._pdf_column_gutters(items, width, max_line_width=0.30)
+        if len(gutters) <= 1:
+            gutters = DocumentConverter._pdf_column_gutters(items, width)
+        if len(gutters) > 1:
+            items = DocumentConverter._pdf_aligned_rows(items, gutters)
+            return DocumentConverter._pdf_order_column_bands(items, gutters)
+        mid = gutters[0] if gutters else width / 2
+        left = [item for item in items if item['bbox'][2] < mid and not (item.get('margin_key') or item.get('table'))]
+        right = [item for item in items if item['bbox'][0] > mid and not (item.get('margin_key') or item.get('table'))]
         normal = lambda values: sorted(values, key=lambda item: (item['bbox'][1], item['bbox'][0]))
         if len(left) < 3 or len(right) < 3:
             return normal(items)
@@ -639,11 +1337,8 @@ class DocumentConverter:
                 pairs.append((label, value))
                 unused.remove(value)
         def tabular(label, value):
-            numeric = bool(re.fullmatch(r'[\d\s.,/%€$:+−–-]+(?:\s*(?:kr|sek|eur|m²|m2|st|kg))?',
-                                        value['text'].strip(), re.I))
-            status = bool(re.fullmatch(r'ja|nej|yes|no', value['text'].strip(), re.I))
             short = len(label['text'].split()) <= 4 and len(value['text'].split()) <= 3
-            return numeric or status or short
+            return DocumentConverter._pdf_table_value(value['text']) or short
         table_pairs = [(label, value) for label, value in pairs if tabular(label, value)]
         if (len(pairs) >= min(len(left), len(right)) * 0.7 and pairs
                 and len(table_pairs) >= 3):
@@ -657,33 +1352,25 @@ class DocumentConverter:
         if max(min(item['bbox'][1] for item in left), min(item['bbox'][1] for item in right)) >= min(
                 max(item['bbox'][3] for item in left), max(item['bbox'][3] for item in right)):
             return normal(items)
-        broad = normal([item for item in items if item not in left and item not in right])
-        remaining, ordered = list(left + right), []
-        for separator in broad:
-            band = [item for item in remaining if item['bbox'][1] < separator['bbox'][1]]
-            ordered.extend(normal([item for item in band if item['bbox'][2] < mid]))
-            ordered.extend(normal([item for item in band if item['bbox'][0] > mid]))
-            remaining = [item for item in remaining if item not in band]
-            ordered.append(separator)
-        ordered.extend(normal([item for item in remaining if item['bbox'][2] < mid]))
-        ordered.extend(normal([item for item in remaining if item['bbox'][0] > mid]))
-        return ordered
+        return DocumentConverter._pdf_order_column_bands(items, [mid])
 
-    def _extract_docx(self, filepath: str) -> str:
+    def _extract_docx(self, filepath: str, metadata: Optional[Dict] = None) -> str:
         _load_parser('.docx')
         doc = DocxDocument(filepath)
+        self._read_office_metadata(doc, 'core_properties', metadata)
         parts = []
 
         def para_to_md(para) -> Optional[str]:
             text = para.text.strip()
             if not text:
                 return None
-            style = para.style.name if para.style and para.style.name else ""
-            if style.startswith('Heading') or style.startswith('Rubrik'):
-                digits = re.findall(r'\d+', style)
+            style = para.style
+            name = (style.name or '') if style else ''
+            if name.startswith('Heading') or name.startswith('Rubrik'):
+                digits = re.findall(r'\d+', name)
                 level = int(digits[0]) if digits else 1
                 return f"{'#' * min(level + 1, 6)} {text}"
-            if style == 'Title' or style == 'Titel':
+            if name in ('Title', 'Titel'):
                 return f"## {text}"
             return text
 
@@ -712,9 +1399,16 @@ class DocumentConverter:
                     parts.append(md)
         return "\n\n".join(parts)
 
-    def _extract_xlsx(self, filepath: str) -> str:
+    def _extract_xlsx(self, filepath: str, metadata: Optional[Dict] = None) -> str:
         _load_parser('.xlsx')
         wb = xl_load_workbook(filepath, read_only=True, data_only=True)
+        try:
+            self._read_office_metadata(wb, 'properties', metadata)
+            return self._xlsx_text(wb)
+        finally:
+            wb.close()
+
+    def _xlsx_text(self, wb) -> str:
         parts = []
         for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
@@ -727,22 +1421,18 @@ class DocumentConverter:
                 if n >= self.MAX_XLSX_ROWS_PER_SHEET:
                     truncated = True
                     break
-                cells = [str(c).replace('\n', ' ').replace('|', '/') if c is not None
-                         else "" for c in row]
-                if any(c for c in cells):
-                    rows_data.append("| " + " | ".join(cells) + " |")
+                if any(cell is not None and cell != '' for cell in row):
+                    rows_data.append(row)
             if rows_data:
-                col_count = rows_data[0].count("|") - 1
-                rows_data.insert(1, "|" + "|".join(["---"] * max(col_count, 1)) + "|")
-                parts.append("\n".join(rows_data))
+                parts.append(markdown_table(rows_data))
             if truncated:
                 parts.append(f"_(Bladet avkortat efter {self.MAX_XLSX_ROWS_PER_SHEET} rader.)_")
-        wb.close()
         return "\n\n".join(parts)
 
-    def _extract_pptx(self, filepath: str) -> str:
+    def _extract_pptx(self, filepath: str, metadata: Optional[Dict] = None) -> str:
         _load_parser('.pptx')
         prs = PptxPresentation(filepath)
+        self._read_office_metadata(prs, 'core_properties', metadata)
         parts = []
 
         def shape_text(shape, depth=0):

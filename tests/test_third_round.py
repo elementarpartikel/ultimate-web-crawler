@@ -291,7 +291,7 @@ def test_cli_exit_code_and_report_reflect_resource_errors(tmp_path, monkeypatch,
         runner, base = await serve(site)
         path = tmp_path / 'config.json'
         path.write_text(json.dumps([{**config(base, tmp_path), 'name': 'test',
-                                     'find_sitemap': False}]), encoding='utf-8')
+                                     'find_sitemap': False, 'allow_private_hosts': True}]), encoding='utf-8')
         try:
             code = await uwc.run_cli_mode(str(path), output_dir=str(tmp_path / 'out'))
             report = json.loads((tmp_path / 'out' / 'test' / 'crawl_report.json').read_text())

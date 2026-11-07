@@ -53,7 +53,9 @@ import threading
 import time
 import zlib
 import uuid
-from collections import Counter
+import zipfile
+import xml.etree.ElementTree as ET
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -61,16 +63,19 @@ from email.utils import parsedate_to_datetime
 from http.cookies import SimpleCookie
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from contextlib import ExitStack
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 
-from bs4 import BeautifulSoup, Comment
-from crawler_runtime import ConversionProcessRunner, PublicationWorkspace, remove_tree, blocking_complete
+from bs4 import BeautifulSoup, CData, Comment, NavigableString, Tag
+from crawler_runtime import (ConversionProcessRunner, PublicationWorkspace, remove_tree,
+                             blocking_complete, write_private_json)
 
-from crawler_text import (LogLevel, slugify, metadata_line, file_sha256, markdown_table,
+from crawler_text import (LogLevel, slugify, metadata_line, file_sha256, markdown_table, add_table_row_text,
                           downgrade_body_h1, atomic_write_text, detect_prompt_injection,
                           clean_pii_text, ROLE_MAILBOX_LOCALPARTS, _INJECTION_RE,
+                          redact_diagnostic_urls, redact_diagnostic_data, pdf_page_url, pdf_page_reference,
                           _is_table_row, _is_table_sep, _split_long_text)
 from document_conversion import (DocumentConverter, convert_document_result, HAS_PYMUPDF,
                                  HAS_DOCX, HAS_OPENPYXL, HAS_PPTX)
@@ -100,6 +105,7 @@ VERSION = "7.1"
 DEFAULT_USER_AGENT = ("UltimateWebCrawler/7.1 "
                       "(+https://github.com/elementarpartikel/ultimate-web-crawler)")
 ROBOTS_TOKEN = "UltimateWebCrawler"
+DIAGNOSTIC_URL_VERSION = 1
 
 # GUI-beroenden är frivilliga så att serverläget (--config) fungerar på
 # headless-servrar utan tkinter/display.
@@ -107,6 +113,7 @@ try:
     import tkinter as tk
     import webbrowser
     from tkinter import filedialog, messagebox, ttk
+    import tkinter.font as tkfont
     import customtkinter as ctk
     HAS_GUI = True
 except Exception:  # ImportError, TclError m.fl.
@@ -173,6 +180,8 @@ except ImportError:
 if HAS_GUI:
     ctk.set_appearance_mode("Light")
     ctk.set_default_color_theme("blue")
+    # Temats ursprungliga font (Roboto, som följer med CustomTkinter) är reserv där Segoe UI saknas.
+    CTK_THEME_FONT = dict(ctk.ThemeManager.theme["CTkFont"])
 
 # ─────────────────────────────────────────────────────────────
 #  ENUMS OCH DATACLASSES
@@ -218,6 +227,45 @@ class CrawlStats:
         return self.pages_visited / secs if secs > 0 else 0.0
 
 
+RUN_SUMMARY_TEXTS = {
+    'success': {'sv': 'Lyckad körning', 'en': 'Successful run'},
+    'partial': {'sv': 'Partiell körning', 'en': 'Partial run'},
+    'failed': {'sv': 'Misslyckad körning', 'en': 'Failed run'},
+    'counts': {
+        'sv': 'Besökta sidor {0}, nya {1}, ändrade {2}, borttagna {3}, dokument {4}, sidfel {5}',
+        'en': 'Pages visited {0}, new {1}, updated {2}, removed {3}, documents {4}, page errors {5}',
+    },
+    'download_failures': {'sv': 'Dokument med hämtningsfel {0}', 'en': 'Document download failures {0}'},
+    'robots_unreachable': {'sv': 'Värdar med otillgänglig robots.txt {0}', 'en': 'Hosts with unavailable robots.txt {0}'},
+    'conversion_failures': {'sv': 'Dokument med konverteringsfel {0}', 'en': 'Document conversion failures {0}'},
+    'short_pages': {'sv': 'Sidor med för lite text {0}', 'en': 'Pages with too little text {0}'},
+    'possible_prompt_injection': {'sv': 'Källor med möjlig prompt-injektion {0}', 'en': 'Sources with possible prompt injection {0}'},
+    'fatal_error': {'sv': 'Körningen avbröts av ett fel', 'en': 'The run ended with an error'},
+    'report_hint': {'sv': 'Se körningsrapporten.', 'en': 'See the run report.'},
+}
+
+
+@dataclass(frozen=True)
+class CrawlSummary:
+    status: str
+    counts: Tuple[int, int, int, int, int, int]
+    warnings: Tuple[Tuple[str, int], ...]
+    fatal_error: Optional[str]
+    report_path: Optional[str]
+
+    def render(self, lang: str, texts: Dict, *, include_error_detail: bool = False) -> str:
+        parts = [texts[self.status][lang], texts['counts'][lang].format(*self.counts)]
+        notices = [texts[key][lang].format(count) for key, count in self.warnings]
+        if self.fatal_error:
+            notices.append(self.fatal_error if include_error_detail else texts['fatal_error'][lang])
+        if notices:
+            parts.append(' · '.join(notices).rstrip('.'))
+        result = '. '.join(parts) + '.'
+        if notices and self.report_path:
+            result += ' ' + texts['report_hint'][lang]
+        return result
+
+
 # ─────────────────────────────────────────────────────────────
 #  HJÄLPFUNKTIONER & CHUNKING
 # ─────────────────────────────────────────────────────────────
@@ -229,14 +277,15 @@ DEFAULT_IGNORE_QUERY_PARAMS = (
     # Generisk kampanj-/spårningsspårning
     'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
     'fbclid', 'gclid', 'msclkid', 'mc_cid', 'mc_eid',
-    'ref', 'source', 'igshid', 'mibextid',
+    'igshid', 'mibextid',
     # Session-/auth-tokens som varierar mellan besök men inte ändrar innehåll
     'sessionid', 'jsessionid', 'phpsessid',
     # Sitevision (svenska kommuners CMS — Tyresö m.fl.).
-    # `state` (addBookmark/removeBookmark) och `logout=true` är de vanligaste
-    # som sett till fyra dubletter av samma sida.
-    'state', 'logout', 'printerfriendly',
+    'logout', 'printerfriendly',
 )
+
+# Dessa parametrar kunde tidigare ge olika källor samma cachenyckel.
+CONTENT_QUERY_PARAMS = ('ref', 'source', 'state')
 
 # Prefix-matchade parametrar — alla nycklar som börjar med dessa strippas.
 # Detta täcker hela Sitevision-familjen (sv.url, sv.target, sv.viewportname,
@@ -424,7 +473,7 @@ def semantic_chunk_text(sections: List[Dict], max_words: int = 400,
             chunk["url"] = source_url
             p_num = chunk.get("page_number")
             if p_num is not None:
-                chunk["page_url"] = f"{source_url}#page={p_num}" if "#page=" not in source_url else source_url
+                chunk["page_url"] = pdf_page_url(source_url, p_num)
     return chunks
 
 
@@ -438,6 +487,20 @@ def markdown_to_plain(text: str) -> str:
     return re.sub(r'\n{3,}', '\n\n', text).strip()
 
 
+def markdown_header_field(header: str, label: str) -> str:
+    m = re.search(r'^\*\*' + re.escape(label) + r':\*\*[ \t]*(.+)$', header, re.MULTILINE)
+    return m.group(1).strip() if m else ''
+
+
+def plain_header_fields(lines) -> Dict[str, str]:
+    fields = {}
+    for line in lines:
+        key, separator, value = line.partition(':')
+        if separator:
+            fields[key.strip()] = value.strip()
+    return fields
+
+
 def markdown_file_to_chunks(text: str, is_document: bool = False) -> Tuple[Dict, List[Dict]]:
     """Läser en av crawlerns .md-filer och returnerar (metadata, chunks)."""
     parts = text.split('\n---\n')
@@ -445,8 +508,7 @@ def markdown_file_to_chunks(text: str, is_document: bool = False) -> Tuple[Dict,
 
     def field(label: str) -> str:
         # Brödtexten får inte kunna fylla i eller förfalska dokumentets metadata.
-        m = re.search(r'^\*\*' + re.escape(label) + r':\*\*[ \t]*(.+)$', header, re.MULTILINE)
-        return m.group(1).strip() if m else ""
+        return markdown_header_field(header, label)
 
     title_match = re.match(r'#\s+(.+)', text)
     title = title_match.group(1).strip() if title_match else ""
@@ -480,7 +542,7 @@ def markdown_file_to_chunks(text: str, is_document: bool = False) -> Tuple[Dict,
             stack = [h for h in stack if h[0] < level]
             stack.append((level, heading))
         else:
-            heading, content = "Huvudinnehåll", raw
+            level, heading, content = 0, "Huvudinnehåll", raw
         if content:
             page_num, slide_num = None, None
             if is_document:
@@ -499,6 +561,12 @@ def markdown_file_to_chunks(text: str, is_document: bool = False) -> Tuple[Dict,
                     if slide_m:
                         slide_num = int(slide_m.group(1))
                         break
+            if level == 2 and page_num is not None:
+                # Sidhänvisningen finns som separata fält i JSONL.
+                reference = pdf_page_reference(url, page_num)
+                if content == reference:
+                    continue
+                content = content.removeprefix(reference + '\n\n')
             sec_dict = {"heading": heading, "text": content,
                         "path": " > ".join(h[1] for h in stack) or heading}
             if page_num is not None:
@@ -531,11 +599,7 @@ def plain_file_to_chunks(text: str) -> Tuple[Dict, List[Dict]]:
     parts = text.split('\n---\n')
     header = parts[0].strip().splitlines()
     title = header[0] if header else ''
-    fields = {}
-    for line in header[1:]:
-        key, separator, value = line.partition(':')
-        if separator:
-            fields[key.strip()] = value.strip()
+    fields = plain_header_fields(header[1:])
     body = '\n---\n'.join(parts[1:-1]) if len(parts) >= 3 else text
     flags = [flag.strip() for flag in fields.get('Flaggor', '').split(',') if flag.strip()]
     meta = {'url': fields.get('Källa', ''), 'title': title, 'source_type': 'page',
@@ -555,7 +619,20 @@ def csv_safe(value) -> str:
 
 
 # Funktionsbrevlådor är inte personuppgifter och är ofta exakt det en användare
-# av Svea letar efter. Bevaras bara om `keep_role_emails` är påslaget.
+# av en RAG-tjänst letar efter. Bevaras bara om `keep_role_emails` är påslaget.
+
+
+def html_table_cell_text(cell: Tag) -> str:
+    """Bevara explicita radbrytningar utan att ta med HTML-källans indrag."""
+    lines = [[]]
+    for node in cell.descendants:
+        if node.name == 'br':
+            lines.append([])
+        elif type(node) in (NavigableString, CData):
+            text = re.sub(r'[ \t\r\n\f]+', ' ', node).strip(' ')
+            if text:
+                lines[-1].append(text)
+    return '\n'.join(' '.join(line) for line in lines)
 
 
 def absolutize_markdown_links(text: str, base_url: str) -> str:
@@ -688,7 +765,7 @@ class AsyncCrawlDatabase:
         async with self.conn.execute("PRAGMA table_info(doc_cache)") as cur:
             doc_cols = {row[1] for row in await cur.fetchall()}
         for name in ('content_hash', 'converted_hash', 'md_filename', 'conversion_profile',
-                     'fetched_at', 'conversion_context'):
+                     'fetched_at', 'conversion_context', 'fetch_url'):
             if name not in doc_cols:
                 await self.conn.execute(f"ALTER TABLE doc_cache ADD COLUMN {name} TEXT")
         await self.conn.commit()
@@ -769,6 +846,17 @@ class AsyncCrawlDatabase:
         await self.conn.execute("DELETE FROM page_cache WHERE url = ?", (url,))
         await self._maybe_commit()
 
+    async def get_page_url_candidates(self):
+        async with self.conn.execute(
+                "SELECT url, fetch_url, filename FROM page_cache "
+                "WHERE url != fetch_url AND instr(fetch_url, '?') > 0 ORDER BY url") as cursor:
+            return await cursor.fetchall()
+
+    async def rekey_page(self, old_url: str, new_url: str, filename: Optional[str]):
+        await self.conn.execute("UPDATE page_cache SET url=?, filename=? WHERE url=?",
+                                (new_url, filename, old_url))
+        await self._maybe_commit()
+
     async def get_unseen_since(self, iso_ts: str) -> List[Tuple[str, str]]:
         """Sidor i cachen som inte besökts sedan `iso_ts` (kandidater för borttagna sidor)."""
         async with self.conn.execute(
@@ -781,7 +869,7 @@ class AsyncCrawlDatabase:
         async with self.conn.execute(
             "SELECT filename, size_bytes, etag, last_modified, referer_url, "
             "referer_title, link_text, content_hash, converted_hash, md_filename, "
-            "conversion_profile, fetched_at, conversion_context FROM doc_cache WHERE url = ?", (url,)
+            "conversion_profile, fetched_at, conversion_context, fetch_url FROM doc_cache WHERE url = ?", (url,)
         ) as cursor:
             row = await cursor.fetchone()
         if not row:
@@ -791,27 +879,27 @@ class AsyncCrawlDatabase:
                 'referer_title': row[5] or '', 'link_text': row[6] or '',
                 'content_hash': row[7], 'converted_hash': row[8],
                 'md_filename': row[9], 'conversion_profile': row[10],
-                'fetched_at': row[11], 'conversion_context': row[12]}
+                'fetched_at': row[11], 'conversion_context': row[12], 'fetch_url': row[13]}
 
     async def save_doc(self, url: str, filename: str, size_bytes: int,
                        etag: Optional[str], last_modified: Optional[str],
                        referer_url: str = "", referer_title: str = "",
                        link_text: str = "", content_hash: Optional[str] = None,
-                       fetched_at: Optional[str] = None):
+                       fetched_at: Optional[str] = None, fetch_url: Optional[str] = None):
         prior = await self.get_doc(url)
         same_version = bool(prior and content_hash and prior['content_hash'] == content_hash)
         await self.conn.execute(
             'INSERT OR REPLACE INTO doc_cache (url, filename, size_bytes, etag, '
             'last_modified, referer_url, referer_title, link_text, downloaded_at, '
-            'content_hash, converted_hash, md_filename, conversion_profile, fetched_at, conversion_context) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            'content_hash, converted_hash, md_filename, conversion_profile, fetched_at, conversion_context, fetch_url) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (url, filename, size_bytes, etag, last_modified, referer_url,
              referer_title, link_text, datetime.now().isoformat(), content_hash,
              prior['converted_hash'] if same_version else None,
              prior['md_filename'] if same_version else None,
              prior['conversion_profile'] if same_version else None,
              datetime.now().isoformat(timespec='seconds') if fetched_at is None else fetched_at,
-             prior['conversion_context'] if same_version else None))
+             prior['conversion_context'] if same_version else None, fetch_url))
         await self._maybe_commit()
 
     async def mark_doc_converted(self, url: str, content_hash: str,
@@ -835,7 +923,7 @@ class AsyncCrawlDatabase:
     async def get_all_docs(self) -> List[Dict]:
         keys = ('url', 'filename', 'size_bytes', 'etag', 'last_modified', 'referer_url',
                 'referer_title', 'link_text', 'content_hash', 'converted_hash',
-                'md_filename', 'conversion_profile', 'fetched_at', 'conversion_context')
+                'md_filename', 'conversion_profile', 'fetched_at', 'conversion_context', 'fetch_url')
         async with self.conn.execute(
                 f"SELECT {', '.join(keys)} FROM doc_cache ORDER BY url") as cur:
             return [dict(zip(keys, row)) for row in await cur.fetchall()]
@@ -883,6 +971,14 @@ class AsyncCrawlDatabase:
         ) as cursor:
             return await cursor.fetchall()
 
+    async def get_page_crawl_records(self):
+        async with self.conn.execute(
+            "SELECT url, title, crawled_at, content_hash, filename, fetch_url, "
+            "processing_profile, content_length FROM page_cache ORDER BY crawled_at DESC"
+        ) as cursor:
+            columns = [column[0] for column in cursor.description]
+            return {row[0]: dict(zip(columns, row)) for row in await cursor.fetchall()}
+
     async def close(self):
         if self.conn:
             await self.flush()
@@ -903,23 +999,21 @@ class PerDomainRateLimiter:
         self.base_delay = self.delay
         self.domain_minimums: Dict[str, float] = {}
         self.domain_delays: Dict[str, float] = {}
-        self.last_requests: Dict[str, datetime] = {}
-        self._lock = asyncio.Lock()
+        self.last_requests: Dict[str, float] = {}
+        self._locks: Dict[str, asyncio.Lock] = {}
 
     async def async_wait(self, domain: str):
-        async with self._lock:
-            now = datetime.now()
-            last_req = self.last_requests.get(domain, datetime.min)
-            elapsed = (now - last_req).total_seconds()
-            delay = max(self.domain_delays.get(domain, self.delay), self.domain_minimums.get(domain, 0))
-            if elapsed < delay:
-                sleep_time = delay - elapsed
-                self.last_requests[domain] = now + timedelta(seconds=sleep_time)
-            else:
-                sleep_time = 0
-                self.last_requests[domain] = now
-        if sleep_time > 0:
-            await asyncio.sleep(sleep_time)
+        async with self._locks.setdefault(domain, asyncio.Lock()):
+            # Räkna från faktisk start så att försenade väntare inte släpps i klump.
+            while True:
+                now = time.monotonic()
+                delay = max(self.domain_delays.get(domain, self.delay), self.domain_minimums.get(domain, 0))
+                last = self.last_requests.get(domain)
+                remaining = last + delay - now if last is not None else 0
+                if remaining <= 0:
+                    self.last_requests[domain] = now
+                    return
+                await asyncio.sleep(remaining)
 
     def slow_down(self, factor: float = 1.5, domain: Optional[str] = None):
         """Adaptiv throttling: anropas vid 429/503 så att vi blir långsammare."""
@@ -1236,8 +1330,26 @@ class FetchResult:
 
 # Filextensioner som indikerar binära dokument — för dessa gör vi HEAD först
 DOCUMENT_EXTENSIONS = {
-    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+    '.pdf', '.doc', '.docx', '.dotx', '.xls', '.xlsx', '.ppt', '.pptx',
     '.odt', '.ods', '.odp', '.rtf', '.csv', '.zip',
+}
+DOCUMENT_CONTENT_TYPES = {
+    'application/pdf': '.pdf',
+    'application/msword': '.doc',
+    'application/vnd.ms-excel': '.xls',
+    'application/vnd.ms-powerpoint': '.ppt',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.template': '.dotx',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
+    'application/vnd.oasis.opendocument.text': '.odt',
+    'application/vnd.oasis.opendocument.spreadsheet': '.ods',
+    'application/vnd.oasis.opendocument.presentation': '.odp',
+    'application/rtf': '.rtf',
+    'text/rtf': '.rtf',
+    'text/csv': '.csv',
+    'application/zip': '.zip',
+    'application/x-zip': '.zip',
 }
 # Filextensioner vi aldrig hämtar (bilder, fonts, video, etc.)
 # .zip ligger MEDVETET inte här — den finns i DOCUMENT_EXTENSIONS, så
@@ -1257,15 +1369,57 @@ class BlockedHostError(Exception):
     """Mål-adressen är inte tillåten (t.ex. privat IP när startsidan är publik)."""
 
 
+class OffDomainRedirectError(BlockedHostError):
+    """Ett navigationsmål ligger utanför crawlens tillåtna domäner."""
+    def __init__(self, target: str):
+        self.target = target
+        super().__init__('Omdirigerad utanför tillåtna domäner')
+
+
+class BlockedDNSError(OSError):
+    """En DNS-policynekning som aiohttp kan bädda in i ett anslutningsfel."""
+
+
+_IPV6_TRANSITION_NETWORKS = tuple(map(ipaddress.IPv6Network, (
+    '64:ff9b::/96', '64:ff9b:1::/48', '2002::/16', '2001::/32',
+)))
+_INTRANET_IPV4 = tuple(map(ipaddress.IPv4Network, ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16')))
+_INTRANET_IPV6 = ipaddress.IPv6Network('fc00::/7')
+
+
+def is_public_ip(value) -> bool:
+    """En publik anslutning får inte gå via kända IPv6-övergångsprefix."""
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    if isinstance(address, ipaddress.IPv6Address):
+        if address.ipv4_mapped is not None:
+            address = address.ipv4_mapped
+        elif any(address in network for network in _IPV6_TRANSITION_NETWORKS):
+            return False
+    return address.is_global and not (address.is_multicast or address.is_reserved)
+
+
+def _is_intranet_ip(address) -> bool:
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    if address.is_loopback:
+        return True
+    if isinstance(address, ipaddress.IPv4Address):
+        return any(address in network for network in _INTRANET_IPV4)
+    return address in _INTRANET_IPV6
+
+
 def is_non_public_host(host: Optional[str]) -> bool:
     """True om `host` är en IP-literal eller localhost som inte är publik."""
     if not host:
         return False
-    host = host.strip("[]").lower()
+    host = host.strip("[]").lower().rstrip('.')
     if host == "localhost" or host.endswith(".localhost"):
         return True
     try:
-        return not ipaddress.ip_address(host).is_global
+        return not is_public_ip(ipaddress.ip_address(host))
     except ValueError:
         return False      # vanligt värdnamn — kontrolleras av SafeResolver vid DNS-uppslag
 
@@ -1285,14 +1439,8 @@ if HAS_AIOHTTP:
 
         async def resolve(self, host, port=0, family=socket.AF_INET):
             infos = await self._inner.resolve(host, port, family)
-            if not self.allow_private:
-                for info in infos:
-                    try:
-                        if not ipaddress.ip_address(info["host"]).is_global:
-                            raise OSError(f"Blockerad icke-publik adress "
-                                          f"{info['host']} för {host}")
-                    except ValueError:
-                        continue
+            if not self.allow_private and any(not is_public_ip(info['host']) for info in infos):
+                raise BlockedDNSError(f'Blockerat icke-publikt DNS-mål för {host}')
             return infos
 
         async def close(self):
@@ -1407,7 +1555,7 @@ class BrowserEgressProxy:
         if not 0 < port <= 65535 or is_non_public_host(host):
             raise BlockedHostError("Webbläsarens mål är inte publikt")
         infos = await self.resolver.resolve(host, port, family=socket.AF_UNSPEC)
-        if not infos or any(not ipaddress.ip_address(i['host']).is_global for i in infos):
+        if not infos or any(not is_public_ip(i['host']) for i in infos):
             raise BlockedHostError("Webbläsarens DNS-mål är inte publikt")
         last_error = None
         for info in infos:
@@ -1566,14 +1714,18 @@ _BLOCK_PAGE_SIGNALS = (
 _SOFT_404_TITLE_RE = re.compile(
     r'\b404\b|hittades inte|kunde inte hittas|page not found|sidan saknas|'
     r'finns inte|not found$', re.IGNORECASE)
+_HIDDEN_CLASSES = frozenset(('sr-only', 'visually-hidden', 'd-none'))
 _HIDDEN_STYLE_RE = re.compile(
-    r'(?:display\s*:\s*none|'
+    r'(?:^|;)\s*(?:display\s*:\s*none|'
     r'visibility\s*:\s*hidden|'
     r'font-size\s*:\s*0(?:\.0+)?(?:px|em|rem|pt|%)?|'
     r'opacity\s*:\s*0(?:\.0+)?|'
+    r'color\s*:\s*transparent|'
+    r'clip\s*:\s*rect\(\s*0(?:px)?(?:(?:\s*,\s*|\s+)0(?:px)?){3}\s*\)|'
+    r'clip-path\s*:\s*inset\(\s*(?:50|100)%\s*\)|'
     r'text-indent\s*:\s*-[0-9]{4,}px|'
     r'left\s*:\s*-[0-9]{4,}px)'
-    r'(?:\s*!important)?\s*(?:;|\b|$)',
+    r'(?:\s*!important)?\s*(?:;|$)',
     re.IGNORECASE
 )
 _NOISE_CLASS_RE = re.compile(
@@ -1600,21 +1752,26 @@ KNOWN_CONFIG_KEYS = {
     "quarantine_flagged_chunks",   # karantänsätt chunks med säkerhetsflaggor (standard True)
     "session_check_url",          # resurs som kräver inloggning och som kontot har rätt att läsa
     'conversion_workers', 'conversion_queue_size', 'conversion_timeout',
-    'generation_keep', 'generation_min_age_hours',
+    'conversion_memory_mb',
+    'generation_keep', 'generation_min_age_hours', 'changes_history_max_entries',
+    'spa_wait_seconds', 'spa_ready_selector',
+    'allow_libreoffice',
 }
 
 _FLOAT_CONFIG_RULES = {
     'delay': (0.5, 0), 'max_page_mb': (10, 0.000001),
     'max_download_mb': (100, 0.000001), 'sitemap_lastmod_max_age_days': (14, 0),
     'conversion_timeout': (180, 0.1),
+    'conversion_memory_mb': (1024, 64),
     'generation_min_age_hours': (24, 0.01),
+    'spa_wait_seconds': (3, 0),
 }
 _INT_CONFIG_RULES = {
     'max_pages': (0, 0), 'max_depth': (0, 0), 'concurrency': (10, 1),
     'playwright_concurrency': (2, 1), 'max_path_segments': (15, 1),
     'max_query_params': (5, 0), 'ocr_max_pages': (50, 0),
     'conversion_workers': (2, 1), 'conversion_queue_size': (8, 1),
-    'generation_keep': (0, 0),
+    'generation_keep': (0, 0), 'changes_history_max_entries': (0, 0),
 }
 _LIST_CONFIG_KEYS = {
     'allowed_domains', 'exclude_keywords', 'require_keywords', 'keep_query_params',
@@ -1627,6 +1784,7 @@ _BOOL_CONFIG_KEYS = {
     'ignore_https_errors', 'allow_private_hosts', 'respect_canonical', 'dedupe_content',
     'use_sitemap_lastmod', 'export_jsonl', 'ocr', 'login_browser_headless',
     'quarantine_flagged_chunks',
+    'allow_libreoffice',
 }
 
 
@@ -1634,6 +1792,7 @@ def normalize_site_config(site: dict) -> Dict:
     """Gemensamma typer och standardvärden för GUI och CLI efter validering."""
     result = dict(site)
     result.setdefault('incremental', True)
+    result['spa_ready_selector'] = site.get('spa_ready_selector', '').strip()
     for key, (default, _) in _FLOAT_CONFIG_RULES.items():
         result[key] = float(site.get(key, default))
     for key, (default, _) in _INT_CONFIG_RULES.items():
@@ -1646,23 +1805,28 @@ def normalize_site_config(site: dict) -> Dict:
     return result
 
 
+def _valid_http_url(value: str) -> bool:
+    try:
+        parsed = urlparse(value)
+        return (parsed.scheme in ('http', 'https') and bool(parsed.hostname)
+                and not any(char.isspace() for char in parsed.netloc)
+                and parsed.port != 0 and not parsed.username and not parsed.password)
+    except ValueError:
+        return False
+
+
 def validate_site_config(site: dict) -> Tuple[List[str], List[str]]:
     """Returnerar (fel, varningar) för en sajt-post i sites.json."""
     errors, warnings = [], []
     if not isinstance(site, dict):
         return ["posten är inte ett JSON-objekt"], []
     url = str(site.get("start_url", "")).strip()
-    def valid_http_url(value):
-        try:
-            parsed = urlparse(value)
-            return (parsed.scheme in ('http', 'https') and bool(parsed.hostname)
-                    and parsed.port != 0 and not parsed.username and not parsed.password)
-        except ValueError:
-            return False
-    if not valid_http_url(url):
+    if not _valid_http_url(url):
         errors.append('start_url saknas eller är ogiltig (kräver http(s), värd och giltig port utan inloggningsuppgifter)')
-    if site.get('session_check_url') and not valid_http_url(str(site['session_check_url'])):
+    if site.get('session_check_url') and not _valid_http_url(str(site['session_check_url'])):
         errors.append('session_check_url måste vara en http(s)-adress utan inloggningsuppgifter')
+    if 'spa_ready_selector' in site and not isinstance(site['spa_ready_selector'], str):
+        errors.append('spa_ready_selector måste vara text')
     for key in site:
         if key not in KNOWN_CONFIG_KEYS:
             warnings.append(f"okänd nyckel ignoreras: {key!r}")
@@ -1676,6 +1840,8 @@ def validate_site_config(site: dict) -> Tuple[List[str], List[str]]:
                     raise ValueError
                 if key == 'sitemap_lastmod_max_age_days' and value >= 999999999:
                     raise ValueError
+                if key == 'spa_wait_seconds' and value > 60:
+                    errors.append('spa_wait_seconds får vara högst 60 sekunder')
             except (TypeError, ValueError, OverflowError):
                 kind = 'heltal' if key in _INT_CONFIG_RULES else 'tal'
                 errors.append(f"{key} måste vara ett ändligt {kind} >= {minimum}, fick {site[key]!r}")
@@ -1720,6 +1886,49 @@ def safe_gunzip(data: bytes, limit: int) -> bytes:
     return out
 
 
+class _SitemapTreeBuilder(ET.TreeBuilder):
+    def doctype(self, name, pubid, system):
+        raise ValueError('Sitemap med DTD eller XML-entiteter avvisad')
+
+
+def parse_sitemap_xml(content: bytes, limit: int):
+    """Packa upp och tolka XML utan tillgång till crawlerns tillstånd."""
+    if content.startswith(b'\x1f\x8b'):
+        content = safe_gunzip(content, limit)
+    if HAS_DEFUSEDXML:
+        root = SafeET.fromstring(content, forbid_dtd=True)
+    else:
+        root = ET.fromstring(content, parser=ET.XMLParser(target=_SitemapTreeBuilder()))
+    indexes, pages = [], []
+    for node in root:
+        kind = node.tag.rsplit('}', 1)[-1]
+        if kind not in ('sitemap', 'url'):
+            continue
+        fields = {child.tag.rsplit('}', 1)[-1]: (child.text or '').strip() for child in node}
+        if loc := fields.get('loc'):
+            if kind == 'sitemap':
+                indexes.append(loc)
+            else:
+                pages.append((loc, fields.get('lastmod', '')))
+    return indexes, pages
+
+
+def document_retry_delay(attempt: int, retry_after: str = '') -> float:
+    """Tolka Retry-After som sekunder eller HTTP-datum, annars exponentiell väntan."""
+    retry_after = retry_after.strip()
+    if retry_after.isascii() and retry_after.isdecimal():
+        return float(retry_after)
+    if retry_after:
+        try:
+            when = parsedate_to_datetime(retry_after)
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            return max(0, (when - datetime.now(timezone.utc)).total_seconds())
+        except (ValueError, TypeError, OverflowError):
+            pass
+    return 2 ** attempt + random.random() * 0.5
+
+
 def magic_ok(ext: str, head: bytes) -> bool:
     """Kontrollerar att filens första byte stämmer med förväntad filtyp
     (stoppar t.ex. en HTML-inloggningssida som sparas som .pdf)."""
@@ -1730,15 +1939,74 @@ def magic_ok(ext: str, head: bytes) -> bool:
         return head[:2] == b'PK'
     if ext in ('.doc', '.xls', '.ppt'):
         return head[:8] == bytes.fromhex('D0CF11E0A1B11AE1')
+    if ext == '.rtf':
+        return head.startswith(b'{\\rtf')
     return True
+
+
+class _DocumentZipReader(io.FileIO):
+    """Begränsa ZIP-katalogen som standardbiblioteket läser in i minnet."""
+    _MAX_READ = 4 * 1024 * 1024
+
+    def read(self, size=-1):
+        if size > self._MAX_READ:
+            raise zipfile.BadZipFile('För stor ZIP-katalog')
+        data = super().read(self._MAX_READ + 1 if size < 0 else size)
+        if len(data) > self._MAX_READ:
+            raise zipfile.BadZipFile('För stor ZIP-katalog')
+        return data
+
+
+def verified_document_extension(path: str, declared: str, previous: str) -> str:
+    """Identifiera dokument med signatur och paketstruktur utan att extrahera text."""
+    with open(path, 'rb') as source:
+        head = source.read(1024)
+    if not head or re.match(rb'<(?:!doctype\s+html|html\b|head\b|body\b|form\b)',
+                            head.removeprefix(b'\xef\xbb\xbf').lstrip(), re.I):
+        return ''
+    if magic_ok('.pdf', head):
+        return '.pdf'
+    if magic_ok('.rtf', head):
+        return '.rtf'
+    if magic_ok('.zip', head):
+        try:
+            with _DocumentZipReader(path, 'rb') as source, zipfile.ZipFile(source) as package:
+                if ('content.xml' in package.NameToInfo and 'mimetype' in package.NameToInfo
+                        and package.getinfo('mimetype').file_size <= 128):
+                    with package.open('mimetype') as metadata:
+                        media_type = metadata.read(129).decode('ascii', errors='replace')
+                    if media_type.startswith('application/vnd.oasis.opendocument.'):
+                        return DOCUMENT_CONTENT_TYPES.get(media_type, '.zip')
+                if '[Content_Types].xml' in package.NameToInfo:
+                    for member, ext in (('word/document.xml', '.docx'),
+                                        ('xl/workbook.xml', '.xlsx'),
+                                        ('ppt/presentation.xml', '.pptx')):
+                        if member in package.NameToInfo:
+                            if ext == '.docx' and package.getinfo('[Content_Types].xml').file_size <= 262144:
+                                with package.open('[Content_Types].xml') as metadata:
+                                    if b'wordprocessingml.template.main+xml' in metadata.read(262145):
+                                        return '.dotx'
+                            return ext
+                if declared in ('.docx', '.dotx', '.xlsx', '.pptx', '.odt', '.ods', '.odp'):
+                    return ''
+                return '.zip'
+        except (zipfile.BadZipFile, RuntimeError, NotImplementedError, EOFError, zlib.error):
+            return ''
+    if magic_ok('.doc', head):
+        # Äldre Office-format delar behållarsignatur. Serverns uppgift väljer parser.
+        return next((ext for ext in (declared, previous) if ext in ('.doc', '.xls', '.ppt')), '')
+    # Textformat och okända bilagor saknar unik signatur. Behåll tidigare typ.
+    ext = previous or declared
+    return ext if magic_ok(declared, head) and magic_ok(ext, head) else ''
 
 
 
 
 class AsyncWebCrawler:
     LOGIN_EXPIRED_LIMIT = 5      # antal sessionsfel i rad innan crawlen avbryts
+    max_sitemaps = 500
 
-    def __init__(self, config: dict, msg_queue: Optional[queue.Queue] = None):
+    def __init__(self, config: dict, msg_queue: Optional[queue.Queue] = None, *, server_mode: bool = False):
         if not HAS_AIOHTTP or not HAS_AIOSQLITE:
             missing = [n for n, ok in (("aiohttp", HAS_AIOHTTP),
                                        ("aiosqlite", HAS_AIOSQLITE)) if not ok]
@@ -1753,10 +2021,12 @@ class AsyncWebCrawler:
         config = normalize_site_config(config)
         self.config = config
         self.msg_queue = msg_queue
+        self.server_mode = server_mode
         self.state = CrawlerState.RUNNING
         self.stats = CrawlStats()
         self.active_tasks = 0
         self.fatal_error: Optional[str] = None
+        self._latest_report_path: Optional[str] = None
         self._output_root = os.path.abspath(config['output_dir'])
         self._publication = None
         self._export_ready = False
@@ -1767,7 +2037,8 @@ class AsyncWebCrawler:
         self._url_tasks = set()
         self._conversion_runner = ConversionProcessRunner(
             os.path.join(self._output_root, '.conversion_jobs'),
-            workers=config['conversion_workers'], timeout=config['conversion_timeout'])
+            workers=config['conversion_workers'], timeout=config['conversion_timeout'],
+            memory_mb=config['conversion_memory_mb'])
 
         # URL-normalisering: parametrar som ska strippas kan justeras per sajt
         keep = {k.lower() for k in config.get("keep_query_params", [])}
@@ -1801,6 +2072,8 @@ class AsyncWebCrawler:
         ua_token = self.user_agent.split("/")[0].split()[0] if self.user_agent else ROBOTS_TOKEN
         self.robots_token = ua_token or ROBOTS_TOKEN
         self._allow_private = bool(config.get("allow_private_hosts", False))
+        self._private_policy_reason = {True: 'explicit_allow', False: 'explicit_deny'}.get(
+            config.get('allow_private_hosts'), 'server_public_default' if server_mode else 'public_default')
 
         self.find_sitemap = config.get("find_sitemap", True)
         self.robot_parser: Optional[RobotsRules] = None
@@ -1823,6 +2096,7 @@ class AsyncWebCrawler:
         self._canonical_of: Dict[str, str] = {}
         self._canonical_pending: Dict[str, str] = {}
         self._initial_page_files: Set[str] = set()
+        self._rekeyed_page_files: Dict[str, str] = {}
 
         parsed_start = urlparse(self.start_url)
         self.domain = parsed_start.netloc.lower()
@@ -1858,6 +2132,7 @@ class AsyncWebCrawler:
                 ocr=bool(config.get("ocr", True)),
                 ocr_languages=str(config.get("ocr_languages", "swe+eng")),
                 ocr_max_pages=int(config.get("ocr_max_pages", 50)),
+                allow_libreoffice=config.get('allow_libreoffice', False),
             )
         self.visited_sitemaps: Set[str] = set()
         self.login_event = threading.Event()
@@ -1870,7 +2145,8 @@ class AsyncWebCrawler:
         self.async_download_lock = asyncio.Lock()
         self.async_pw_lock = asyncio.Lock()
         self.async_stats_lock = asyncio.Lock()
-        self.async_sitemap_lock = asyncio.Lock()
+        self._sitemap_slots = asyncio.Semaphore(min(4, self.concurrency))
+        self._sitemap_tasks = set()
         self._dns_allowed_cache: Dict[str, bool] = {}
 
         self.semaphore = asyncio.Semaphore(self.concurrency)
@@ -1888,16 +2164,20 @@ class AsyncWebCrawler:
         self._context = None
         self._browser_proxy: Optional[BrowserEgressProxy] = None
         self._export_files: Optional[Set[str]] = None
+        self._chunk_export_stats: Dict = {}
+        self._changes_history_trimmed = False
 
         # Ändringslogg och rapport (skrivs som changes.jsonl / crawl_report.json)
         self.changes: List[Dict] = []
         self.counts = {"added": 0, "updated": 0, "removed": 0, "docs_added": 0,
                        "docs_updated": 0, "docs_removed": 0}
         self.report: Dict[str, List] = {
-            "short_pages": [], "blocked_pages": [], "soft_404": [],
+            "short_pages": [], "blocked_pages": [], "soft_404": [], "spa_timeouts": [],
             "gone_pages": [], "off_domain_redirects": [],
             "conversion_failures": [], "download_failures": [],
+            'legacy_conversion_skipped': [],
             "possible_prompt_injection": [], "session_expired": [],
+            'prompt_injection_signals': [],
             "duplicates": [], "canonical_skipped": [], "wrong_language": [],
             "ocr_used": [], "gone_documents": [], "retired_text_files": [],
             "document_version_mismatch": [],
@@ -1943,7 +2223,8 @@ class AsyncWebCrawler:
                       "(pip install protego)", LogLevel.DEBUG)
 
     # ─── Logging & GUI ──────────────────────────────────────
-    def _log(self, msg: str, level=LogLevel.INFO):
+    def _log(self, msg: str, level=LogLevel.INFO, *, gui_key: Optional[str] = None, show_in_gui: bool = True):
+        msg = redact_diagnostic_urls(msg)
         if level == LogLevel.DEBUG:
             self.logger.debug(msg)
         elif level == LogLevel.INFO:
@@ -1954,10 +2235,12 @@ class AsyncWebCrawler:
             self.logger.error(msg)
         if self.msg_queue:
             # DEBUG hålls utanför GUI:t — annars svämmar loggkön över vid snabba körningar
-            if level != LogLevel.DEBUG:
-                self.msg_queue.put(("log", f"[{level.name}] {msg}"))
+            if show_in_gui and level != LogLevel.DEBUG:
+                data = (level.name, gui_key) if gui_key else f"[{level.name}] {msg}"
+                self.msg_queue.put(("log", data))
         else:
-            line = f"[{level.name}] {msg}"
+            site = f"[{self.domain}] " if self.server_mode else ''
+            line = f"[{level.name}] {site}{msg}"
             try:
                 print(line)
             except UnicodeEncodeError:       # t.ex. cp1252-konsol utan emoji-stöd
@@ -1978,7 +2261,16 @@ class AsyncWebCrawler:
                              "event": event, "url": url, **extra})
 
     def _gui_update(self, url: str, status: str, title: str):
-        nya_eller_sparade = self.stats.pages_visited - self.stats.pages_unchanged
+        if self.msg_queue:
+            safe_title = title.replace('\x00', '') if title else "Ingen titel"
+            self.msg_queue.put(("table", (url, status, safe_title)))
+            self._gui_stats()
+
+    def _gui_stats(self):
+        if not self.msg_queue:
+            return
+        cached = (self.stats.pages_unchanged + self.stats.pages_not_modified_304
+                  + self.stats.pages_skipped_lastmod)
         queue_size = self.url_queue.size() + self.active_tasks + self._conversion_pending
         pages_done = self.stats.pages_visited
 
@@ -1999,19 +2291,10 @@ class AsyncWebCrawler:
             else:
                 eta_str = f"~{int(eta_sec)}s"
 
-        if self.msg_queue:
-            safe_title = title.replace('\x00', '') if title else "Ingen titel"
-            self.msg_queue.put(("table", (url, status, safe_title)))
-            self.msg_queue.put(("stats_data", (
-                self.stats.pages_visited,
-                nya_eller_sparade,
-                self.stats.documents_downloaded,
-                (self.stats.pages_unchanged + self.stats.pages_not_modified_304
-                 + self.stats.pages_skipped_lastmod),
-                queue_size,
-                self.stats.pages_failed,
-                eta_str,
-            )))
+        self.msg_queue.put(("stats_data", (
+            pages_done, pages_done - cached, self.stats.documents_downloaded,
+            cached, queue_size, self.stats.pages_failed, self._conversion_pending, eta_str,
+        )))
 
     # ─── URL-validering ─────────────────────────────────────
     def _domain_allowed(self, netloc: str) -> bool:
@@ -2074,40 +2357,74 @@ class AsyncWebCrawler:
 
     # ─── Nätverkslager ──────────────────────────────────────
     async def _resolve_private_policy(self):
-        """Tillåt privata adresser bara om startadressen själv är privat (intranät)."""
-        if self._allow_private:
+        """Identifiera intranät utan att ge särskilda IPv6-adresser privat behörighet."""
+        if 'allow_private_hosts' in self.config:
+            if self._allow_private:
+                self._log('⚠ Privata nätverksmål tillåts enligt konfigurationen', LogLevel.WARNING,
+                          gui_key='private_network_explicit')
             return
-        host = urlparse(self.start_url).hostname
+        if self.server_mode:
+            return
+        self._allow_private = False
+        self._private_policy_reason = 'public_default'
+        host = (urlparse(self.start_url).hostname or '').lower().rstrip('.')
         if not host:
             return
-        if is_non_public_host(host):
-            self._allow_private = True
+        if host == 'localhost' or host.endswith('.localhost'):
+            self._private_policy_reason = 'intranet_literal'
         else:
             try:
-                loop = asyncio.get_running_loop()
-                infos = await loop.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-                if infos and all(not ipaddress.ip_address(i[4][0]).is_global
-                                 for i in infos):
-                    self._allow_private = True
-            except Exception:
-                pass
+                address = ipaddress.ip_address(host)
+            except ValueError:
+                try:
+                    infos = await asyncio.get_running_loop().getaddrinfo(host, None, type=socket.SOCK_STREAM)
+                    if infos and all(_is_intranet_ip(ipaddress.ip_address(info[4][0])) for info in infos):
+                        self._private_policy_reason = 'intranet_dns'
+                except (OSError, ValueError):
+                    pass
+            else:
+                if _is_intranet_ip(address):
+                    self._private_policy_reason = 'intranet_literal'
+        self._allow_private = self._private_policy_reason in ('intranet_literal', 'intranet_dns')
         if self._allow_private:
-            self._log("ℹ Startadressen är ett privat nätverk/intranät — "
-                      "privata adresser tillåts", LogLevel.DEBUG)
+            self._log('⚠ Automatiskt intranätläge aktiverat. Privata nätverksmål tillåts', LogLevel.WARNING,
+                      gui_key='private_network_automatic')
 
     async def _on_redirect(self, session, ctx, params):
-        """Stoppar redirects till privata IP-literaler och icke-http(s)-scheman."""
+        """Kontrollera domän, nätverksmål och robots före redirectens anslutning."""
         loc = params.response.headers.get('Location', '')
         target = urlparse(urljoin(str(params.url), loc))
         if target.scheme not in ('http', 'https'):
             raise BlockedHostError(f"Redirect till otillåtet schema: {target.scheme}")
         if not self._allow_private and is_non_public_host(target.hostname):
             raise BlockedHostError(f"Redirect till icke-publik adress: {target.hostname}")
+        self._check_crawl_scope(target.geturl(), str(params.url))
         # Robots-hämtningen själv måste kunna följa redirects utan rekursion.
         obey = (getattr(ctx, 'trace_request_ctx', None) or {}).get('obey_robots', True)
         if obey and not await self._robots_allowed(target.geturl()):
             raise RobotsDeniedError("Redirect stoppad av robots.txt")
-        await self.rate_limiter.async_wait(target.netloc.lower())
+        if not await self._wait_for_request(target.geturl()):
+            raise RobotsDeniedError('Körningen stoppad')
+
+    async def _wait_until_running(self) -> bool:
+        while self.state == CrawlerState.PAUSED:
+            await asyncio.sleep(0.1)
+        return self.state != CrawlerState.STOPPED
+
+    async def _wait_for_request(self, url: str) -> bool:
+        domain = urlparse(url).netloc.lower()
+        while await self._wait_until_running():
+            await self.rate_limiter.async_wait(domain)
+            if self.state != CrawlerState.PAUSED:
+                return self.state != CrawlerState.STOPPED
+        return False
+
+    def _check_crawl_scope(self, target: str, source: str):
+        if self.config.get('strict_domain', True) and not self._domain_allowed(urlparse(target).netloc):
+            entry = {'url': source, 'final_url': target}
+            if entry not in self.report['off_domain_redirects']:
+                self.report['off_domain_redirects'].append(entry)
+            raise OffDomainRedirectError(target)
 
     def _check_http_target(self, url: str):
         """IP-literaler passerar inte aiohttp-resolvern och måste kontrolleras här."""
@@ -2120,8 +2437,7 @@ class AsyncWebCrawler:
     async def _create_session(self) -> aiohttp.ClientSession:
         """Skapar aiohttp-session med riktig CookieJar och Brotli om tillgängligt.
 
-        Cookies från Playwright-inloggningen filtreras till samma toppdomän
-        innan de injiceras i CookieJar — undviker att tappa secure/httponly-flaggor.
+        Endast sajtens cookies överförs, med bevarad domän/värd, path och flaggor.
         """
         connector = aiohttp.TCPConnector(
             limit=max(20, self.concurrency * 2),
@@ -2161,18 +2477,20 @@ class AsyncWebCrawler:
     def _inject_playwright_cookies(self, jar: CookieJar, cookies: List[Dict]):
         """Konverterar Playwright-cookies till format som aiohttp's CookieJar förstår."""
         added = 0
-        for c in cookies:
+        for c in self._site_cookies(cookies):
             try:
-                domain = (c.get('domain') or '').lstrip('.')
-                if not domain:
-                    domain = self.domain
+                raw_domain = c.get('domain') or ''
+                domain = raw_domain.lstrip('.') or urlparse(c.get('url') or self.start_url).hostname
                 # Bygg en URL för update_cookies så att domain/path bevaras
                 scheme = 'https' if c.get('secure') else 'http'
-                cookie_url = f"{scheme}://{domain}{c.get('path', '/')}"
+                authority = f'[{domain}]' if ':' in domain else domain
+                cookie_url = f"{scheme}://{authority}{c.get('path', '/')}"
 
                 sc = SimpleCookie()
                 sc[c['name']] = c['value']
                 m = sc[c['name']]
+                if raw_domain.startswith('.'):
+                    m['domain'] = raw_domain
                 if c.get('path'):
                     m['path'] = c['path']
                 if c.get('expires') and c['expires'] > 0:
@@ -2193,6 +2511,24 @@ class AsyncWebCrawler:
                 self._log(f"Kunde inte överföra cookie {c.get('name')}: {e}",
                           LogLevel.DEBUG)
         self._log(f"✓ Överförde {added} cookies från login-sessionen")
+
+    def _site_cookies(self, cookies: List[Dict]) -> List[Dict]:
+        """Spara endast cookies som gäller minst en av sajtens tillåtna värdar.
+
+        IdP-cookies får finnas i den interaktiva browserns minne, men inte på disk
+        eller i aiohttp. En föräldradomäncookie kan krävas för en tillåten undervärd.
+        """
+        hosts = {urlparse(self.start_url).hostname.lower(), *self.allowed_domains}
+        result = []
+        for cookie in cookies:
+            if not isinstance(cookie, dict):
+                continue
+            raw = cookie.get('domain') or ''
+            domain = (raw.lstrip('.') or urlparse(cookie.get('url') or self.start_url).hostname or '').lower()
+            if (self._domain_allowed(domain)
+                    or raw.startswith('.') and any(host == domain or host.endswith('.' + domain) for host in hosts)):
+                result.append(cookie)
+        return result
 
     @staticmethod
     def _decode_body(body: bytes, charset: Optional[str]) -> str:
@@ -2271,13 +2607,7 @@ class AsyncWebCrawler:
             await asyncio.sleep(wait)
 
         for attempt in range(max_retries + 1):
-            # Respektera pause/stop mellan försök
-            while self.state == CrawlerState.PAUSED:
-                await asyncio.sleep(0.3)
-            if self.state == CrawlerState.STOPPED:
-                return None
-            await self.rate_limiter.async_wait(urlparse(url).netloc.lower())
-            if self.state == CrawlerState.STOPPED:
+            if not await self._wait_for_request(url):
                 return None
 
             try:
@@ -2287,6 +2617,7 @@ class AsyncWebCrawler:
                         trace_request_ctx={'obey_robots': obey_robots},
                         timeout=aiohttp.ClientTimeout(total=10)
                     ) as resp:
+                        self._check_crawl_scope(str(resp.url), url)
                         if resp.status in (403, 405):
                             # Servern stödjer inte HEAD — låt anroparen falla tillbaka till GET
                             return FetchResult(
@@ -2313,6 +2644,7 @@ class AsyncWebCrawler:
                     trace_request_ctx={'obey_robots': obey_robots},
                     timeout=aiohttp.ClientTimeout(total=20)
                 ) as resp:
+                    self._check_crawl_scope(str(resp.url), url)
                     if resp.status == 304:
                         self.rate_limiter.succeeded(urlparse(str(resp.url)).netloc.lower())
                         return FetchResult(
@@ -2380,10 +2712,17 @@ class AsyncWebCrawler:
                 raise
             except RobotsDeniedError:
                 return None
+            except OffDomainRedirectError as e:
+                if self._login_detection_enabled and self.login_detector.is_login_redirect(url, e.target):
+                    return FetchResult(status=401, final_url=url)
+                return None
             except BlockedHostError as e:
                 self._log(f"  ⛔ Blockerad: {url} ({e})", LogLevel.WARNING)
                 return None
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                if isinstance(getattr(e, 'os_error', None), BlockedDNSError):
+                    self._log(f"  ⛔ Blockerad: {url} ({e.os_error})", LogLevel.WARNING)
+                    return None
                 if attempt == max_retries:
                     self._log(f"  ✗ Nätverksfel: {url} ({e})", LogLevel.DEBUG)
                     return None
@@ -2460,96 +2799,88 @@ class AsyncWebCrawler:
         for sm in sitemaps or [self.base_url + '/sitemap.xml']:
             await self._parse_sitemap(urljoin(self.base_url + '/', sm))
 
-    async def _parse_sitemap(self, url: str):
-        async with self.async_sitemap_lock:
-            if url in self.visited_sitemaps or len(self.visited_sitemaps) >= 500:
-                return
-            # Sitemaps på andra domäner följs bara om de uttryckligen är tillåtna
-            if self.config.get("strict_domain", True) and not self._domain_allowed(
-                    urlparse(url).netloc):
-                self._log(f"  ⛔ Hoppar över sitemap utanför domänen: {url}", LogLevel.DEBUG)
-                return
-            self.visited_sitemaps.add(url)
-
-        self._log(f"🗺️ Letar i sitemap: {url}")
-        try:
-            r = await self.fetch(url, max_retries=2, decode_text=False,
-                                 max_bytes=self.max_sitemap_bytes)
-            if not r or not r.body:
-                return
-            content = r.body
-            if url.lower().endswith('.gz') or content[:2] == b'\x1f\x8b':
-                content = safe_gunzip(content, self.max_sitemap_bytes)
-
-            # XML-entiteter i en sitemap behövs aldrig — och är ett klassiskt
-            # angrepp (billion laughs / XXE). Avvisa hellre än att riskera det.
-            if b'<!ENTITY' in content:
-                self._log(f"  ⛔ Sitemap med XML-entiteter avvisad: {url}", LogLevel.WARNING)
-                return
-
-            sitemap_urls: List[str] = []
-            url_strs: List[str] = []
+    async def _read_sitemap(self, url: str):
+        async with self._sitemap_slots:
+            if not await self._wait_until_running():
+                return None
+            self._log(f"🗺️ Letar i sitemap: {url}")
             try:
-                soup = BeautifulSoup(content, 'lxml-xml')
-                sitemap_urls = [
-                    loc.text.strip() for sm in soup.find_all('sitemap')
-                    if (loc := sm.find('loc'))
-                ]
-                for node in soup.find_all('url'):
-                    loc = node.find('loc')
-                    if not loc:
-                        continue
-                    loc_text = loc.text.strip()
-                    url_strs.append(loc_text)
-                    lastmod = node.find('lastmod')
-                    if lastmod and lastmod.text.strip():
-                        self.sitemap_lastmod[normalize_url(
-                            loc_text, self.ignore_query_params)] = lastmod.text.strip()
-            except Exception:
-                if HAS_DEFUSEDXML:
-                    try:
-                        root = SafeET.fromstring(content)
-                        for elem in root.iter():
-                            tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
-                            if tag in ('sitemap', 'url'):
-                                for child in elem:
-                                    ctag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
-                                    if ctag == 'loc' and child.text:
-                                        (sitemap_urls if tag == 'sitemap' else url_strs
-                                         ).append(child.text.strip())
-                    except Exception:
-                        pass
-                else:
-                    self._log("ℹ Sitemapen kunde inte tolkas (installera defusedxml för "
-                              "säker reservtolkning)", LogLevel.DEBUG)
+                result = await self.fetch(url, max_retries=2, decode_text=False,
+                                          max_bytes=self.max_sitemap_bytes)
+                if not result or not result.body or self.state == CrawlerState.STOPPED:
+                    return None
+                indexes, pages = await asyncio.to_thread(parse_sitemap_xml, result.body,
+                                                          self.max_sitemap_bytes)
+                return result.final_url or url, indexes, pages
+            except Exception as e:
+                self._log(f"⚠ Fel vid sitemap-läsning: {e}", LogLevel.DEBUG)
+                return None
 
-            if sitemap_urls:
-                await asyncio.gather(
-                    *[self._parse_sitemap(s) for s in sitemap_urls],
-                    return_exceptions=True
-                )
+    async def _parse_sitemap(self, url: str):
+        """Följ index breddvis med begränsad kö och begränsat antal aktiva jobb."""
+        pending = deque()
+
+        def schedule(value: str, base: str):
+            if len(self.visited_sitemaps) >= 500:
+                return
+            try:
+                target = request_url(urljoin(base, value))
+                parsed = urlparse(target)
+                if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+                    return
+                if self.config.get('strict_domain', True) and not self._domain_allowed(parsed.netloc):
+                    self._log(f"  ⛔ Hoppar över sitemap utanför domänen: {target}", LogLevel.DEBUG)
+                    return
+            except ValueError:
+                return
+            if target not in self.visited_sitemaps and len(self.visited_sitemaps) < self.max_sitemaps:
+                self.visited_sitemaps.add(target)
+                pending.append(target)
+
+        schedule(url, self.base_url + '/')
+        while pending and await self._wait_until_running():
+            batch = [asyncio.create_task(self._read_sitemap(pending.popleft()))
+                     for _ in range(min(4, len(pending)))]
+            self._sitemap_tasks.update(batch)
+            try:
+                results = await asyncio.gather(*batch, return_exceptions=True)
+            finally:
+                self._sitemap_tasks.difference_update(batch)
+            if not await self._wait_until_running():
+                return
 
             count = 0
-            for s in url_strs:
-                if self.is_valid_url(s):
-                    # Spåra sitemap-funna dokument i manifestet — så att
-                    # PDFer som bara hittas via sitemap (och inte via en
-                    # webbsida) ändå syns där, om än utan riktig referer.
-                    if (self.config.get("download_docs", False)
-                            and self._looks_like_document_url(s)):
+            for result in results:
+                if result is None or isinstance(result, BaseException):
+                    continue
+                base, indexes, pages = result
+                for index, child in enumerate(indexes):
+                    if len(self.visited_sitemaps) >= self.max_sitemaps:
+                        break
+                    if index % 128 == 0:
+                        await asyncio.sleep(0)
+                        if not await self._wait_until_running():
+                            return
+                    schedule(child, base)
+                for index, (page_url, lastmod) in enumerate(pages):
+                    if index % 128 == 0:
+                        await asyncio.sleep(0)
+                        if not await self._wait_until_running():
+                            return
+                    if not self.is_valid_url(page_url):
+                        continue
+                    if lastmod:
+                        self.sitemap_lastmod[normalize_url(page_url, self.ignore_query_params)] = lastmod
+                    if self.config.get('download_docs', False) and self._looks_like_document_url(page_url):
                         await self.manifest.record_link(
-                            doc_url=normalize_url(s, self.ignore_query_params),
-                            referer_url="",          # ingen riktig sida som länkar
-                            referer_title="",        # → konvertern faller till metadata/filnamn
-                            link_text="(via sitemap)",
+                            doc_url=normalize_url(page_url, self.ignore_query_params),
+                            referer_url="", referer_title="", link_text="(via sitemap)",
                         )
-                    if self.url_queue.add_url(s, depth=0,
+                    if self.url_queue.add_url(page_url, depth=0,
                                               base_priority=CrawlPriority.SITEMAP.value):
                         count += 1
-            if count > 0:
+            if count:
                 self._log(f"✓ Hittade {count} (godkända) URLs i sitemap/index")
-        except Exception as e:
-            self._log(f"⚠ Fel vid sitemap-läsning: {e}", LogLevel.DEBUG)
 
     # ─── Playwright (lazy initialization) ──────────────────
     async def get_playwright_context(self):
@@ -2605,7 +2936,7 @@ class AsyncWebCrawler:
             loop = asyncio.get_running_loop()
             try:
                 infos = await loop.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-                allowed = all(ipaddress.ip_address(info[4][0]).is_global for info in infos)
+                allowed = bool(infos) and all(is_public_ip(info[4][0]) for info in infos)
             except Exception:
                 allowed = False
             self._dns_allowed_cache[host] = allowed
@@ -2624,7 +2955,8 @@ class AsyncWebCrawler:
         """
         cdp = await page.context.new_cdp_session(page)
         guard = {'cdp': cdp, 'tasks': set(), 'done': asyncio.Event(),
-                 'started': False, 'success': False, 'reason': '', 'closed': False}
+                 'started': False, 'success': False, 'reason': '', 'closed': False,
+                 'bytes': 0, 'limited': False, 'blocked_url': ''}
 
         async def handle(event):
             request_id = event['requestId']
@@ -2640,9 +2972,11 @@ class AsyncWebCrawler:
                                                            'errorReason': 'Aborted'})
                         return
                     if event['resourceType'] == 'Document':
+                        self._check_crawl_scope(target, page.url)
                         if not await self._robots_allowed(target):
                             raise RobotsDeniedError('Robots.txt nekar navigation')
-                        await self.rate_limiter.async_wait(urlparse(target).netloc.lower())
+                        if not await self._wait_for_request(target):
+                            raise RobotsDeniedError('Körningen stoppad')
                     await cdp.send('Fetch.continueRequest', {'requestId': request_id})
                     return
                 status = event.get('responseStatusCode', 0)
@@ -2656,6 +2990,7 @@ class AsyncWebCrawler:
                 if filepath and is_document and status == 200:
                     guard['started'] = True
                     guard['final_url'] = target
+                    guard['document_headers'] = headers
                     try:
                         if (self.config.get('strict_domain', True)
                                 and not self._domain_allowed(urlparse(target).netloc)):
@@ -2669,11 +3004,17 @@ class AsyncWebCrawler:
                                                            'errorReason': 'Aborted'})
                         guard['done'].set()
                     return
+                if status >= 200 and status not in (204, 304) and not 300 <= status < 400:
+                    if not await self._fulfill_browser_resource(cdp, request_id, event, guard):
+                        await cdp.send('Fetch.failRequest', {'requestId': request_id, 'errorReason': 'Aborted'})
+                    return
                 await cdp.send('Fetch.continueRequest', {'requestId': request_id})
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                guard['reason'] = guard['reason'] or str(e)[:160]
+                if isinstance(e, OffDomainRedirectError):
+                    guard['blocked_url'] = e.target
+                guard['reason'] = guard['reason'] or redact_diagnostic_urls(str(e))[:160]
                 try:
                     await cdp.send('Fetch.failRequest', {'requestId': request_id,
                                                        'errorReason': 'Aborted'})
@@ -2691,12 +3032,46 @@ class AsyncWebCrawler:
 
         guard['callback'] = paused
         cdp.on('Fetch.requestPaused', paused)
-        patterns = [{'urlPattern': '*', 'requestStage': 'Request'}]
-        if filepath:
-            patterns.append({'urlPattern': '*', 'resourceType': 'Document',
-                             'requestStage': 'Response'})
+        patterns = [{'urlPattern': '*', 'requestStage': 'Request'},
+                    {'urlPattern': '*', 'requestStage': 'Response'}]
         await cdp.send('Fetch.enable', {'patterns': patterns})
         return guard
+
+    async def _fulfill_browser_resource(self, cdp, request_id: str, event: Dict, guard: Dict) -> bool:
+        """Begränsa sidans samlade svarskroppar innan Chromium får rendera dem."""
+        headers = event.get('responseHeaders', [])
+        length = next((h['value'] for h in headers if h['name'].lower() == 'content-length'), '')
+        remaining = self.max_page_bytes - guard['bytes']
+        if guard['limited'] or length.isdigit() and int(length) > remaining:
+            guard.update(limited=True, reason='Sidans storleksgräns överskreds')
+            return False
+        stream = None
+        body = bytearray()
+        try:
+            stream = (await cdp.send('Fetch.takeResponseBodyAsStream', {'requestId': request_id}))['stream']
+            async with asyncio.timeout(20):
+                while self.state != CrawlerState.STOPPED:
+                    block = await cdp.send('IO.read', {'handle': stream,
+                        'size': min(65536, max(1, self.max_page_bytes - guard['bytes'] + 1))})
+                    data = (base64.b64decode(block['data']) if block.get('base64Encoded')
+                            else block['data'].encode('utf-8'))
+                    guard['bytes'] += len(data)
+                    if guard['limited'] or guard['bytes'] > self.max_page_bytes:
+                        guard.update(limited=True, reason='Sidans storleksgräns överskreds')
+                        return False
+                    body.extend(data)
+                    if block.get('eof'):
+                        # CDP-streamen är avkodad; komprimerings-/längdheaders gäller inte längre.
+                        clean_headers = [h for h in headers if h['name'].lower() not in (
+                            'content-encoding', 'content-length', 'transfer-encoding')]
+                        await cdp.send('Fetch.fulfillRequest', {
+                            'requestId': request_id, 'responseCode': event['responseStatusCode'],
+                            'responseHeaders': clean_headers, 'body': base64.b64encode(body).decode('ascii')})
+                        return True
+            return False
+        finally:
+            if stream:
+                await cdp.send('IO.close', {'handle': stream})
 
     async def _stream_browser_document(self, cdp, request_id: str, headers: Dict,
                                        filepath: str, guard: Dict) -> bool:
@@ -2753,6 +3128,37 @@ class AsyncWebCrawler:
         except Exception:
             pass
 
+    async def _wait_for_spa_content(self, page, pending: Set, guard: Dict) -> bool:
+        """Ge huvudtext och dataanrop tid att bli klara efter DOMContentLoaded."""
+        budget = self.config['spa_wait_seconds']
+        if not budget:
+            return True
+        selector = self.config['spa_ready_selector']
+        start = time.monotonic()
+        previous, changed_at = None, start
+        try:
+            async with asyncio.timeout(budget):
+                if selector:
+                    await page.locator(selector).first.wait_for(state='visible', timeout=0)
+                    return True
+                while not guard['reason'] and await self._wait_until_running():
+                    sample = await page.evaluate('''() => {
+                        const root = document.querySelector('main, [role="main"], #root, #app, #__next')
+                            || document.body;
+                        const text = root?.innerText.trim() || '';
+                        return [text.length, text.slice(0, 256), text.slice(-256)];
+                    }''')
+                    now = time.monotonic()
+                    if sample != previous or pending:
+                        previous, changed_at = sample, now
+                    if sample[0] and not pending and now - start >= 0.75 and now - changed_at >= 0.25:
+                        return True
+                    await asyncio.sleep(0.1)
+        except TimeoutError:
+            # Långlivade dataanrop får inte hålla hela crawlen öppen.
+            return not selector and bool(previous and previous[0])
+        return False
+
     async def _render_response_with_playwright(self, url: str) -> FetchResult:
         """Bevara HTTP-status även när Chromium renderar svaret."""
         async with self.playwright_semaphore:
@@ -2760,9 +3166,27 @@ class AsyncWebCrawler:
             if ctx is None:
                 return FetchResult()
             page = await ctx.new_page()
+            pending = set()
+            navigation_status = None
+
+            def track_request(request):
+                if request.resource_type in ('fetch', 'xhr'):
+                    pending.add(request)
+
+            def finish_request(request):
+                pending.discard(request)
+
+            def track_response(response):
+                nonlocal navigation_status
+                if response.request.is_navigation_request() and response.frame == page.main_frame:
+                    navigation_status = response.status
 
             guard = None
             try:
+                page.on('request', track_request)
+                page.on('requestfinished', finish_request)
+                page.on('requestfailed', finish_request)
+                page.on('response', track_response)
                 guard = await self._install_browser_guard(page)
                 # Kort timeout — om sidan inte är klar inom 12s tar vi vad vi har
                 goto_ok = False
@@ -2770,17 +3194,55 @@ class AsyncWebCrawler:
                     response = await page.goto(url, wait_until="domcontentloaded", timeout=12000)
                     goto_ok = True
                 except Exception as e:
-                    self._log(f"  ⚠ Playwright kunde inte ladda {url}: {str(e)[:80]}",
+                    self._log(f"  ⚠ Playwright kunde inte ladda {url}: {redact_diagnostic_urls(str(e))[:80]}",
                               LogLevel.DEBUG)
+                ready = True
+                if goto_ok and not guard['reason'] and (not response or 200 <= response.status < 300):
+                    ready = await self._wait_for_spa_content(page, pending, guard)
                 # Avbryt om goto misslyckades eller crawl stoppats
-                if not goto_ok or self.state == CrawlerState.STOPPED:
+                if guard['limited']:
+                    self._log('⚠ Sidans storleksgräns överskreds i webbläsaren', LogLevel.WARNING)
+                    return FetchResult(status=413, final_url=url)
+                if guard['blocked_url'] and self._login_detection_enabled and self.login_detector.is_login_redirect(url, guard['blocked_url']):
+                    return FetchResult(status=401, final_url=url)
+                if not goto_ok or guard['reason'] or not await self._wait_until_running():
                     return FetchResult()
-                html = await page.content()
+                if not ready:
+                    self.report['spa_timeouts'].append({'url': url})
+                    return FetchResult(status=408, final_url=url)
+                # Kontrollera DOM i webbläsaren innan hela serialiseringen förs till Python.
+                within_limit = await asyncio.wait_for(page.evaluate('''limit => {
+                    const encoder = new TextEncoder();
+                    const walker = document.createTreeWalker(document, NodeFilter.SHOW_ALL);
+                    let node;
+                    const count = text => {
+                        if (text.length > limit) return false;
+                        limit -= encoder.encode(text).length;
+                        return limit >= 0;
+                    };
+                    while ((node = walker.nextNode())) {
+                        if (node.nodeType === Node.ELEMENT_NODE) {
+                            if (!count(node.tagName + node.tagName + '<></>')) return false;
+                            for (const attr of node.attributes)
+                                if (!count(attr.name) || !count(attr.value) || !count('="" ')) return false;
+                        } else if (!count(node.nodeValue || '')) return false;
+                    }
+                    return true;
+                }''', self.max_page_bytes), timeout=12)
+                if not within_limit:
+                    self._log('⚠ Sidans DOM överskred storleksgränsen', LogLevel.WARNING)
+                    return FetchResult(status=413, final_url=url)
+                html = await asyncio.wait_for(page.content(), timeout=12)
+                if guard['limited'] or len(html.encode('utf-8')) > self.max_page_bytes:
+                    return FetchResult(status=413, final_url=url)
+                if guard['reason'] or self.state == CrawlerState.STOPPED:
+                    return FetchResult()
                 final_url = page.url
-                if response and 200 <= response.status < 300:
+                self._check_crawl_scope(final_url, url)
+                status = navigation_status or (response.status if response else 200)
+                if 200 <= status < 300:
                     self.rate_limiter.succeeded(urlparse(final_url).netloc.lower())
-                return FetchResult(text=html, final_url=final_url,
-                                   status=response.status if response else 200)
+                return FetchResult(text=html, final_url=final_url, status=status)
             finally:
                 if guard:
                     await self._close_browser_guard(guard)
@@ -2795,10 +3257,12 @@ class AsyncWebCrawler:
 
     # ─── Innehållsextraktion ────────────────────────────────
     def extract_structured_data(self, html: str, url: str) -> Dict:
+        html_changed = False
         try:
             soup = BeautifulSoup(html, 'lxml')
         except Exception:
             soup = BeautifulSoup(html, 'html.parser')
+            html_changed = True
 
         base_tag = soup.find('base', href=True)
         base_url = urljoin(url, base_tag['href'].strip()) if base_tag else url
@@ -2810,42 +3274,73 @@ class AsyncWebCrawler:
         # Om ett dolt element innehåller ett injektionsmönster raderas det så att det
         # varken når Trafilatura eller reservvägen.
         # Normala dolda element (accordions, FAQ-paneler, flikar, liten text) bevaras!
-        hidden_elements = []
-        for el in soup.find_all(True, style=_HIDDEN_STYLE_RE):
-            hidden_elements.append(el)
-        for el in soup.find_all(attrs={"hidden": True}):
-            hidden_elements.append(el)
-        for el in soup.find_all(attrs={"aria-hidden": "true"}):
-            hidden_elements.append(el)
+        hidden_style, hidden_attr, hidden_aria, hidden_class = [], [], [], []
+        comments, anchors, meta_tags = [], [], []
+        for node in soup.descendants:
+            if isinstance(node, Tag):
+                attrs = node.attrs
+                if node.name == 'a' and 'href' in attrs:
+                    anchors.append(node)
+                elif node.name == 'meta':
+                    meta_tags.append(node)
+                if (style := attrs.get('style')) and _HIDDEN_STYLE_RE.search(style):
+                    hidden_style.append(node)
+                elif 'hidden' in attrs:
+                    hidden_attr.append(node)
+                elif attrs.get('aria-hidden') == 'true':
+                    hidden_aria.append(node)
+                elif node.name == 'template' or ((classes := attrs.get('class'))
+                                                and not _HIDDEN_CLASSES.isdisjoint(classes)):
+                    hidden_class.append(node)
+            elif isinstance(node, Comment):
+                comments.append(node)
 
         hidden_texts: List[str] = []
-        for el in hidden_elements:
+        # Behåll ordningen mellan markeringstyperna för nästlade element.
+        for el in (*hidden_style, *hidden_attr, *hidden_aria, *hidden_class):
             if el.decomposed if hasattr(el, "decomposed") else False:
                 continue
-            t = el.get_text(' ', strip=True)
+            t = ' '.join(str(node) for node in el.find_all(string=True)
+                         if not isinstance(node, Comment))
             if t:
                 hidden_texts.append(t)
                 if detect_prompt_injection(t):
                     el.decompose()
+                    html_changed = True
 
-        for c in list(soup.find_all(string=lambda t: isinstance(t, Comment))):
+        for c in comments:
+            if getattr(c, 'parent', None) is None:
+                continue
             c_str = str(c).strip()
             if c_str:
                 hidden_texts.append(c_str)
             c.extract()
+            html_changed = True
+
+        meta_tags = [tag for tag in meta_tags if not tag.decomposed]
+
+        def find_meta(attribute, criterion):
+            if isinstance(criterion, re.Pattern):
+                return next((tag for tag in meta_tags if criterion.search(tag.get(attribute, ''))), None)
+            return next((tag for tag in meta_tags if tag.get(attribute) in criterion), None)
 
         page_links = []
-        for a_tag in soup.find_all('a', href=True):
-            href = a_tag.get('href', '').strip()
+        for a_tag in anchors:
+            if a_tag.decomposed:
+                continue
+            raw_href = a_tag['href']
+            href = raw_href.strip()
             if href and not href.startswith(('#', 'javascript:', 'mailto:', 'tel:')):
                 full_url = urljoin(base_url, href)
-                a_tag['href'] = full_url
+                if full_url != raw_href:
+                    a_tag['href'] = full_url
+                    html_changed = True
                 # Länktexten kan innehålla namn/e-post och ska tvättas som all annan text
                 link_text = self.clean_pii(a_tag.get_text(separator=' ', strip=True)[:200])
                 page_links.append({"url": full_url, "text": link_text})
 
         raw_title = soup.title.string.strip() if soup.title and soup.title.string else ""
-        og_title_tag = soup.find('meta', attrs={'property': 'og:title'})
+        og_title_tag = find_meta('property', ('og:title',))
         og_title = (og_title_tag.get('content', '').strip()
                     if og_title_tag and og_title_tag.get('content') else "")
         h1_tag = soup.find('h1')
@@ -2856,31 +3351,29 @@ class AsyncWebCrawler:
         title = metadata_line(self.clean_pii(title or "Okänd"))
 
         keywords = []
-        meta_kw = soup.find('meta', attrs={'name': re.compile(r'keywords', re.I)})
+        meta_kw = find_meta('name', re.compile(r'keywords', re.I))
         if meta_kw and meta_kw.get('content'):
             keywords = [self.clean_pii(k.strip()) for k in meta_kw['content'].split(',')]
 
         description = ""
-        meta_desc = soup.find('meta', attrs={'name': re.compile(r'description', re.I)})
+        meta_desc = find_meta('name', re.compile(r'description', re.I))
         if meta_desc and meta_desc.get('content'):
             description = self.clean_pii(meta_desc['content'].strip())
 
-        author_tag = soup.find('meta', attrs={'name': ['author', 'DC.creator']})
+        author_tag = find_meta('name', ('author', 'DC.creator'))
         author = self.clean_pii(author_tag['content']) if author_tag and author_tag.get('content') else ""
 
         pub_date = ""
         mod_date = ""
 
-        meta_pub = soup.find('meta', attrs={'property': re.compile(
-            r'article:published_time|og:pubdate', re.I)}) or \
-            soup.find('meta', attrs={'name': re.compile(r'pubdate|date', re.I)})
+        meta_pub = (find_meta('property', re.compile(r'article:published_time|og:pubdate', re.I))
+                    or find_meta('name', re.compile(r'pubdate|date', re.I)))
         if meta_pub and meta_pub.get('content'):
             pub_date = meta_pub['content'].strip()
 
-        meta_mod = soup.find('meta', attrs={'property': re.compile(
-            r'article:modified_time|og:updated_time', re.I)}) or \
-            soup.find('meta', attrs={'name': re.compile(r'last-modified|revised', re.I)}) or \
-            soup.find('meta', attrs={'itemprop': 'dateModified'})
+        meta_mod = (find_meta('property', re.compile(r'article:modified_time|og:updated_time', re.I))
+                    or find_meta('name', re.compile(r'last-modified|revised', re.I))
+                    or find_meta('itemprop', ('dateModified',)))
         if meta_mod and meta_mod.get('content'):
             mod_date = meta_mod['content'].strip()
 
@@ -2925,23 +3418,21 @@ class AsyncWebCrawler:
         canonical = (canonical_tag.get('href', '').strip()
                      if canonical_tag and canonical_tag.get('href') else "")
 
-        og_type_tag = soup.find('meta', attrs={'property': 'og:type'})
+        og_type_tag = find_meta('property', ('og:type',))
         og_type = og_type_tag['content'] if og_type_tag and og_type_tag.get('content') else ""
 
         full_text = ""
         structured_sections: List[Dict] = []
 
-        cleaned_html = str(soup)
-
         if self.use_trafilatura and HAS_TRAFILATURA:
             try:
                 extracted = trafilatura.extract(
-                    cleaned_html, include_links=True, include_images=False,
+                    str(soup) if html_changed else html, include_links=True, include_images=False,
                     include_tables=True, include_formatting=True,
                     output_format="markdown", url=url,
                 )
                 if extracted:
-                    extracted = self.clean_pii(extracted)
+                    extracted = self.clean_pii(add_table_row_text(extracted, allow_headerless=True))
                     extracted = absolutize_markdown_links(extracted, base_url)
                     raw_sections = re.split(r'(?=^#{1,6}\s)', extracted, flags=re.MULTILINE)
                     heading_stack: List[Tuple[int, str]] = []
@@ -2968,15 +3459,14 @@ class AsyncWebCrawler:
                 self._log(f"  ⚠ Trafilatura misslyckades ({e})", LogLevel.DEBUG)
 
         if not full_text:
-            for tag in ('script', 'style', 'nav', 'footer', 'aside',
-                        'iframe', 'svg', 'button', 'form'):
-                for el in soup.find_all(tag):
-                    el.decompose()
             # Brus-rensning på klass/id. Matchar hela klasstoken från början
             # ("nav-item", "menu") men aldrig t.ex. <body class="has-nav">, och
             # rör aldrig html/body/main/article.
             for el in soup.find_all(True):
                 if el.decomposed if hasattr(el, "decomposed") else False:
+                    continue
+                if el.name in ('script', 'style', 'nav', 'footer', 'aside', 'iframe', 'svg', 'button', 'form'):
+                    el.decompose()
                     continue
                 if el.name in ('html', 'body', 'main', 'article', 'head'):
                     continue
@@ -3026,14 +3516,16 @@ class AsyncWebCrawler:
                         if txt:
                             current_text.append(f"• {txt}")
                 elif el.name == 'table':
-                    rows = el.find_all('tr')
-                    for i, row in enumerate(rows):
-                        cols = [c.get_text(separator=' ', strip=True)
-                                for c in row.find_all(['td', 'th'])]
-                        if cols:
-                            current_text.append("| " + " | ".join(cols) + " |")
-                            if i == 0:
-                                current_text.append("|" + "|".join(["---"] * len(cols)) + "|")
+                    rows = []
+                    for row in el.find_all('tr'):
+                        if row.find_parent('table') is not el:
+                            continue
+                        cells = row.find_all(['td', 'th'], recursive=False)
+                        if cells:
+                            rows.append([html_table_cell_text(cell) for cell in cells])
+                    table = markdown_table(rows)
+                    if table:
+                        current_text.append(f"\n{add_table_row_text(table)}\n")
                 else:
                     # Stycken inuti tabeller/listor har redan tagits med av sin förälder
                     if el.find_parent(['table', 'li']):
@@ -3076,11 +3568,7 @@ class AsyncWebCrawler:
         structured_sections = cleaned_sections
         full_text = strip_cms_boilerplate(full_text)
 
-        flags = []
-        if detect_prompt_injection(full_text, *hidden_texts):
-            flags.append("possible_prompt_injection")
-
-        return {
+        data = {
             "title": title,
             "site_title": self.clean_pii(raw_title),
             "url": url,
@@ -3093,11 +3581,24 @@ class AsyncWebCrawler:
             "og_type": og_type,
             "description": description,
             "keywords": keywords,
-            "flags": flags,
+            "flags": [],
             "plain_text": full_text,
             "chunks": semantic_chunk_text(structured_sections, source_url=url, title=title),
             "page_links": page_links,
         }
+        # Metadata och rubrikvägar kan nå RAG-tjänsten även när de saknas i brödtexten.
+        metadata = [value for key, value in data.items() if key != 'plain_text' and isinstance(value, str)]
+        groups = {
+            'hidden_html': hidden_texts,
+            'metadata': [*metadata, *keywords],
+            'links': [value for link in page_links for value in link.values()],
+            'page_text': [full_text, *(chunk[key] for chunk in data['chunks']
+                                      for key in ('heading', 'heading_path', 'context', 'content'))],
+        }
+        data['injection_signals'] = [name for name, values in groups.items() if detect_prompt_injection(*values)]
+        if data['injection_signals']:
+            data['flags'].append('possible_prompt_injection')
+        return data
 
     def _looks_like_document_url(self, url: str) -> bool:
         """Heuristik: är URL:en sannolikt ett binärt dokument?"""
@@ -3182,7 +3683,7 @@ class AsyncWebCrawler:
         options = {key: bool(self.config.get(key, defaults.get(key, False))) for key in keys}
         options.update(format=self.save_format,
                        trafilatura=bool(self.use_trafilatura and HAS_TRAFILATURA),
-                       extractor_version=4)
+                       extractor_version=9)
         return hashlib.sha256(json.dumps(options, sort_keys=True).encode('utf-8')).hexdigest()
 
     @staticmethod
@@ -3301,6 +3802,11 @@ class AsyncWebCrawler:
         async with self.async_stats_lock:
             self.stats.pages_failed += 1
         self.report["gone_pages"].append({"url": url, "status": status, 'confirmed': confirmed})
+        if confirmed and self.config.get('download_docs', False):
+            # Dokument utan filändelse passerar sidflödet innan filtypen blir känd.
+            prior_doc = await self.db.get_doc(url)
+            if prior_doc:
+                await self._handle_gone_document(url, prior_doc, status)
         if cached is not None:
             fn = cached.get('filename')
             if fn:
@@ -3335,6 +3841,9 @@ class AsyncWebCrawler:
         # validatorer och innehållsåteranvändning styrs av incremental.
         cached = await self.db.get_cache(url)
         conditional_cache = (cached if self.config.get("incremental") and cached
+                             and cached.get('fetch_url')
+                             and normalize_url(cached['fetch_url'], self.ignore_query_params) == url
+                             and not self.config['spa_ready_selector']
                              and cached.get('processing_profile') == self._page_profile() else None)
         html, source, final_url = "", "Standard", fetch_url
         etag, last_mod = None, None
@@ -3376,6 +3885,7 @@ class AsyncWebCrawler:
                     self._gui_update(url, "Fel", "")
                     return False
 
+                self._check_crawl_scope(result.final_url or fetch_url, fetch_url)
                 if result.status in (404, 410):
                     await self._handle_gone(url, cached, result.status)
                     if url == normalize_url(self.start_url, self.ignore_query_params) and not cached:
@@ -3410,8 +3920,9 @@ class AsyncWebCrawler:
                     await self._drop_saved_page(url, cached, 'ändrad filtyp')
                     await self.db.mark_page_unsaved(url)
                     return False
-                if any(dt in content_type for dt in ('application/pdf', 'application/vnd',
-                                                     'application/msword')):
+                media_type = content_type.partition(';')[0].strip()
+                if (media_type in DOCUMENT_CONTENT_TYPES or media_type.startswith('application/vnd')
+                        or (media_type == 'application/octet-stream' and await self.db.get_doc(url))):
                     if self.config.get("download_docs", False):
                         await self.download_document(fetch_url)
                     await self._drop_saved_page(url, cached, 'sidan är nu ett dokument')
@@ -3424,12 +3935,13 @@ class AsyncWebCrawler:
                     return False
 
                 # JS-fallback
-                if self._needs_javascript(html):
+                if self.config['spa_ready_selector'] or self._needs_javascript(html):
                     if self.state == CrawlerState.STOPPED:
                         return False
                     rendered = await self._render_response_with_playwright(final_url)
                     rendered_html, rendered_url = rendered.text, rendered.final_url
                     render_status = rendered.status
+                    self._check_crawl_scope(rendered_url or final_url, fetch_url)
                     if rendered_html:
                         html = rendered_html
                         final_url = rendered_url or final_url
@@ -3448,11 +3960,13 @@ class AsyncWebCrawler:
                 rendered = await self._render_response_with_playwright(fetch_url)
                 rendered_html, rendered_url = rendered.text, rendered.final_url
                 render_status = rendered.status
+                final_url = rendered_url or fetch_url
                 if rendered_html:
                     html = rendered_html
                     final_url = rendered_url or fetch_url
                     source = "Webbläsare"
 
+            self._check_crawl_scope(final_url, fetch_url)
             if render_status in (404, 410):
                 await self._handle_gone(url, cached, render_status)
                 if url == normalize_url(self.start_url, self.ignore_query_params) and not cached:
@@ -3495,14 +4009,7 @@ class AsyncWebCrawler:
                     await self.db.mark_page_unsaved(url)
                     return False
 
-            # ─── Redirect utanför domänen / bot-skydd ───
-            if (self.config.get("strict_domain", True)
-                    and not self._domain_allowed(urlparse(final_url).netloc)):
-                self.report["off_domain_redirects"].append({"url": url, "final_url": final_url})
-                self._gui_update(url, "Omdirigerad utanför domän", "")
-                await self._drop_saved_page(url, cached, 'omdirigerad utanför tillåtna domäner')
-                await self.db.mark_page_unsaved(url)
-                return False
+            # ─── Bot-skydd ───
             if final_url != url:
                 # Slut-URL:en är redan besökt — undvik att hämta samma innehåll två gånger
                 self.url_queue.mark_seen(final_url)
@@ -3517,6 +4024,7 @@ class AsyncWebCrawler:
                 return False
 
             data = await asyncio.to_thread(self.extract_structured_data, html, final_url)
+            injection_signals = data.pop('injection_signals', [])
             content_hash = get_clean_hash(data["plain_text"])
             text_length = len(data["plain_text"])
 
@@ -3529,6 +4037,7 @@ class AsyncWebCrawler:
                 self._log(f"  ⚠ Möjlig prompt-injektion i sidans innehåll: {url}",
                           LogLevel.WARNING)
                 self.report["possible_prompt_injection"].append(url)
+                self.report['prompt_injection_signals'].append({'url': url, 'signals': injection_signals})
 
             page_links = data.get("page_links", [])
 
@@ -3537,12 +4046,12 @@ class AsyncWebCrawler:
                 page_lang = (data.get("language") or "").lower().replace("_", "-").split("-")[0]
                 if page_lang and page_lang not in self.languages:
                     self.report["wrong_language"].append({"url": url, "language": page_lang})
-                    self._gui_update(url, f"Hoppar över språk ({page_lang})", data["title"])
                     await self._drop_saved_page(url, cached, "fel språk")
                     await self._save_page_cache(url, data, content_hash, etag, last_mod, [], None, fetch_url,
                                                 rendered=source == 'Webbläsare')
                     async with self.async_stats_lock:
                         self.stats.pages_visited += 1
+                    self._gui_update(url, f"Hoppar över språk ({page_lang})", data["title"])
                     return True
 
             # ─── Canonical: sidan är en kopia av en annan URL ───
@@ -3580,13 +4089,7 @@ class AsyncWebCrawler:
                 and (not fn or os.path.exists(out_path))
             )
 
-            if unchanged:
-                async with self.async_stats_lock:
-                    self.stats.pages_unchanged += 1
-                self._gui_update(url, "Oförändrad", data["title"])
-            else:
-                self._gui_update(url, f"Hämtad ({source})", data["title"])
-
+            if not unchanged:
                 if text_length > 50 and self._saves_text():
                     os.makedirs(os.path.dirname(out_path), exist_ok=True)
                     await blocking_complete(self._write_page_file, out_path, final_url, data)
@@ -3612,15 +4115,19 @@ class AsyncWebCrawler:
 
             async with self.async_stats_lock:
                 self.stats.pages_visited += 1
+                if unchanged:
+                    self.stats.pages_unchanged += 1
+            self._gui_update(url, "Oförändrad" if unchanged else f"Hämtad ({source})", data["title"])
             return True
 
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            self._log(f"  ✗ Fel vid besök ({url}): {str(e)[:80]}", LogLevel.ERROR)
+            reason = redact_diagnostic_urls(str(e))
+            self._log(f"  ✗ Fel vid besök ({url}): {reason[:80]}", LogLevel.ERROR)
             async with self.async_stats_lock:
                 self.stats.pages_failed += 1
-            self._gui_update(url, "Fel", str(e)[:30])
+            self._gui_update(url, "Fel", reason[:30])
             return False
 
     def _write_page_file(self, out_path: str, url: str, data: Dict):
@@ -3694,7 +4201,7 @@ class AsyncWebCrawler:
                        ocr_languages=str(self.config.get('ocr_languages', 'swe+eng')),
                        ocr_max_pages=int(self.config.get('ocr_max_pages', 50)),
                        quarantine=bool(self.config.get('quarantine_flagged_chunks', True)),
-                       converter_version=5)
+                       converter_version=22)
         return hashlib.sha256(json.dumps(options, sort_keys=True).encode('utf-8')).hexdigest()
 
     def _conversion_context(self, ref: Dict, last_modified: Optional[str]) -> str:
@@ -3703,7 +4210,7 @@ class AsyncWebCrawler:
         values['server_modified'] = DocumentConverter._parse_date(last_modified, http=True)
         return hashlib.sha256(json.dumps(values, sort_keys=True).encode('utf-8')).hexdigest()
 
-    async def _invalidate_document_text(self, url: str, prior: Optional[Dict]):
+    async def _invalidate_document_text(self, url: str, prior: Optional[Dict], **change_details):
         """En gammal konvertering får aldrig leva vidare som text för en ny version."""
         names = set()
         if prior:
@@ -3719,10 +4226,10 @@ class AsyncWebCrawler:
                 path = os.path.join(self.output_dir, folder, name)
                 if os.path.isfile(path):
                     os.remove(path)
-                    self._record_change('document_text_removed', url, file=name)
+                    self._record_change('document_text_removed', url, file=name, **change_details)
 
     async def _handle_gone_document(self, url: str, prior: Optional[Dict], status: int):
-        await self._invalidate_document_text(url, prior)
+        await self._invalidate_document_text(url, prior, reason=f'HTTP {status}')
         await self.db.delete_doc(url)
         if prior and prior.get('filename'):
             path = os.path.join(self.output_dir, 'dokument', os.path.basename(prior['filename']))
@@ -3742,7 +4249,7 @@ class AsyncWebCrawler:
         if ext not in DocumentConverter.SUPPORTED and ext not in DocumentConverter.LEGACY_TARGETS:
             return None
         keys = ('remove_email', 'remove_phone', 'remove_pnr', 'remove_ip', 'keep_role_emails',
-                'ocr', 'ocr_languages', 'ocr_max_pages')
+                'ocr', 'ocr_languages', 'ocr_max_pages', 'allow_libreoffice')
         options = {key: self.config[key] for key in keys if key in self.config}
         md_name = DocumentConverter.md_filename(url, filename)
         result = await self._conversion_runner.run(
@@ -3754,10 +4261,11 @@ class AsyncWebCrawler:
             os.makedirs(os.path.dirname(md_path), exist_ok=True)
             await blocking_complete(atomic_write_text, md_path, result['text'])
         if md_path:
-            with open(md_path, encoding='utf-8') as f:
-                meta, _ = markdown_file_to_chunks(f.read(), is_document=True)
-            if 'possible_prompt_injection' in meta['flags']:
+            header = result['text'].partition('\n---\n')[0]
+            flags = markdown_header_field(header, 'Flaggor')
+            if 'possible_prompt_injection' in (flag.strip() for flag in flags.split(',')):
                 self.report['possible_prompt_injection'].append(url)
+                self.report['prompt_injection_signals'].append({'url': url, 'signals': ['document']})
                 if self.config.get('quarantine_flagged_chunks', True):
                     folder = os.path.join(self.output_dir, 'texter_karantan')
                     os.makedirs(folder, exist_ok=True)
@@ -3793,11 +4301,13 @@ class AsyncWebCrawler:
                     raise
                 except Exception as error:
                     self.report['conversion_failures'].append({
-                        'url': job['url'], 'file': job['filename'], 'reason': str(error)[:200]})
+                        'url': job['url'], 'file': job['filename'],
+                        'reason': redact_diagnostic_urls(str(error))[:200]})
                     self._log(f'⚠ Konverteringsjobb misslyckades: {error}', LogLevel.ERROR)
                 finally:
                     if job is not None:
                         self._conversion_pending -= 1
+                        self._gui_stats()
                     self._conversion_queue.task_done()
 
         self._conversion_tasks = [asyncio.create_task(worker())
@@ -3823,6 +4333,9 @@ class AsyncWebCrawler:
     async def _queue_conversion(self, job: Dict):
         ext = os.path.splitext(job['filepath'])[1].lower()
         if ext not in DocumentConverter.SUPPORTED and ext not in DocumentConverter.LEGACY_TARGETS:
+            return
+        if ext in DocumentConverter.LEGACY_TARGETS and not self.config.get('allow_libreoffice', False):
+            self.report['legacy_conversion_skipped'].append({'url': job['url'], 'file': job['filename']})
             return
         if self._conversion_queue is None:
             await self._complete_conversion(job)
@@ -3854,21 +4367,32 @@ class AsyncWebCrawler:
                     self._conversion_pending -= 1
                 self._conversion_queue.task_done()
 
-    async def _download_via_aiohttp(self, url: str, docs_dir: str, default_name: str,
-                                    url_ext: str, slug_base: str, url_hash: str,
-                                    headers: Dict[str, str],
-                                    prior_path: Optional[str], prior_hash: Optional[str] = None) -> Dict:
-        """Strömmar ett dokument till <fil>.part och byter atomärt till slutnamnet.
+    async def _download_via_aiohttp(self, url: str, part_path: str, headers: Dict[str, str]) -> Dict:
+        """Gör högst tre strömmande försök med ny arbetsfil efter nätfel."""
+        for attempt in range(3):
+            if not await self._wait_for_request(url):
+                return {'status': 'aborted'}
+            outcome = await self._download_document_attempt(url, part_path, headers)
+            if outcome['status'] != 'retry':
+                return outcome
+            if attempt == 2:
+                break
+            delay = document_retry_delay(attempt, outcome.get('retry_after', ''))
+            if delay > 60:
+                break
+            if os.path.exists(part_path):
+                os.remove(part_path)
+            await asyncio.sleep(delay)
+        return {'status': 'failed'}
 
-        Returnerar dict med "status": ok | not_modified | same | too_large |
-        aborted | failed (+ filename/etag/last_modified vid ok/same).
-        """
-        part_path = None
+    async def _download_document_attempt(self, url: str, part_path: str, headers: Dict[str, str]) -> Dict:
+        """Strömma ett svar till arbetsfilen före filtypskontrollen."""
         try:
             self._check_http_target(url)
             async with self.req_session.get(
                 url, headers=headers, timeout=aiohttp.ClientTimeout(total=120)
             ) as resp:
+                self._check_crawl_scope(str(resp.url), url)
                 if resp.status in (429, 503):
                     self.rate_limiter.slow_down(domain=urlparse(str(resp.url)).netloc.lower())
                 elif resp.status in (200, 304):
@@ -3878,31 +4402,16 @@ class AsyncWebCrawler:
                             'last_modified': resp.headers.get('Last-Modified')}
                 if resp.status in (404, 410):
                     return {"status": "gone", "http_status": resp.status}
+                if resp.status in (429, 500, 502, 503, 504):
+                    return {'status': 'retry', 'retry_after': resp.headers.get('Retry-After', '')}
                 if resp.status != 200:
                     self._log(f"  ⚠ aiohttp HTTP {resp.status} för dokument: {url}",
                               LogLevel.DEBUG)
                     return {"status": "failed", "browser_retry": resp.status in (401, 403)}
 
-                if (self.config.get('strict_domain', True)
-                        and not self._domain_allowed(resp.url.raw_authority)):
-                    self.report['off_domain_redirects'].append(
-                        {'url': url, 'final_url': str(resp.url)})
-                    return {"status": "blocked"}
-
                 content_type = resp.headers.get('Content-Type', '').lower()
                 cd_raw = resp.headers.get('Content-Disposition', '')
-                is_attachment = 'attachment' in cd_raw.lower()
-                doc_content_types = (
-                    'application/pdf', 'application/vnd',
-                    'application/msword', 'application/octet-stream',
-                    'application/x-download', 'application/force-download',
-                    'application/zip', 'application/x-zip',
-                    'application/x-rar', 'application/rtf', 'text/csv',
-                )
-                looks_like_doc = (
-                    is_attachment or any(dt in content_type for dt in doc_content_types)
-                )
-                if not looks_like_doc and 'text/html' in content_type:
+                if content_type.partition(';')[0].strip() in ('text/html', 'application/xhtml+xml'):
                     self._log(f"  ⚠ Servern svarar HTML istället för dokument: {url}",
                               LogLevel.DEBUG)
                     return {"status": "failed", "browser_retry": True}
@@ -3918,58 +4427,12 @@ class AsyncWebCrawler:
                 etag = resp.headers.get('ETag')
                 last_mod = resp.headers.get('Last-Modified')
 
-                # Filnamn: ett tidigare namn behålls (stabilt mellan körningar)
-                if prior_path:
-                    filename = os.path.basename(prior_path)
-                else:
-                    ext = url_ext
-                    filename = default_name
-                    if ext == ".bin":
-                        ct_ext_map = {
-                            'application/pdf': '.pdf',
-                            'application/msword': '.doc',
-                            'application/vnd.openxmlformats-officedocument.wordprocessingml': '.docx',
-                            'application/vnd.openxmlformats-officedocument.spreadsheetml': '.xlsx',
-                            'application/vnd.openxmlformats-officedocument.presentationml': '.pptx',
-                            'application/vnd.ms-excel': '.xls',
-                            'application/vnd.ms-powerpoint': '.ppt',
-                            'application/zip': '.zip',
-                            'application/x-zip': '.zip',
-                        }
-                        for ct_prefix, ct_extension in ct_ext_map.items():
-                            if ct_prefix in content_type:
-                                ext = ct_extension
-                                filename = f"{slug_base}_{url_hash}{ext}"
-                                break
-                    if cd_raw:
-                        match = re.search(
-                            r"filename\*?=(?:UTF-8'')?[\"']?([^\"';]+)[\"']?",
-                            cd_raw, flags=re.IGNORECASE)
-                        if match:
-                            cd_name = unquote(match.group(1)).strip()
-                            if cd_name:
-                                cd_ext = self._safe_ext(posixpath.splitext(cd_name)[1]) or ext
-                                filename = (f"{slugify(cd_name.split('.')[0])[:50] or slug_base}_"
-                                            f"{url_hash}{cd_ext}")
-
-                final_ext = os.path.splitext(filename)[1]
-                final_path = os.path.join(docs_dir, filename)
-
-                part_path = final_path + ".part"
                 written = 0
-                first = True
                 digest = hashlib.sha256()
                 with open(part_path, 'wb') as f:
                     async for chunk in resp.content.iter_chunked(65536):
                         if self.state == CrawlerState.STOPPED:
                             return {"status": "aborted"}
-                        if first:
-                            first = False
-                            if not magic_ok(final_ext, chunk):
-                                self._log(f"  ⚠ Innehållet matchar inte filtypen "
-                                          f"{final_ext} (troligen en inloggnings-/felsida): {url}",
-                                          LogLevel.WARNING)
-                                return {"status": "failed"}
                         written += len(chunk)
                         if written > self.max_download_bytes:
                             self._log(f"  ⚠ Dokumentet överskred storleksgränsen: {url}",
@@ -3979,28 +4442,19 @@ class AsyncWebCrawler:
                         digest.update(chunk)
                 if written == 0:
                     return {"status": "failed"}
-                content_hash = digest.hexdigest()
-                if prior_path and prior_hash == content_hash:
-                    return {"status": "same", "filename": filename, "content_hash": content_hash,
-                            "etag": etag, "last_modified": last_mod}
-                if prior_path:
-                    cache_url = normalize_url(url, self.ignore_query_params)
-                    await self._invalidate_document_text(cache_url, await self.db.get_doc(cache_url))
-                os.replace(part_path, final_path)
-                part_path = None
-                return {"status": "ok", "filename": filename,
-                        "etag": etag, "last_modified": last_mod, "content_hash": content_hash}
-        except BlockedHostError:
+                return {"status": "ok", "etag": etag, "last_modified": last_mod,
+                        "content_hash": digest.hexdigest(), "content-type": content_type,
+                        "content-disposition": cd_raw, "final_url": str(resp.url)}
+        except (BlockedHostError, RobotsDeniedError):
             return {"status": "blocked"}
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError, asyncio.TimeoutError) as e:
+            if isinstance(getattr(e, 'os_error', None), BlockedDNSError):
+                return {'status': 'blocked'}
+            self._log(f"  ⚠ aiohttp-fel vid dokumentnedladdning: {e}", LogLevel.DEBUG)
+            return {"status": "failed" if isinstance(e, aiohttp.ClientSSLError) else "retry"}
+        except aiohttp.ClientError as e:
             self._log(f"  ⚠ aiohttp-fel vid dokumentnedladdning: {e}", LogLevel.DEBUG)
             return {"status": "failed"}
-        finally:
-            if part_path and os.path.exists(part_path):
-                try:
-                    os.remove(part_path)
-                except OSError:
-                    pass
 
     @staticmethod
     def _safe_ext(ext: str) -> str:
@@ -4028,10 +4482,8 @@ class AsyncWebCrawler:
                 return
             self.downloaded_files.add(url)
 
-        # Rate limit även dokumentnedladdningar
-        domain = urlparse(url).netloc
-        await self.rate_limiter.async_wait(domain)
-
+        part_path = None
+        installing = False
         try:
             docs_dir = os.path.join(self.output_dir, "dokument")
             os.makedirs(docs_dir, exist_ok=True)
@@ -4053,16 +4505,17 @@ class AsyncWebCrawler:
 
             # Villkorlig GET: uppdaterade dokument hämtas om, oförändrade hoppas över
             headers: Dict[str, str] = {}
-            if (prior_path and (not prior.get('content_hash')
-                                or prior['content_hash'] == prior_hash)):
+            # En äldre post utan begärd adress kan innehålla en annan variant.
+            if (prior_path and prior.get('fetch_url')
+                    and normalize_url(prior['fetch_url'], self.ignore_query_params) == url
+                    and (not prior.get('content_hash') or prior['content_hash'] == prior_hash)):
                 if prior['etag']:
                     headers['If-None-Match'] = prior['etag']
                 if prior['last_modified']:
                     headers['If-Modified-Since'] = prior['last_modified']
 
-            outcome = await self._download_via_aiohttp(
-                fetch_url, docs_dir, default_name, url_ext, slug_base, url_hash,
-                headers, prior_path, prior_hash)
+            part_path = os.path.join(docs_dir, uuid.uuid4().hex + '.part')
+            outcome = await self._download_via_aiohttp(fetch_url, part_path, headers)
             status = outcome["status"]
 
             if status == 'gone':
@@ -4078,29 +4531,39 @@ class AsyncWebCrawler:
             if (status == "failed" and outcome.get('browser_retry') and HAS_PLAYWRIGHT
                     and self._login_detection_enabled):
                 self._log(f"  🔄 Försöker Playwright-fallback för: {url}", LogLevel.DEBUG)
-                filename = os.path.basename(prior_path) if prior_path else default_name
-                final_path = os.path.join(docs_dir, filename)
-                part_path = final_path + ".part"
-                ok = await self._download_via_playwright(fetch_url, part_path)
-                if ok and os.path.exists(part_path):
-                    with open(part_path, 'rb') as fh:
-                        head = fh.read(1024)
-                    size = os.path.getsize(part_path)
-                    if (magic_ok(os.path.splitext(filename)[1], head)
-                            and 0 < size <= self.max_download_bytes):
-                        incoming_hash = await asyncio.to_thread(file_sha256, part_path)
-                        if prior_path and incoming_hash != prior_hash:
-                            await self._invalidate_document_text(url, prior)
-                        os.replace(part_path, final_path)
-                        outcome = {"status": "same" if prior_hash == incoming_hash else "ok", "filename": filename,
-                                   "etag": None, "last_modified": None,
-                                   "content_hash": incoming_hash}
-                        status = outcome['status']
-                if os.path.exists(part_path):
-                    try:
-                        os.remove(part_path)
-                    except OSError:
-                        pass
+                response = {}
+                if await self._download_via_playwright(fetch_url, part_path, response):
+                    outcome = {**response, 'status': 'ok',
+                               'content_hash': await blocking_complete(file_sha256, part_path)}
+                    status = 'ok'
+
+            filename = os.path.basename(prior_path) if prior_path else default_name
+            if status == 'ok':
+                if prior_path and prior_hash == outcome['content_hash']:
+                    status = 'same'
+                else:
+                    match = re.search(r"""filename\*?=(?:UTF-8'')?["']?([^"';]+)""",
+                                      outcome.get('content-disposition', ''), re.I)
+                    name_hint = unquote(match.group(1)).strip() if match else ''
+                    media_type = outcome.get('content-type', '').partition(';')[0].strip().lower()
+                    declared = (self._safe_ext(posixpath.splitext(name_hint)[1])
+                                or DOCUMENT_CONTENT_TYPES.get(media_type)
+                                or self._safe_ext(posixpath.splitext(urlparse(outcome.get('final_url', '')).path)[1])
+                                or url_ext)
+                    stem, previous_ext = os.path.splitext(filename)
+                    ext = await blocking_complete(verified_document_extension, part_path, declared,
+                                                  previous_ext if prior_path else '')
+                    if self.state == CrawlerState.STOPPED:
+                        return
+                    if not ext:
+                        status = 'felaktig filtyp'
+                    else:
+                        if not prior_path and name_hint:
+                            stem = f"{slugify(name_hint.split('.')[0])[:50] or slug_base}_{url_hash}"
+                        filename = stem + ext
+                        installing = True
+                        await self._invalidate_document_text(url, prior)
+                        os.replace(part_path, os.path.join(docs_dir, filename))
 
             referers = self.manifest._referers.get(url, [])
             ref = dict(referers[0]) if referers else {}
@@ -4111,14 +4574,15 @@ class AsyncWebCrawler:
 
             if status in ("ok", "not_modified", "same"):
                 self._successful_documents += 1
-                filename = outcome.get("filename") or os.path.basename(prior_path or default_name)
                 filepath = os.path.join(docs_dir, filename)
                 size = os.path.getsize(filepath)
                 content_hash = outcome.get('content_hash') or prior_hash
                 if not content_hash:
                     content_hash = await asyncio.to_thread(file_sha256, filepath)
                 profile = self._conversion_profile()
-                lm = outcome.get('last_modified') or (prior or {}).get('last_modified')
+                lm = outcome.get('last_modified')
+                if status != 'ok' and not lm:
+                    lm = (prior or {}).get('last_modified')
                 context_hash = self._conversion_context(ref, lm)
                 if status == 'not_modified':
                     fetched_at = (prior or {}).get('fetched_at') or ''
@@ -4136,7 +4600,7 @@ class AsyncWebCrawler:
                                                        os.path.basename(prior['md_filename'])))
                             for folder in ('texter', 'texter_karantan'))
                 )
-                if not conversion_valid:
+                if not conversion_valid and not installing:
                     await self._invalidate_document_text(url, prior)
 
                 if status == "ok":
@@ -4145,8 +4609,9 @@ class AsyncWebCrawler:
                         self.stats.bytes_downloaded += size
                     kind = "docs_updated" if prior_path else "docs_added"
                     self.counts[kind] += 1
+                    replaced = {'previous_file': os.path.basename(prior_path)} if prior_path and prior_path != filepath else {}
                     self._record_change("document_updated" if prior_path else "document_added",
-                                        url, file=filename)
+                                        url, file=filename, **replaced)
                     self._log(f"  ⬇ Dokument sparat: {filename}")
                     etag, lm = outcome.get("etag"), outcome.get("last_modified")
                 else:
@@ -4160,7 +4625,10 @@ class AsyncWebCrawler:
                                        ref.get('referer_url', ''),
                                        ref.get('referer_title', ''),
                                        ref.get('link_text', ''), content_hash=content_hash,
-                                       fetched_at=fetched_at)
+                                       fetched_at=fetched_at, fetch_url=fetch_url)
+                if installing and prior_path and prior_path != filepath:
+                    os.remove(prior_path)
+                installing = False
 
                 # Även 304 måste försöka igen efter ett tidigare konverteringsfel.
                 if self.converter and not conversion_valid:
@@ -4181,12 +4649,19 @@ class AsyncWebCrawler:
                     doc_url=url, filename=os.path.basename(prior_path),
                     size_bytes=os.path.getsize(prior_path))
         except Exception as e:
+            if installing:
+                self._export_failed('dokumentbyte', e)
             self._log(f"  ✗ Filnedladdning misslyckades: {url}, {e}", LogLevel.ERROR)
-            self.report['download_failures'].append({'url': url, 'reason': str(e)[:160]})
+            self.report['download_failures'].append({'url': url, 'reason': redact_diagnostic_urls(str(e))[:160]})
             async with self.async_download_lock:
                 self.downloaded_files.discard(url)
 
-    async def _download_via_playwright(self, url: str, filepath: str) -> bool:
+        finally:
+            if part_path and os.path.exists(part_path):
+                os.remove(part_path)
+
+    async def _download_via_playwright(self, url: str, filepath: str,
+                                       response: Optional[Dict] = None) -> bool:
         """Fallback-nedladdning via Playwright för SAML-skyddade dokument.
 
         Browser-sessionen följer SAML-flödet. Bilagor och inline-dokument
@@ -4213,6 +4688,12 @@ class AsyncWebCrawler:
                 if not guard['success']:
                     self._log(f"  ⚠ Browser-nedladdning misslyckades: {guard['reason'] or 'inget dokument'}",
                               LogLevel.DEBUG)
+                elif response is not None:
+                    headers = guard['document_headers']
+                    response.update({'content-type': headers.get('content-type', ''),
+                                     'content-disposition': headers.get('content-disposition', ''),
+                                     'last_modified': headers.get('last-modified'),
+                                     'final_url': guard['final_url']})
                 return guard['success']
             finally:
                 if guard:
@@ -4241,6 +4722,9 @@ class AsyncWebCrawler:
 
     async def _finalize_page_duplicates(self):
         """Canonical får ersätta källan först när målet bekräftats och sparats."""
+        if not (self._canonical_pending or self.dedupe_content):
+            return
+        records = await self.db.get_page_crawl_records()
         for source, target in self._canonical_pending.items():
             visited = {source}
             while target in self._canonical_pending and target not in visited:
@@ -4250,11 +4734,11 @@ class AsyncWebCrawler:
                 target = min(visited)  # behåll en deterministisk kopia vid en cykel
             if source == target:
                 continue
-            target_cache = await self.db.get_cache(target)
+            target_cache = records.get(target)
             confirmed = bool(target_cache and target_cache.get('crawled_at', '')
                              >= self.stats.start_time.isoformat())
             if confirmed and self.is_valid_url(target) and self._exportable_page(target_cache):
-                source_cache = await self.db.get_cache(source)
+                source_cache = records.pop(source, None)
                 await self._drop_duplicate_page(source, source_cache, f'canonical → {target}')
                 self.report['canonical_skipped'].append({'url': source, 'canonical': target})
                 self._gui_update(source, 'Duplikat (canonical)', (source_cache or {}).get('title', ''))
@@ -4265,10 +4749,9 @@ class AsyncWebCrawler:
             return
         owners = {}
         unresolved = {entry['url'] for entry in self.report['canonical_unresolved']}
-        records = sorted(await self.db.get_all_records(),
-                         key=lambda row: (row[0] not in self._initial_page_files, row[0]))
-        for url, _, _, content_hash, _ in records:
-            cached = await self.db.get_cache(url)
+        for url in sorted(records, key=lambda url: (url not in self._initial_page_files, url)):
+            cached = records[url]
+            content_hash = cached['content_hash']
             if (not self.is_valid_url(url) or not self._exportable_page(cached)
                     or (cached.get('content_length') or 0) < 200):
                 continue
@@ -4281,6 +4764,45 @@ class AsyncWebCrawler:
             else:
                 owners[content_hash] = url
 
+    async def _migrate_page_url_keys(self):
+        """Flytta endast gamla sidnycklar som den sparade begäran kan identifiera."""
+        retained = set(CONTENT_QUERY_PARAMS).difference(self.ignore_query_params)
+        if not retained:
+            return
+        reason = 'ändrad URL-identitet'
+        for old_url, fetch_url, filename in await self.db.get_page_url_candidates():
+            url = normalize_url(fetch_url, self.ignore_query_params)
+            if url == old_url:
+                continue
+            old_query = parse_qs(urlparse(old_url).query, keep_blank_values=True)
+            old_names = {name.lower() for name in old_query}
+            legacy_ignore = (*self.ignore_query_params, *(retained - old_names))
+            if normalize_url(fetch_url, legacy_ignore) != old_url:
+                continue
+            target = await self.db.get_cache(url)
+            if target:
+                await self.db.delete_page(old_url)
+                if filename:
+                    self.counts['removed'] += 1
+                    self._record_change('removed', old_url, file=filename, reason=reason)
+                continue
+            new_name = None
+            if filename:
+                filename = os.path.basename(filename)
+                new_name = stable_filename(url, os.path.splitext(filename)[1])
+                for folder in ('texter', 'texter_karantan'):
+                    old_path = os.path.join(self.output_dir, folder, filename)
+                    if os.path.isfile(old_path) and new_name != filename:
+                        new_path = os.path.join(self.output_dir, folder, new_name)
+                        if os.path.exists(new_path):
+                            raise FileExistsError(f'Filnamnskollision vid flytt av {filename}')
+                        await blocking_complete(os.replace, old_path, new_path)
+                if new_name != filename:
+                    self._rekeyed_page_files[filename] = new_name
+                    self.counts['updated'] += 1
+                    self._record_change('updated', url, file=new_name, previous_file=filename, reason=reason)
+            await self.db.rekey_page(old_url, url, new_name)
+
     async def _enqueue_cached_urls(self):
         """Återkontrollera kända URL:er sist, även när de försvunnit ur navigeringen.
 
@@ -4289,16 +4811,18 @@ class AsyncWebCrawler:
         """
         if not self.config.get('incremental') or self.max_depth != 0:
             return
-        for url, *_ in await self.db.get_all_records():
+        for url, cached in (await self.db.get_page_crawl_records()).items():
             if self.is_valid_url(url):
-                cached = await self.db.get_cache(url)
                 self.url_queue.add_url(cached.get('fetch_url') or url, depth=0,
                                        base_priority=CrawlPriority.LOW.value)
         if self.config.get('download_docs', False):
             for doc in await self.db.get_all_docs():
-                if self.is_valid_url(doc['url']):
-                    self.url_queue.add_url(doc['url'], depth=0,
-                                           base_priority=CrawlPriority.LOW.value)
+                # Vid en delad äldre identitet ska både den gamla källadressen
+                # och den faktiskt begärda adressen kunna kontrolleras.
+                for url in dict.fromkeys((doc['fetch_url'] or doc['url'], doc['url'])):
+                    if self.is_valid_url(url):
+                        self.url_queue.add_url(url, depth=0,
+                                               base_priority=CrawlPriority.LOW.value)
 
     async def _original_hash(self, path: str) -> str:
         """Verifiera originalet minst en gång per körning, återanvänd inom körningen.
@@ -4322,10 +4846,11 @@ class AsyncWebCrawler:
     async def _prepare_export(self):
         """Exportera bara registrerade texter, och bara rätt version av dokumenttext.
 
-        Äldre filer utan aktiv registrering flyttas ut ur Sveas textmappar till
+        Äldre filer utan aktiv registrering flyttas ut ur de exporterade textmapparna till
         texter_utgangna. De raderas inte eftersom de kan komma från äldre körningar.
         """
         allowed = set()
+        flagged_urls = set(self.report['possible_prompt_injection'])
         self._intentional_export_exclusions = set()
         # Äldre generationer saknar profilbeskrivning. Då ska ett begränsat
         # migrationsförsök inte tyst ersätta dem med nästan tomma utdata.
@@ -4354,19 +4879,28 @@ class AsyncWebCrawler:
                              if os.path.isfile(os.path.join(self.output_dir, folder, name))), None)
                 if path:
                     with open(path, encoding='utf-8') as source:
-                        raw = source.read()
-                    if name.endswith('.json'):
-                        language = json.loads(raw).get('language', '')
-                    elif name.endswith('.txt'):
-                        language = plain_file_to_chunks(raw)[0].get('language', '')
-                    else:
-                        language = markdown_file_to_chunks(raw)[0].get('language', '')
+                        if name.endswith('.json'):
+                            language = json.load(source).get('language', '')
+                        else:
+                            header = []
+                            for line in source:
+                                if line.rstrip('\n') == '---':
+                                    break
+                                header.append(line)
+                            if name.endswith('.txt'):
+                                language = plain_header_fields(''.join(header).strip().splitlines()[1:]).get('Språk', '')
+                            else:
+                                language = markdown_header_field(''.join(header), 'Språk')
                     language = language.lower().replace('_', '-').split('-')[0]
                     if language and language not in self.languages:
                         self._intentional_export_exclusions.add(name)
                         self.report['wrong_language'].append({'url': url, 'language': language})
                         continue
             allowed.add(name)
+            if url not in flagged_urls and os.path.isfile(os.path.join(self.output_dir, 'texter_karantan', name)):
+                self.report['possible_prompt_injection'].append(url)
+                self.report['prompt_injection_signals'].append({'url': url, 'signals': ['previously_quarantined']})
+                flagged_urls.add(url)
         for doc in await self.db.get_all_docs():
             if not doc['filename'] or not self.is_valid_url(doc['url'], for_export=True):
                 if doc.get('md_filename'):
@@ -4396,8 +4930,10 @@ class AsyncWebCrawler:
                 quarantine_file = os.path.join(self.output_dir, 'texter_karantan',
                                                os.path.basename(doc['md_filename']))
                 if (os.path.isfile(quarantine_file)
-                        and doc['url'] not in self.report['possible_prompt_injection']):
+                        and doc['url'] not in flagged_urls):
                     self.report['possible_prompt_injection'].append(doc['url'])
+                    self.report['prompt_injection_signals'].append({'url': doc['url'], 'signals': ['document']})
+                    flagged_urls.add(doc['url'])
             else:
                 self.report['document_version_mismatch'].append(
                     {'url': doc['url'], 'file': doc['filename']})
@@ -4427,7 +4963,8 @@ class AsyncWebCrawler:
             if source_identity(name) in identities or (not self._saves_text() and not name.endswith('_doc.md')):
                 explained.add(name)
         for change in self.changes:
-            if change.get('reason') in ('HTTP 404', 'HTTP 410', 'fel språk', 'HTTP 403'):
+            if (change.get('reason') in ('HTTP 404', 'HTTP 410', 'fel språk', 'HTTP 403')
+                    or change['event'] == 'removed' and change.get('reason') == 'ändrad URL-identitet'):
                 if change.get('file'):
                     explained.add(os.path.basename(change['file']))
         # Bekräftade canonical-/dubblettbeslut och karantän är avsiktliga.
@@ -4438,6 +4975,8 @@ class AsyncWebCrawler:
             url = entry.get('url') if isinstance(entry, dict) else entry
             if url:
                 explained.add(stable_filename(url, self.save_format))
+        explained.update(old for old, new in self._rekeyed_page_files.items()
+                         if new in now or new in explained)
         lost = before - now - explained
         if lost and len(lost) > len(before) * 0.5:
             self.report['publication_blocked'].append(
@@ -4512,9 +5051,10 @@ class AsyncWebCrawler:
             self._log(f"⚠ Fel vid skapande av manifest-fil: {e}", LogLevel.ERROR)
 
     def _export_failed(self, artifact: str, error: Exception):
-        self.report['export_failures'].append({'artifact': artifact, 'reason': str(error)[:160]})
-        message = (f'JSONL-export misslyckades: {error}' if artifact == 'chunks.jsonl'
-                   else f'Export av {artifact} misslyckades: {error}')
+        reason = redact_diagnostic_urls(str(error))
+        self.report['export_failures'].append({'artifact': artifact, 'reason': reason[:160]})
+        message = (f'JSONL-export misslyckades: {reason}' if artifact == 'chunks.jsonl'
+                   else f'Export av {artifact} misslyckades: {reason}')
         self.fatal_error = self.fatal_error or message
 
     def delivery_status(self) -> str:
@@ -4533,133 +5073,249 @@ class AsyncWebCrawler:
             return 'partial' if self.stats.pages_visited or self._successful_documents else 'failed'
         return 'success'
 
+    @staticmethod
+    def _chunk_file_signature(path):
+        try:
+            info = os.stat(path)
+        except FileNotFoundError:
+            return None
+        # Hårdlänkning ändrar ctime på vissa filsystem. Storlek och mtime
+        # upptäcker ändringar även om en fil utanför crawlern skrivits på plats.
+        return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns]
+
+    def _read_chunk_index(self, index_path, outputs, quarantine_enabled):
+        try:
+            with open(index_path, encoding='utf-8') as source:
+                index = json.load(source)
+            if (index['version'] != 1 or index['quarantine'] != quarantine_enabled
+                    or index['outputs'] != [self._chunk_file_signature(path) for path in outputs]
+                    or index['outputs'][0] is None):
+                return None
+            offsets = [0, 0]
+            for _, bucket, start, length, count in index['sources'].values():
+                if (any(type(value) is not int for value in (bucket, start, length, count))
+                        or bucket not in (0, 1) or start != offsets[bucket] or length < 0
+                        or not 0 <= count <= length or bool(count) != bool(length)):
+                    return None
+                offsets[bucket] += length
+            if offsets == [entry[2] if entry else 0 for entry in index['outputs']]:
+                return index
+        except (OSError, ValueError, TypeError, KeyError, IndexError, AttributeError):
+            pass
+        return None
+
+    def _append_source_chunks(self, path, name, force_quarantine, quarantine_enabled, targets):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                raw = f.read()
+            if name.endswith('.json'):
+                data = json.loads(raw)
+                flags = data.get("flags") or []
+                meta = {"url": data.get("url", ""), "title": data.get("title", ""),
+                        "source_type": "page", "referer_url": "",
+                        "language": data.get("language", ""),
+                        "modified_date": data.get("modified_date", ""),
+                        "crawled_at": data.get("crawled_at", ""),
+                        "flags": flags}
+                chunks = data.get("chunks", [])
+            elif name.endswith('.md'):
+                meta, chunks = markdown_file_to_chunks(raw, is_document=name.endswith('_doc.md'))
+                flags = meta.get("flags") or []
+            else:
+                meta, chunks = plain_file_to_chunks(raw)
+                flags = meta.get('flags') or []
+        except Exception as e:
+            if self._export_files is not None:
+                raise RuntimeError(f'Registrerad källfil kunde inte exporteras: {name}') from e
+            self._log(f"  ⚠ Hoppar över {name} i chunks.jsonl: {e}", LogLevel.DEBUG)
+            return 0, targets[0].tell(), 0, 0
+
+        if force_quarantine and not flags:
+            flags = ["quarantined"]
+            meta["flags"] = flags
+
+        key = hashlib.md5((meta.get("url") or name).encode('utf-8')).hexdigest()[:10]
+        bucket = int(bool(flags or force_quarantine) and quarantine_enabled)
+        target = targets[bucket]
+        start = target.tell()
+        for ch in chunks:
+            chunk_url = ch.get("url") or meta.get("url", "")
+            record = {
+                "id": f"{key}-{ch.get('chunk_index', 0)}",
+                **meta,
+                "url": chunk_url,
+                "heading": ch.get("heading", ""),
+                "heading_path": ch.get("heading_path", ""),
+                "context": ch.get("context", ""),
+                "content": ch.get("content", ""),
+                "chunk_index": ch.get("chunk_index", 0),
+                "total_chunks": ch.get("total_chunks", 0),
+                "flags": flags,
+            }
+            if "page_number" in ch and ch["page_number"] is not None:
+                record["page_number"] = ch["page_number"]
+                record["page_url"] = ch.get("page_url") or pdf_page_url(record['url'], ch['page_number'])
+            for field_name in ('heading_paths', 'slide_number'):
+                if field_name in ch:
+                    record[field_name] = ch[field_name]
+            target.write((json.dumps(record, ensure_ascii=False) + os.linesep).encode('utf-8'))
+        return bucket, start, target.tell() - start, len(chunks)
+
     def _write_chunks_jsonl(self) -> int:
-        """Bygger chunks.jsonl (en chunk per rad) av ALLA sparade sidor och dokument.
-
-        Läser från disk i stället för från minnet, så att filen blir komplett även vid
-        inkrementella körningar där oförändrade sidor inte bearbetas om. Färdig att läsas
-        in i en vektordatabas: varje rad har id, url, titel, rubrikväg, kontext och text.
-        Flaggade sidor (t.ex. möjlig prompt-injektion) karantänsätts i chunks_quarantine.jsonl."""
-        texts_dir = os.path.join(self.output_dir, "texter")
-        quarantine_dir = os.path.join(self.output_dir, "texter_karantan")
-        out_path = os.path.join(self.output_dir, "chunks.jsonl")
-        quarantine_path = os.path.join(self.output_dir, "chunks_quarantine.jsonl")
-        tmp_path = out_path + ".tmp"
-        tmp_quarantine = quarantine_path + ".tmp"
-        written = 0
-        quarantine_written = 0
+        """Publicera hela JSONL-korpusen och återanvänd oförändrade källors byteintervall."""
+        names = ('chunks.jsonl', 'chunks_quarantine.jsonl')
+        outputs = [os.path.join(self.output_dir, name) for name in names]
         quarantine_enabled = bool(self.config.get("quarantine_flagged_chunks", True))
+        index_name = PublicationWorkspace.CHUNK_INDEX
+        use_index = self._publication is not None and self._export_files is not None
+        previous = self._publication.previous_directory if use_index else None
+        index_path = os.path.join(self.output_dir, index_name)
+        sources = {}
+        for folder in ('texter', 'texter_karantan'):
+            directory = os.path.join(self.output_dir, folder)
+            if not os.path.isdir(directory):
+                continue
+            for name in sorted(os.listdir(directory)):
+                if (name.endswith(('.md', '.json', '.txt'))
+                        and (self._export_files is None or name in self._export_files)):
+                    sources[f'{folder}/{name}'] = (
+                        self._chunk_file_signature(os.path.join(directory, name)) if use_index else None)
 
-        sources: List[Tuple[str, str, bool]] = []
-        if os.path.isdir(texts_dir):
-            for name in sorted(os.listdir(texts_dir)):
-                if self._export_files is None or name in self._export_files:
-                    sources.append((texts_dir, name, False))
-        if os.path.isdir(quarantine_dir):
-            for name in sorted(os.listdir(quarantine_dir)):
-                if self._export_files is None or name in self._export_files:
-                    sources.append((quarantine_dir, name, True))
+        previous_outputs = [os.path.join(previous, name) for name in names] if previous else []
+        previous_index_path = os.path.join(previous, index_name) if previous else None
+        index = (self._read_chunk_index(previous_index_path, previous_outputs, quarantine_enabled)
+                 if previous_index_path else None)
+        old_sources = index['sources'] if index else {}
+        reusable = {key for key, stamp in sources.items()
+                    if stamp and stamp[1] and key in old_sources and stamp == old_sources[key][0]}
+        counts = [0, 0]
+        if (index and len(reusable) == len(sources) and list(sources) == list(old_sources)
+                and [self._chunk_file_signature(path) for path in outputs] == index['outputs']):
+            self._publication._link_or_copy(previous_index_path, index_path)
+            for _, bucket, _, _, count in old_sources.values():
+                counts[bucket] += count
+            self._chunk_export_stats = {'sources': len(sources), 'reused_sources': len(reusable),
+                                        'reused_jsonl': True, 'bytes': sum(
+                                            entry[2] for entry in index['outputs'] if entry)}
+            return counts[0]
 
-        with open(tmp_path, 'w', encoding='utf-8') as out, \
-             open(tmp_quarantine, 'w', encoding='utf-8') as q_out:
-            for sdir, name, force_quarantine in sources:
-                path = os.path.join(sdir, name)
-                try:
-                    with open(path, 'r', encoding='utf-8') as f:
-                        raw = f.read()
-                    if name.endswith('.json'):
-                        data = json.loads(raw)
-                        flags = data.get("flags") or []
-                        meta = {"url": data.get("url", ""), "title": data.get("title", ""),
-                                "source_type": "page", "referer_url": "",
-                                "language": data.get("language", ""),
-                                "modified_date": data.get("modified_date", ""),
-                                "crawled_at": data.get("crawled_at", ""),
-                                "flags": flags}
-                        chunks = data.get("chunks", [])
-                    elif name.endswith('.md'):
-                        meta, chunks = markdown_file_to_chunks(raw, is_document=name.endswith('_doc.md'))
-                        flags = meta.get("flags") or []
-                    elif name.endswith('.txt'):
-                        meta, chunks = plain_file_to_chunks(raw)
-                        flags = meta.get('flags') or []
-                    else:
-                        continue
-                except Exception as e:
-                    if self._export_files is not None:
-                        raise RuntimeError(f'Registrerad källfil kunde inte exporteras: {name}') from e
-                    self._log(f"  ⚠ Hoppar över {name} i chunks.jsonl: {e}", LogLevel.DEBUG)
-                    continue
+        entries = {}
+        temp_paths = [path + '.tmp' for path in outputs]
+        with ExitStack() as stack:
+            targets = [stack.enter_context(open(path, 'wb')) for path in temp_paths]
+            originals = ([stack.enter_context(open(path, 'rb')) if stamp else None
+                          for path, stamp in zip(previous_outputs, index['outputs'])] if reusable else [])
+            for relative, stamp in sources.items():
+                if relative in reusable:
+                    _, bucket, offset, length, count = old_sources[relative]
+                    target = targets[bucket]
+                    start = target.tell()
+                    if length:
+                        source = originals[bucket]
+                        source.seek(offset)
+                        remaining = length
+                        while remaining:
+                            block = source.read(min(remaining, 1024 * 1024))
+                            if not block:
+                                raise OSError('Tidigare chunkexport är ofullständig')
+                            target.write(block)
+                            remaining -= len(block)
+                else:
+                    folder, name = relative.split('/', 1)
+                    bucket, start, length, count = self._append_source_chunks(
+                        os.path.join(self.output_dir, folder, name), name, folder == 'texter_karantan',
+                        quarantine_enabled, targets)
+                entries[relative] = [stamp, bucket, start, length, count]
+                counts[bucket] += count
 
-                if force_quarantine and not flags:
-                    flags = ["quarantined"]
-                    meta["flags"] = flags
-
-                key = hashlib.md5((meta.get("url") or name).encode('utf-8')).hexdigest()[:10]
-                is_quarantined = bool((flags or force_quarantine) and quarantine_enabled)
-                target_out = q_out if is_quarantined else out
-
-                for ch in chunks:
-                    chunk_url = ch.get("url") or meta.get("url", "")
-                    record = {
-                        "id": f"{key}-{ch.get('chunk_index', 0)}",
-                        **meta,
-                        "url": chunk_url,
-                        "heading": ch.get("heading", ""),
-                        "heading_path": ch.get("heading_path", ""),
-                        "context": ch.get("context", ""),
-                        "content": ch.get("content", ""),
-                        "chunk_index": ch.get("chunk_index", 0),
-                        "total_chunks": ch.get("total_chunks", 0),
-                        "flags": flags,
-                    }
-                    if "page_number" in ch and ch["page_number"] is not None:
-                        record["page_number"] = ch["page_number"]
-                        record["page_url"] = ch.get("page_url", f"{record['url']}#page={ch['page_number']}")
-                    for field_name in ('heading_paths', 'slide_number'):
-                        if field_name in ch:
-                            record[field_name] = ch[field_name]
-
-                    target_out.write(json.dumps(record, ensure_ascii=False) + "\n")
-                    if is_quarantined:
-                        quarantine_written += 1
-                    else:
-                        written += 1
-
-        os.replace(tmp_path, out_path)
-        if quarantine_written > 0:
-            os.replace(tmp_quarantine, quarantine_path)
-            self._log(f"🛡️ {quarantine_written} chunks sattes i karantän i chunks_quarantine.jsonl "
+        os.replace(temp_paths[0], outputs[0])
+        if counts[1]:
+            os.replace(temp_paths[1], outputs[1])
+            self._log(f"🛡️ {counts[1]} chunks sattes i karantän i chunks_quarantine.jsonl "
                       f"(flaggade för säkerhetsrisker)", LogLevel.WARNING)
         else:
-            if os.path.exists(tmp_quarantine):
-                try:
-                    os.remove(tmp_quarantine)
-                except OSError:
-                    pass
-            if os.path.exists(quarantine_path):
-                try:
-                    os.remove(quarantine_path)
-                except OSError:
-                    pass
+            os.remove(temp_paths[1])
+            if os.path.exists(outputs[1]):
+                os.remove(outputs[1])
+        stamps = [self._chunk_file_signature(path) for path in outputs]
+        if use_index:
+            # Höj versionen när JSONL-rader eller indexformat ändras.
+            index = {'version': 1, 'quarantine': quarantine_enabled, 'outputs': stamps, 'sources': entries}
+            atomic_write_text(index_path, json.dumps(index, ensure_ascii=False, separators=(',', ':')))
+        self._chunk_export_stats = {'sources': len(sources), 'reused_sources': len(reusable),
+                                    'reused_jsonl': False, 'bytes': sum(entry[2] for entry in stamps if entry)}
+        return counts[0]
 
-        return written
+    @staticmethod
+    def _history_tail_start(previous, keep):
+        """Sök bakåt till de senaste hela JSONL-raderna utan att läsa äldre historik."""
+        end = previous.seek(0, os.SEEK_END)
+        if not keep or not end:
+            return end
+        previous.seek(end - 1)
+        position = end - (previous.read(1) == b'\n')
+        while position:
+            start = max(0, position - 65536)
+            previous.seek(start)
+            block = previous.read(position - start)
+            lines = block.count(b'\n')
+            if lines >= keep:
+                return start + len(block.rsplit(b'\n', keep)[0]) + 1
+            keep -= lines
+            position = start
+        return 0
+
+    def _write_changes(self):
+        if not self._publication:
+            return  # En körning utan utmappslås får inte migrera den delade historiken.
+        path = os.path.join(self.output_dir, 'changes.jsonl')
+        exists = os.path.isfile(path)
+        migrate = exists
+        previous_limit = 0
+        if exists and self._publication.previous_directory:
+            previous_report = os.path.join(self.output_dir, 'crawl_report.json')
+            try:
+                with open(previous_report, encoding='utf-8') as report_file:
+                    report = json.load(report_file)
+                migrate = report.get('url_diagnostics_version') != DIAGNOSTIC_URL_VERSION
+                previous_limit = report.get('changes_history', {}).get('max_entries', 0)
+            except (OSError, ValueError, AttributeError):
+                pass
+        def json_line(change):
+            return (json.dumps(redact_diagnostic_data(change), ensure_ascii=False) + '\n').encode('utf-8')
+
+        limit = self.config['changes_history_max_entries']
+        if not (self.changes or migrate or limit and limit != previous_limit):
+            return
+        with ExitStack() as stack:
+            previous = stack.enter_context(open(path, 'rb')) if exists and (limit or migrate or self.changes) else None
+            offset = self._history_tail_start(previous, max(0, limit - len(self.changes))) if limit and previous else 0
+            if not (self.changes or migrate or offset):
+                return
+            with open(path + '.tmp', 'wb') as output:
+                if previous:
+                    previous.seek(offset)
+                    if migrate:
+                        for line in previous:
+                            if line.strip():
+                                output.write(json_line(json.loads(line)))
+                    else:
+                        shutil.copyfileobj(previous, output)
+                        if self.changes and output.tell():
+                            previous.seek(-1, os.SEEK_END)
+                            if previous.read(1) != b'\n':
+                                output.write(b'\n')
+                for change in self.changes:
+                    output.write(json_line({**change, 'run': self.crawl_session_id}))
+        os.replace(path + '.tmp', path)
+        self._changes_history_trimmed = bool(offset)
 
     async def _generate_report(self):
-        """Skriver changes.jsonl (append) och crawl_report.json (överskrivs)."""
-        if self.changes:
-            try:
-                path = os.path.join(self.output_dir, 'changes.jsonl')
-                with open(path + '.tmp', 'wb') as output:
-                    if os.path.exists(path):
-                        with open(path, 'rb') as previous:
-                            shutil.copyfileobj(previous, output)
-                    for change in self.changes:
-                        output.write((json.dumps({**change, 'run': self.crawl_session_id},
-                                                 ensure_ascii=False) + '\n').encode('utf-8'))
-                os.replace(path + '.tmp', path)
-            except Exception as e:
-                self._export_failed('changes.jsonl', e)
+        """Skriver ändringshistorik och körningsrapport med maskerade URL:er."""
+        try:
+            await blocking_complete(self._write_changes)
+        except Exception as e:
+            self._export_failed('changes.jsonl', e)
         try:
             not_seen: List[Dict] = []
             if self._completed_naturally:
@@ -4671,10 +5327,18 @@ class AsyncWebCrawler:
                     rows = await self.db.get_unseen_since(self.stats.start_time.isoformat())
                     not_seen = [{"url": u, "title": t} for u, t in rows]
 
+            history_path = os.path.join(self.output_dir, 'changes.jsonl')
             report = {
                 "run": self.crawl_session_id,
                 "domain": self.domain,
                 "version": VERSION,
+                'url_diagnostics_version': DIAGNOSTIC_URL_VERSION,
+                'chunk_export': self._chunk_export_stats,
+                'changes_history': {'max_entries': self.config['changes_history_max_entries'],
+                                    'trimmed': self._changes_history_trimmed,
+                                    'bytes': os.path.getsize(history_path) if os.path.isfile(history_path) else 0},
+                'network_policy': {'allow_private_hosts': self._allow_private,
+                                   'reason': self._private_policy_reason},
                 'page_processing_profile': self._page_profile(),
                 'document_processing_profile': self._conversion_profile(),
                 "started_at": self.stats.start_time.isoformat(timespec="seconds"),
@@ -4707,36 +5371,28 @@ class AsyncWebCrawler:
                 os.makedirs(reports, exist_ok=True)
                 report_path = os.path.join(reports, self.crawl_session_id + '.json')
             atomic_write_text(report_path,
-                              json.dumps(report, ensure_ascii=False, indent=2))
+                              json.dumps(redact_diagnostic_data(report), ensure_ascii=False, indent=2))
+            if self._publication is None:
+                self._latest_report_path = report_path
         except Exception as e:
             self._export_failed('crawl_report.json', e)
             self._log(f"⚠ Fel vid skapande av crawl_report.json: {e}", LogLevel.ERROR)
 
+    def run_summary(self) -> CrawlSummary:
+        stats = self.stats
+        warning_keys = ('download_failures', 'robots_unreachable', 'conversion_failures',
+                        'short_pages', 'possible_prompt_injection')
+        return CrawlSummary(
+            status=self.delivery_status(),
+            counts=(stats.pages_visited, self.counts['added'], self.counts['updated'],
+                    self.counts['removed'], stats.documents_downloaded, stats.pages_failed),
+            warnings=tuple((key, len(self.report[key])) for key in warning_keys if self.report[key]),
+            fatal_error=redact_diagnostic_urls(self.fatal_error) if self.fatal_error else None,
+            report_path=self._latest_report_path,
+        )
+
     def summary_text(self) -> str:
-        s = self.stats
-        parts = [f"{s.pages_visited} sidor besökta",
-                 f"{self.counts['added']} nya", f"{self.counts['updated']} ändrade",
-                 f"{self.counts['removed']} borttagna",
-                 f"{s.documents_downloaded} dokument", f"{s.pages_failed} sidfel"]
-        label = {'success': 'Lyckad körning', 'partial': 'Partiell körning',
-                 'failed': 'Misslyckad körning'}[self.delivery_status()]
-        text = label + ': ' + ", ".join(parts) + "."
-        warn = []
-        if self.report['download_failures']:
-            warn.append(f"{len(self.report['download_failures'])} dokument kunde inte hämtas")
-        if self.report['robots_unreachable']:
-            warn.append(f"robots.txt kunde inte nås på {len(self.report['robots_unreachable'])} värdar")
-        if self.report["conversion_failures"]:
-            warn.append(f"{len(self.report['conversion_failures'])} dokument gick inte att konvertera")
-        if self.report["short_pages"]:
-            warn.append(f"{len(self.report['short_pages'])} sidor hade för lite text")
-        if self.report["possible_prompt_injection"]:
-            warn.append(f"{len(self.report['possible_prompt_injection'])} sidor kan innehålla prompt-injektion")
-        if self.fatal_error:
-            warn.append(f"FEL: {self.fatal_error}")
-        if warn:
-            text += " Observera: " + "; ".join(warn) + ". Se crawl_report.json."
-        return text
+        return self.run_summary().render('sv', RUN_SUMMARY_TEXTS, include_error_detail=True)
 
     def pause(self):
         if self.state == CrawlerState.RUNNING:
@@ -4755,7 +5411,7 @@ class AsyncWebCrawler:
             self._crawl_loop.call_soon_threadsafe(self._cancel_current_work)
 
     def _cancel_current_work(self):
-        for task in list(self._url_tasks) + self._conversion_tasks:
+        for task in [*self._url_tasks, *self._sitemap_tasks, *self._conversion_tasks]:
             if not task.done() and not task.cancelling():
                 task.cancel()
 
@@ -4768,9 +5424,9 @@ class AsyncWebCrawler:
             with open(path, 'r', encoding='utf-8') as f:
                 cookies = json.load(f)
             if isinstance(cookies, list) and cookies:
-                self.saved_cookies = cookies
-                self._log(f"✓ Läste {len(cookies)} sparade cookies från {path}")
-                return True
+                self.saved_cookies = self._site_cookies(cookies)
+                self._log(f"✓ Läste {len(self.saved_cookies)} sparade cookies från {path}")
+                return bool(self.saved_cookies)
         except Exception as e:
             self._log(f"⚠ Kunde inte läsa cookie-filen {path}: {e}", LogLevel.WARNING)
         return False
@@ -4780,13 +5436,7 @@ class AsyncWebCrawler:
         if not path or not self.saved_cookies:
             return
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump(self.saved_cookies, f)
-            try:
-                os.chmod(path, 0o600)
-            except OSError:
-                pass
+            write_private_json(path, self._site_cookies(self.saved_cookies))
             self._log(f"✓ Sparade sessionscookies i {path} (innehåller inloggningsuppgifter "
                       f"— skydda filen!)", LogLevel.WARNING)
         except Exception as e:
@@ -4888,6 +5538,13 @@ class AsyncWebCrawler:
                          'started_at': self.stats.start_time.isoformat(),
                          'finished_at': datetime.now().isoformat(), 'attempt_generation': publication.generation_id,
                          'export_failures': self.report['export_failures']}
+        attempt_path = os.path.join(self._output_root, 'crawl_report.json')
+
+        def write_attempt_report():
+            atomic_write_text(attempt_path, json.dumps(redact_diagnostic_data(latest_report),
+                                                       ensure_ascii=False, indent=2))
+            self._latest_report_path = attempt_path
+
         try:
             await self.db.close()
             report_path = os.path.join(self.output_dir, 'crawl_report.json')
@@ -4912,7 +5569,8 @@ class AsyncWebCrawler:
                                                      self.config['generation_min_age_hours'])
                     self.report['generation_cleanup'].extend(removed)
                 except Exception as error:
-                    self.report['generation_cleanup_failures'].append({'reason': str(error)[:160]})
+                    self.report['generation_cleanup_failures'].append(
+                        {'reason': redact_diagnostic_urls(str(error))[:160]})
                     self._log(f'⚠ Generationsstädning misslyckades: {error}', LogLevel.WARNING)
             current = publication.current()
             latest_report.update(status=self.delivery_status(), fatal_error=self.fatal_error,
@@ -4924,8 +5582,7 @@ class AsyncWebCrawler:
                                  generation_cleanup_failures_count=len(self.report['generation_cleanup_failures']),
                                  export_failures=self.report['export_failures'][:200],
                                  export_failures_count=len(self.report['export_failures']))
-            atomic_write_text(os.path.join(self._output_root, 'crawl_report.json'),
-                              json.dumps(latest_report, ensure_ascii=False, indent=2))
+            write_attempt_report()
         except Exception as error:
             self._export_failed('publicering', error)
             if latest_report:
@@ -4933,8 +5590,7 @@ class AsyncWebCrawler:
                                      publication_committed=publication.published,
                                      export_failures=self.report['export_failures'][:200],
                                      export_failures_count=len(self.report['export_failures']))
-                atomic_write_text(os.path.join(self._output_root, 'crawl_report.json'),
-                                  json.dumps(latest_report, ensure_ascii=False, indent=2))
+                write_attempt_report()
         finally:
             await blocking_complete(publication.abort)
             self.output_dir = self._output_root
@@ -4958,20 +5614,28 @@ class AsyncWebCrawler:
         finally:
             self.stats.end_time = datetime.now()
             try:
-                await self._generate_report()
-                await self._finish_publication()
+                try:
+                    await self._generate_report()
+                    await self._finish_publication()
+                finally:
+                    await self._shutdown()
+            except asyncio.CancelledError:
+                self.state = CrawlerState.STOPPED
+                raise
+            except Exception as e:
+                self._export_failed('avslut', e)
+                self._log(f"⚠ Fel vid avslut av körningen: {e}", LogLevel.ERROR)
             finally:
-                await self._shutdown()
-            rate = self.stats.pages_per_second
-            self._log(f"Färdig! Total tid: {self.stats.duration} "
-                      f"({rate:.1f} sidor/sek, "
-                      f"{self.stats.pages_not_modified_304} via 304-cache)")
-            summary = self.summary_text()
-            self._log(summary)
-            self._close_log_handlers()
-            if self.msg_queue:
-                self.msg_queue.put(("summary", summary))
-                self.msg_queue.put(("done", "Klar"))
+                rate = self.stats.pages_per_second
+                self._log(f"Färdig! Total tid: {self.stats.duration} "
+                          f"({rate:.1f} sidor/sek, "
+                          f"{self.stats.pages_not_modified_304} via 304-cache)")
+                summary = self.run_summary()
+                self._log(summary.render('sv', RUN_SUMMARY_TEXTS, include_error_detail=True), show_in_gui=False)
+                self._close_log_handlers()
+                if self.msg_queue:
+                    self.msg_queue.put(("summary", summary))
+                    self.msg_queue.put(("done", "Klar"))
 
     async def _shutdown(self):
         await self._close_conversion_queue(cancel=True)
@@ -5001,6 +5665,7 @@ class AsyncWebCrawler:
 
     async def _crawl_inner(self):
         await self.db.connect()
+        await self._migrate_page_url_keys()
         self._initial_page_files = {
             url for url, _, _, _, filename in await self.db.get_all_records()
             if filename and os.path.isfile(os.path.join(self.output_dir, 'texter', os.path.basename(filename)))
@@ -5101,7 +5766,10 @@ class AsyncWebCrawler:
             self.fatal_error = self.fatal_error or f"{type(e).__name__}: {e}"
             self._log(f"💥 Oväntat fel i async crawl: {e}", LogLevel.ERROR)
         finally:
+            self._gui_stats()
             await self._close_conversion_queue(cancel=self.state == CrawlerState.STOPPED)
+            if self.msg_queue and self.state != CrawlerState.STOPPED:
+                self.msg_queue.put(('phase', 'phase_exporting'))
             if self.state == CrawlerState.STOPPED:
                 self._completed_naturally = False
             await self._finalize_page_duplicates()
@@ -5135,7 +5803,7 @@ async def _post_webhook(webhook_url: str, text: str):
                 if resp.status >= 400:
                     print(f"⚠ Webhook svarade HTTP {resp.status}")
     except Exception as e:
-        print(f"⚠ Kunde inte skicka webhook: {e}")
+        print(redact_diagnostic_urls(f"⚠ Kunde inte skicka webhook: {e}"))
 
 
 async def run_cli_mode(config_file: str, webhook_url: Optional[str] = None,
@@ -5165,16 +5833,18 @@ async def run_cli_mode(config_file: str, webhook_url: Optional[str] = None,
         errors, warnings = validate_site_config(site)
         label = site.get("name", f"#{idx}") if isinstance(site, dict) else f"#{idx}"
         for w in warnings:
-            print(f"⚠ {label}: {w}")
+            print(redact_diagnostic_urls(f"⚠ {label}: {w}"))
         if errors:
             for e in errors:
-                print(f"⛔ {label}: {e}")
+                print(redact_diagnostic_urls(f"⛔ {label}: {e}"))
             failures.append(f"{label}: ogiltig konfiguration")
             config_failures.append(f"{label}: ogiltig konfiguration")
             continue
-        folder = slugify(site.get("name", "") or urlparse(site["start_url"]).netloc) or f"sajt-{idx}"
-        if folder in used_folders:          # två sajter får aldrig dela utmapp/cache
-            folder = f"{folder}-{idx}"
+        base_folder = slugify(site.get("name", "") or urlparse(site["start_url"]).netloc) or f"sajt-{idx}"
+        folder, suffix = base_folder, idx
+        while folder in used_folders:
+            folder = f"{base_folder}-{suffix}"
+            suffix += 1
         used_folders.add(folder)
         valid_sites.append((folder, site))
 
@@ -5187,7 +5857,7 @@ async def run_cli_mode(config_file: str, webhook_url: Optional[str] = None,
                 "use_hybrid": site.get("use_hybrid", True),
                 "incremental": site.get("incremental", True),
             }
-            crawler = AsyncWebCrawler(config)
+            crawler = AsyncWebCrawler(config, server_mode=True)
             await crawler.crawl()
             return site.get("name", folder), crawler
 
@@ -5207,7 +5877,7 @@ async def run_cli_mode(config_file: str, webhook_url: Optional[str] = None,
             if c.delivery_status() != 'success':
                 failures.append(f"{name}: {c.fatal_error or c.delivery_status()}")
     summary_lines.extend(f" - {f}" for f in config_failures)
-    summary = "\n".join(summary_lines)
+    summary = redact_diagnostic_urls("\n".join(summary_lines))
     status = "✅ Klart" if not failures else "⚠ Klart med fel"
     print(f"\n{status} på {time.time() - start_time:.1f} sekunder!\n{summary}")
 
@@ -5220,54 +5890,121 @@ async def run_cli_mode(config_file: str, webhook_url: Optional[str] = None,
 #  GRAFISKT GRÄNSSNITT (GUI - CustomTkinter)
 # ─────────────────────────────────────────────────────────────
 class AppGUI:
+    RUN_STATUS_COLORS = {
+        'success': ("#176536", "#75d59b"),
+        'partial': ("#835100", "#ffc46b"),
+        'failed': ("#a51f2b", "#ff8d94"),
+    }
+    STATUS_COLOR = ("#182435", "#eef2f6")
+    WINDOW_SURFACE = ("#f3f6f9", "#1b2026")
+    PANEL_SURFACE = ("#ffffff", "#262b31")
+    PANEL_BORDER = ("#cdd5de", "#414a55")
+    MUTED_TEXT = ("#526174", "#b2bdca")
+    FIELD_SURFACE = ("#f7f9fc", "#2f3741")
+    CONTROL_HOVER = ("#e9f0f7", "#3d4a59")
+    SELECTED_SURFACE = ("#dbeafa", "#354c65")
+    ACCENT = ("#245985", "#2e689a")
+    ACCENT_HOVER = ("#1b486e", "#3877ab")
+    DISABLED_TEXT = ("#687588", "#a0adba")
+    # Fältkanten ska klara 3:1 mot både fältets fyllning och panelytan (WCAG 1.4.11).
+    # PANEL_BORDER är fortfarande en diskret, dekorativ kant runt panelerna.
+    FIELD_BORDER = ("#7b8794", "#7f8b98")
+    TOOLTIP_SURFACE = ("#ffffff", "#2f3741")
+    # Valt läge i flikar och språkval: fyllningen klarar 3:1 mot ovalt läge och texten 4,5:1 mot fyllningen.
+    SEGMENT_SELECTED = ("#245985", "#8cb8e6")
+    SEGMENT_SELECTED_HOVER = ("#1b486e", "#a3c7ec")
+    SEGMENT_SELECTED_TEXT = ("#ffffff", "#10151b")
+    # Fokusramen följer Windows: mörk i ljust läge, ljus i mörkt läge, med luft mot kontrollen.
+    FOCUS_RING = ("#182435", "#eef2f6")
+    FOCUS_RING_WIDTH = 2
+    FOCUS_RING_GAP = 2
+    # Textstorlek ovanpå skärmens skalning (WCAG 1.4.4 som produktmål): 100–200 %.
+    TEXT_SCALES = (1.0, 1.25, 1.5, 1.75, 2.0)
+    # Plats för panelrubriker, tabellhuvud och minst en rad i varje panel.
+    MIN_TABLE_HEIGHT = 100
+    MIN_LOG_HEIGHT = 76
+    SASH_HEIGHT = 8
+    CONTENT_PAD_X = 12
+    RESULTS_HEIGHT_WHEN_SCROLLING = 300
+
+    # Gemensamma textroller i logiska pixlar vid 100 % (se DESIGNPLAN-WCAG.md, del 1).
+    # Alla fonter i fönstret hämtas härifrån: CustomTkinter, ttk-tabellen och Tk-etiketter.
+    UI_FONT_FAMILY = "Segoe UI"
+    TEXT_ROLES = {
+        # 14 fet valdes efter fönsterprov: 20 fet lämnade ingen plats åt tabell och logg vid 720 × 450.
+        # Panelrubriken skiljs från kolumnrubrikerna genom placering och yta (grått rubrikband).
+        "panel_title": (14, "bold"),      # Resultat, Körningslogg
+        "body": (14, "normal"),           # etiketter, värden, knappar, celler, logg, hjälp
+        "body_strong": (14, "bold"),      # Startadress, primär åtgärd, körstatus
+        "column_heading": (14, "bold"),   # Sidtitel, Status, URL
+        "meta": (12, "normal"),           # sekundära detaljer
+    }
+    # Tabellens kolumnbredder i logiska pixlar vid 100 %.
+    TREE_COLUMN_WIDTHS = {"URL": 390, "Status": 190, "Titel": 240}
+
+    @staticmethod
+    def choose_ui_font_family(available, preferred: str, fallback: str) -> str:
+        """Välj gemensam font: Segoe UI på Windows, annars CustomTkinters medföljande reservfont."""
+        return preferred if preferred in available else fallback
+
     def __init__(self, root: ctk.CTk):
         self.root = root
         self.lang = "sv"
         self.texts = {
             "status_login_required": {"sv": "Inloggning krävs", "en": "Login required"},
-            "run_success": {"sv": "Lyckad körning", "en": "Successful run"},
-            "run_partial": {"sv": "Partiell körning", "en": "Partial run"},
-            "run_failed": {"sv": "Misslyckad körning", "en": "Failed run"},
+            "run_summary": RUN_SUMMARY_TEXTS,
             "window_title": {"sv": f"Webbdammsugare Pro (v{VERSION})", "en": f"Web Crawler Pro (v{VERSION})"},
-            "tab_basic": {"sv": "⚙️ Grundinställningar", "en": "⚙️ Basic Settings"},
-            "tab_adv": {"sv": "🔧 Avancerat", "en": "🔧 Advanced"},
-            "lbl_url": {"sv": "🌐 Startadress:", "en": "🌐 Start URL:"},
-            "btn_help": {"sv": "❓ Hjälp", "en": "❓ Help"},
+            "tab_basic": {"sv": "Grundinställningar", "en": "Basic settings"},
+            "tab_adv": {"sv": "Avancerat", "en": "Advanced"},
+            "lbl_url": {"sv": "Startadress", "en": "Start URL"},
+            "btn_help": {"sv": "Hjälp", "en": "Help"},
+            "dark_mode": {"sv": "Mörkt läge", "en": "Dark mode"},
             "lbl_delay": {"sv": "Fördröjning (sek):", "en": "Delay (sec):"},
             "lbl_max_pages": {"sv": "Max sidor (0=Oändligt):", "en": "Max pages (0=Infinite):"},
             "lbl_max_depth": {"sv": "Max djup (0=Oändligt):", "en": "Max depth (0=Infinite):"},
             "lbl_format": {"sv": "Filformat:", "en": "File Format:"},
             "lbl_concurrency": {"sv": "Samtidighet:", "en": "Concurrency:"},
             "cb_docs": {"sv": "Ladda ner dokument (PDF m.m.)", "en": "Download documents (PDF etc.)"},
-            "cb_convert_docs": {"sv": "📄 Konvertera dokument till Markdown", "en": "📄 Convert documents to Markdown"},
+            "cb_convert_docs": {"sv": "Konvertera dokument till Markdown", "en": "Convert documents to Markdown"},
             "lbl_mode": {"sv": "Körläge:", "en": "Run Mode:"},
-            "lbl_folder": {"sv": "Spara Mapp:", "en": "Save Folder:"},
-            "btn_folder": {"sv": "Välj Mapp...", "en": "Browse..."},
-            "cb_hybrid": {"sv": "⚡ Hybrid-motor (Requests + Playwright)", "en": "⚡ Hybrid Engine (Requests + Playwright)"},
-            "cb_traf": {"sv": "🧠 Använd Trafilatura för text", "en": "🧠 Use Trafilatura for text extraction"},
+            "lbl_folder": {"sv": "Spara i mapp:", "en": "Save folder:"},
+            "btn_folder": {"sv": "Välj mapp…", "en": "Browse…"},
+            "cb_hybrid": {"sv": "Hybridmotor", "en": "Hybrid engine"},
+            "cb_traf": {"sv": "Trafilatura för text", "en": "Trafilatura for text"},
             "cb_sitemap": {"sv": "Läs Sitemap.xml", "en": "Parse Sitemap.xml"},
             "cb_robots": {"sv": "Respektera robots.txt", "en": "Respect robots.txt"},
             "cb_strict": {"sv": "Strikt Domän", "en": "Strict Domain"},
             "lbl_exclude": {"sv": "Uteslut ord i URL:", "en": "Exclude words in URL:"},
             "lbl_require": {"sv": "Kräv ord i URL (något av):", "en": "Require words in URL (any of):"},
-            "cb_rm_email": {"sv": "Radera E-post", "en": "Remove Email"},
-            "cb_rm_phone": {"sv": "Radera Telefonnummer", "en": "Remove Phone Numbers"},
-            "cb_rm_pnr": {"sv": "Radera Personnummer", "en": "Remove Swedish SSN"},
-            "cb_rm_ip": {"sv": "Radera IP-adresser", "en": "Remove IP Addresses"},
+            "cb_rm_email": {"sv": "Maskera e-post", "en": "Mask email"},
+            "cb_rm_phone": {"sv": "Maskera telefon", "en": "Mask phone"},
+            "cb_rm_pnr": {"sv": "Maskera personnummer", "en": "Mask Swedish SSN"},
+            "cb_rm_ip": {"sv": "Maskera IP-adresser", "en": "Mask IP addresses"},
             "cb_full": {"sv": "Full omcrawl (ignorera cache)", "en": "Full re-crawl (ignore cache)"},
             "lbl_lang_filter": {"sv": "Bara språk (t.ex. sv, en):", "en": "Only languages (e.g. sv, en):"},
-            "btn_open": {"sv": "📂 Öppna mapp", "en": "📂 Open folder"},
+            "btn_open": {"sv": "Öppna mapp", "en": "Open folder"},
+            "menu_open_page": {"sv": "Öppna sidan i webbläsaren", "en": "Open page in browser"},
+            "menu_copy_url": {"sv": "Kopiera adress", "en": "Copy address"},
+            "menu_copy": {"sv": "Kopiera", "en": "Copy"},
+            "menu_select_all": {"sv": "Markera allt", "en": "Select all"},
+            "btn_report": {"sv": "Öppna rapport", "en": "Open report"},
+            "report_missing": {"sv": "Körningsrapporten finns inte längre.",
+                               "en": "The run report is no longer available."},
+            "report_open_error": {"sv": "Kunde inte öppna rapporten. {0}",
+                                  "en": "Could not open the report. {0}"},
             "err_title": {"sv": "Ogiltigt värde", "en": "Invalid value"},
             "err_url": {"sv": "Ange en giltig startadress, t.ex. https://www.kommunen.se",
                         "en": "Enter a valid start URL, e.g. https://www.example.com"},
-            "err_num": {"sv": ("Kontrollera att Fördröjning, Max sidor, Max djup och Samtidighet "
-                               "är giltiga tal (använd punkt som decimalavgränsare)."),
-                        "en": ("Please check that Delay, Max pages, Max depth and Concurrency "
-                               "are valid numbers (use dot as decimal separator).")},
-            "err_range": {"sv": ("Fördröjning måste vara minst 0.1 s, Samtidighet mellan 1 och 50, "
-                                 "och Max sidor/djup får inte vara negativa."),
-                          "en": ("Delay must be at least 0.1 s, Concurrency between 1 and 50, "
-                                 "and Max pages/depth cannot be negative.")},
+            # Ett meddelande per fält, så att felet pekar ut fältet och vad som är tillåtet.
+            "err_delay": {"sv": ("Fördröjning (sek) måste vara ett tal som är minst 0,1, till exempel 0,5. "
+                                 "Både komma och punkt fungerar som decimaltecken."),
+                          "en": "Delay (sec) must be a number of at least 0.1, for example 0.5."},
+            "err_max_pages": {"sv": "Max sidor måste vara ett heltal som är 0 eller större. 0 betyder obegränsat.",
+                              "en": "Max pages must be a whole number, 0 or greater. 0 means unlimited."},
+            "err_max_depth": {"sv": "Max djup måste vara ett heltal som är 0 eller större. 0 betyder obegränsat.",
+                              "en": "Max depth must be a whole number, 0 or greater. 0 means unlimited."},
+            "err_concurrency": {"sv": "Samtidighet måste vara ett heltal mellan 1 och 50, till exempel 10.",
+                                "en": "Concurrency must be a whole number from 1 to 50, for example 10."},
             "err_start": {"sv": "Kunde inte starta crawlen:", "en": "Could not start the crawl:"},
             "login_msg": {"sv": ("Logga in i webbläsarfönstret som öppnats. Kontrollera att du "
                                  "ser intranätets startsida och klicka sedan OK här.\n\n"
@@ -5298,19 +6035,54 @@ class AppGUI:
                             "en": "Comma-separated words. Only URLs containing at least one of them are visited."},
             },
             "btn_start": {"sv": "▶ Starta", "en": "▶ Start"},
-            "btn_pause": {"sv": "⏸ Pausa", "en": "⏸ Pause"},
-            "lbl_template": {"sv": "📋 Mall:", "en": "📋 Template:"},
+            "btn_pause": {"sv": "Pausa", "en": "Pause"},
+            "lbl_template": {"sv": "Mall", "en": "Template"},
             "template_none": {"sv": "— Ingen mall —", "en": "— No template —"},
             "template_loaded": {"sv": "✓ Mall laddad: {}", "en": "✓ Template loaded: {}"},
             "template_not_found": {"sv": "Ingen sites.json hittades", "en": "No sites.json found"},
-            "btn_resume": {"sv": "▶ Fortsätt", "en": "▶ Resume"},
-            "btn_stop": {"sv": "■ Stoppa", "en": "■ Stop"},
+            "template_detached": {
+                "sv": "Startadressen har bytt origin; mallens avancerade inställningar har kopplats bort.",
+                "en": "The start URL changed origin; advanced template settings have been detached."},
+            "browser_page_limit": {
+                "sv": "Sidans storleksgräns överskreds i webbläsaren",
+                "en": "The browser page exceeded the size limit"},
+            "browser_dom_limit": {
+                "sv": "Sidans DOM överskred storleksgränsen",
+                "en": "The page DOM exceeded the size limit"},
+            "private_network_explicit": {
+                "sv": "⚠ Privata nätverksmål tillåts enligt konfigurationen",
+                "en": "⚠ Private network targets are allowed by configuration"},
+            "private_network_automatic": {
+                "sv": "⚠ Automatiskt intranätläge aktiverat. Privata nätverksmål tillåts",
+                "en": "⚠ Automatic intranet mode enabled. Private network targets are allowed"},
+            "btn_resume": {"sv": "Fortsätt", "en": "Resume"},
+            "btn_stop": {"sv": "Stoppa", "en": "Stop"},
             "col_status": {"sv": "Status", "en": "Status"},
-            "col_title": {"sv": "Sido-titel", "en": "Page Title"},
-            "status_wait": {"sv": "Väntar på start...", "en": "Waiting to start..."},
+            "col_title": {"sv": "Sidtitel", "en": "Page title"},
+            "results_title": {"sv": "Resultat", "en": "Results"},
+            "results_empty": {"sv": "Inga sidor eller dokument att visa.", "en": "No pages or documents to display."},
+            "log_title": {"sv": "Körningslogg", "en": "Run log"},
+            "log_empty": {"sv": "Här visas händelser och fel under körningen.",
+                          "en": "Run events and errors appear here."},
+            "status_wait": {"sv": "Redo att starta", "en": "Ready to start"},
+            "status_starting": {"sv": "Startar körningen…", "en": "Starting the run…"},
             "stats_fmt": {
-                "sv": "Besökta: {} | Sidor: {} | Dokument: {} | Cachade: {} | I Kö: {} | Fel: {} | Tid kvar: {}",
-                "en": "Visited: {} | Pages: {} | Docs: {} | Cached: {} | Queued: {} | Errors: {} | ETA: {}"
+                "sv": "Besökta: {} | Sidor: {} | Dokument: {} | Cachade: {}\nI kö/aktiva: {} | Fel: {} | Konverteras/väntar: {} | Tid kvar: {}",
+                "en": "Visited: {} | Pages: {} | Docs: {} | Cached: {}\nQueued/active: {} | Errors: {} | Converting/waiting: {} | ETA: {}"
+            },
+            'phase_exporting': {'sv': 'Förbereder leveransen…', 'en': 'Preparing the delivery…'},
+            'phase_stopping': {'sv': 'Stoppar och slutför rapporten…', 'en': 'Stopping and finalizing the report…'},
+            'confirm_close': {'sv': 'Vill du stoppa den pågående körningen och stänga när den har avslutats?',
+                              'en': 'Stop the active run and close when it has finished?'},
+            'confirm_unbounded': {'sv': 'Körningen kan följa länkar till andra domäner utan sid- eller djupgräns. Vill du starta?',
+                                  'en': 'This run can follow links to other domains without page or depth limits. Start the run?'},
+            'eta_texts': {'Beräknar...': 'Calculating…', 'Klar snart': 'Finishing soon'},
+            'table_status_en': {
+                'Hämtad (Standard)': 'Fetched (HTTP)', 'Hämtad (Webbläsare)': 'Fetched (browser)',
+                'Oförändrad': 'Unchanged', 'Ej ändrad': 'Not modified', 'Borttagen': 'Removed',
+                'Hittades inte': 'Not found', 'Fel': 'Error', 'Ingen titel': 'No title',
+                'Blockerad av sajten': 'Blocked by site', 'Hoppar över språk': 'Skipping language',
+                'Session utgången': 'Session expired', 'Duplikat': 'Duplicate',
             },
             "help_title": {"sv": "❓ Hjälp & Instruktioner", "en": "❓ Help & Instructions"},
             "run_modes": {
@@ -5323,7 +6095,7 @@ class AppGUI:
                        "* Startadress: URL där programmet börjar leta.\n"
                        "* Fördröjning: Tid mellan sidbesök (per domän).\n"
                        "* Max sidor/djup: 0 betyder oändligt.\n"
-                       "* Samtidighet: antal parallella sidor (default 10).\n"
+                       "* Samtidighet: antal parallella sidor (standard 10). Fördröjningen begränsar hur ofta nästa anrop kan starta per domän.\n"
                        "* Körläge:\n"
                        "  - Standard: för sajter utan inloggning.\n"
                        "  - Logga in först: ett fönster öppnas där du loggar in, sedan körs allt automatiskt.\n"
@@ -5344,15 +6116,17 @@ class AppGUI:
                        "Vid omkörning hämtas bara nytt/ändrat; borttagna sidor (404/410) raderas.\n"
                        "Kryssa i 'Full omcrawl' för att ignorera cachen.\n"
                        "Efter varje körning skrivs changes.jsonl (nytt/ändrat/borttaget) och\n"
-                       "crawl_report.json (luckor, fel och varningar) i utmappen.\n\n"
+                       "crawl_report.json (luckor, fel och varningar) i utmappen.\n"
+                       "Använd 'Öppna rapport' vid slutstatusen för att öppna körningsrapporten.\n"
+                       "För en sammanhängande leverans, läs current.json en gång och använd den angivna generationen.\n\n"
                        "📋 DOKUMENT-MANIFEST\n-------------------------\n"
-                       "När du laddar ner dokument (PDF m.m.) skapas också en manifest.json\n"
+                       "När du laddar ner dokument (PDF m.m.) skapas också manifest_<domän>.json\n"
                        "i utmappen som listar varje dokument tillsammans med vilken intranät-\n"
                        "sida som hade länken till det.\n\n"
                        "📄 DOKUMENT → MARKDOWN\n-------------------------\n"
                        "Kryssa i 'Konvertera dokument till Markdown' så extraheras texten\n"
                        "ur PDF, Word, Excel och PowerPoint och sparas som .md-filer med\n"
-                       "intranät-URL:en i toppen. Perfekt för RAG-system som Svea där\n"
+                       "intranät-URL:en i toppen. Perfekt för RAG-system där\n"
                        "AI:n behöver se källan direkt i texten för att citera rätt.\n"
                        "Kräver: pip install PyMuPDF python-docx openpyxl python-pptx\n\n"
                        "💻 SERVER-LÄGE\n-------------------------\n"
@@ -5362,7 +6136,7 @@ class AppGUI:
                 "en": ("⚙️ BASIC SETTINGS\n-------------------------\n"
                        "* Start URL: Where the crawler begins.\n"
                        "* Delay: Seconds to wait between requests (per domain).\n"
-                       "* Concurrency: number of parallel pages (default 10).\n"
+                       "* Concurrency: number of parallel pages (default 10). The delay limits how often requests can start per domain.\n"
                        "* Run Mode:\n"
                        "  - Standard: for sites without login.\n"
                        "  - Log in first: a window opens for you to log in, then everything runs automatically.\n"
@@ -5379,10 +6153,11 @@ class AppGUI:
                        "* PII Wash: Removes personal data before saving.\n\n"
                        "♻️ INCREMENTAL CRAWL\n-------------------------\n"
                        "ETag, Last-Modified and links are cached per URL.\n"
-                       "On re-runs, the server responds '304 Not Modified' for unchanged pages\n"
-                       "— often 10-50x faster than the first crawl.\n\n"
+                       "On re-runs, servers that support validators can respond '304 Not Modified'.\n"
+                       "Use 'Open report' after a run to open its report.\n"
+                       "For a consistent delivery, read current.json once and use the generation it names.\n\n"
                        "📋 DOCUMENT MANIFEST\n-------------------------\n"
-                       "When documents (PDFs etc.) are downloaded, a manifest.json is also\n"
+                       "When documents (PDFs etc.) are downloaded, manifest_<domain>.json is also\n"
                        "created in the output folder.\n\n"
                        "📄 DOCUMENTS → MARKDOWN\n-------------------------\n"
                        "Check 'Convert documents to Markdown' to extract text from PDF,\n"
@@ -5399,15 +6174,25 @@ class AppGUI:
         self.root.title(self.texts["window_title"][self.lang])
         # Anpassa fönstret efter skärmen (bärbara med 1366×768 eller hög skalning)
         screen_w, screen_h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        width = min(1000, max(760, screen_w - 40))
-        height = min(880, max(560, screen_h - 100))
-        self.root.geometry(f"{width}x{height}+{max(0, (screen_w - width) // 2)}+{max(0, (screen_h - height) // 3)}")
-        self.root.minsize(760, 560)
+        scale = self.root._get_window_scaling()
+        width = min(1000, max(720, int((screen_w - 40) / scale)))
+        height = min(880, max(450, int((screen_h - 75) / scale)))
+        x = max(0, (screen_w - round(width * scale)) // 2)
+        y = max(0, (screen_h - round(height * scale)) // 3)
+        self.root.geometry(f'{width}x{height}+{x}+{y}')
+        self.root.minsize(720, 450)
         self.msg_queue = queue.Queue()
         self.crawler_instance: Optional[AsyncWebCrawler] = None
         self.crawl_thread: Optional[threading.Thread] = None
+        self._last_summary: Optional[CrawlSummary] = None
+        self._closing = False
         self._tooltip_win = None
-        self._update_treeview_style("Light")
+        self._tooltip_keys = {}
+        self.text_scale = 1.0
+        self._scroll_update_pending = False
+        self._scale_focus_job = None
+        self._compact = False
+        self._stats_wrap = None
         self._build_ui()
         self._load_settings()
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
@@ -5417,7 +6202,9 @@ class AppGUI:
     SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".ultimate_web_crawler_settings.json")
 
     def _collect_settings(self) -> Dict:
+        self._template_options_for(self.url_entry.get().strip())
         return {
+            "template": getattr(self, '_template_choice', None),
             "lang": self.lang,
             "theme": "Dark" if self.theme_switch.get() == 1 else "Light",
             "url": self.url_entry.get().strip(),
@@ -5444,6 +6231,8 @@ class AppGUI:
             "rm_phone": self.rm_phone_var.get(),
             "rm_pnr": self.rm_pnr_var.get(),
             "rm_ip": self.rm_ip_var.get(),
+            # getattr: en ofullständigt byggd GUI får aldrig hindra att övriga inställningar sparas.
+            "text_scale": getattr(self, "text_scale", 1.0),
         }
 
     def _save_settings(self):
@@ -5461,6 +6250,13 @@ class AppGUI:
             return
         if not isinstance(st, dict):
             return
+
+        choice = st.get('template')
+        site = getattr(self, 'templates', {}).get(choice) if isinstance(choice, str) else None
+        if site and self._same_template_origin(st.get('url', ''), site.get('start_url', '')):
+            self._apply_template(choice)
+            if getattr(self, 'template_var', None) is not None:
+                self.template_var.set(choice)
 
         def set_entry(entry, key):
             if key in st and isinstance(st[key], (str, int, float)):
@@ -5485,8 +6281,10 @@ class AppGUI:
                 var.set(st[key])
         if not HAS_TRAFILATURA:
             self.traf_var.set(False)
-        if st.get("format") in (".json", ".md", ".txt"):
-            self.format_var.set(st["format"])
+        if st.get("format") in (".json", ".md", ".txt", "Ingen text", "No text"):
+            value = st['format']
+            self.format_var.set(('Ingen text' if self.lang == 'sv' else 'No text')
+                                if value in ('Ingen text', 'No text') else value)
         if st.get("mode") in self.texts["run_modes"]:
             self.headless_var.set(self.texts["run_modes"][st["mode"]][self.lang])
         if isinstance(st.get("dir"), str) and st["dir"]:
@@ -5495,25 +6293,345 @@ class AppGUI:
             self.theme_switch.select()
             self.change_appearance_mode_event()
         if st.get("lang") == "en":
-            self.lang_var.set("🇬🇧 EN")
-            self.change_language_event("🇬🇧 EN")
+            self.lang_var.set("EN")
+            self.change_language_event("EN")
+        scale = st.get("text_scale")
+        if (isinstance(scale, (int, float)) and not isinstance(scale, bool) and scale in self.TEXT_SCALES
+                and scale != getattr(self, "text_scale", 1.0) and hasattr(self, "text_size_menu")):
+            self._apply_text_scale(float(scale))
+
+    # ─── Typografi och skalning ─────────────────────────────
+    def _setup_typography(self):
+        """Välj gemensam font innan första kontrollen skapas och koppla ttk till samma skalning."""
+        family = self.choose_ui_font_family(
+            set(tkfont.families(self.root)), self.UI_FONT_FAMILY, CTK_THEME_FONT["family"])
+        size, weight = self.TEXT_ROLES["body"]
+        # CustomTkinter-kontroller utan uttrycklig font använder temats standardfont.
+        ctk.ThemeManager.theme["CTkFont"].update(family=family, size=size, weight=weight)
+        self.ui_font_family = family
+        self.fonts = {role: ctk.CTkFont(family=family, size=role_size, weight=role_weight)
+                      for role, (role_size, role_weight) in self.TEXT_ROLES.items()}
+        # CustomTkinter skalar bara sina egna kontroller. ttk-tabellen och Tk-etiketter får
+        # namngivna fonter i pixlar som räknas om från samma faktor som CustomTkinters text.
+        self._ui_scale = ctk.ScalingTracker.get_widget_scaling(self.root)
+        self.tk_fonts = {
+            role: tkfont.Font(root=self.root, family=family,
+                              size=-round(role_size * self._ui_scale), weight=role_weight)
+            for role, (role_size, role_weight) in self.TEXT_ROLES.items()
+        }
+        # Anropas vid DPI-byte (t.ex. flytt till en annan skärm) och vid ändrad textstorlek.
+        ctk.ScalingTracker.add_widget(self._on_ui_scaling, self.root)
+
+    def _on_ui_scaling(self, widget_scaling, _window_scaling):
+        """Räkna om tabellens fonter, radhöjd, kolumnbredder och delare efter ny skalning."""
+        old_scale, self._ui_scale = self._ui_scale, widget_scaling
+        try:
+            for role, font in self.tk_fonts.items():
+                font.configure(size=-round(self.TEXT_ROLES[role][0] * widget_scaling))
+            self._update_treeview_style(ctk.get_appearance_mode())
+            tree = getattr(self, "tree", None)
+            if tree is not None and old_scale != widget_scaling:
+                for column in self.TREE_COLUMN_WIDTHS:
+                    # Behåll användarens egen kolumnbredd, räknad i logiska pixlar.
+                    logical_width = tree.column(column, "width") / old_scale
+                    tree.column(column, width=round(logical_width * widget_scaling))
+            if getattr(self, "_focus_ring_target", None) is not None:
+                self._show_focus_ring(self._focus_ring_target)
+            if getattr(self, "_scroll_canvas", None) is not None:
+                self._schedule_scroll_update()
+                if old_scale != widget_scaling:
+                    # Vänta tills Tk har placerat om kontrollerna och rullningslisterna.
+                    if self._scale_focus_job is not None:
+                        self.root.after_cancel(self._scale_focus_job)
+                    self._scale_focus_job = self.root.after(40, self._restore_focus_after_scaling)
+        except tk.TclError:
+            pass  # fönstret håller på att stängas
+
+    # ─── Tangentbord och fokus ──────────────────────────────
+    def _setup_keyboard(self):
+        """Gör reglagen nåbara med Tab, användbara med tangentbordet och synligt fokuserade."""
+        # Tk-kontrollen som får fokus (sökväg) -> kontrollen som får fokusramen.
+        self._focus_targets = {}
+        self._focus_ring_target = None
+        # Fyra smala ramar ovanpå fönstret ritar fokusramen utan att flytta layouten.
+        self._focus_ring = [tk.Frame(self.root, borderwidth=0, highlightthickness=0, takefocus=0)
+                            for _ in range(4)]
+
+        buttons = (self.help_btn, self.btn_folder, self.start_btn, self.pause_btn, self.stop_btn,
+                   self.open_btn, self.report_btn)
+        for button in buttons:
+            self._make_focusable(button, activate=button.invoke)
+        for checkbox in (self.cb_docs, self.cb_convert_docs, self.cb_hybrid, self.cb_traf, self.cb_sitemap,
+                         self.cb_robots, self.cb_strict, self.cb_full, self.cb_rm_email, self.cb_rm_phone,
+                         self.cb_rm_pnr, self.cb_rm_ip, self.theme_switch):
+            self._make_focusable(checkbox, activate=checkbox.toggle)
+        for menu in (getattr(self, "template_menu", None), self.text_size_menu, self.format_menu,
+                     self.headless_menu):
+            if menu is not None:
+                self._make_focusable(menu, activate=menu._open_dropdown_menu,
+                                     step=lambda direction, m=menu: self._step_option_menu(m, direction))
+        for segmented in (self.tabview._segmented_button, self.lang_switch):
+            self._make_focusable(segmented, step=lambda direction, s=segmented: self._step_segmented(s, direction))
+            self._mark_selected_segment(segmented)
+
+        # Textstorlek med Ctrl+Plus, Ctrl+Minus och Ctrl+0, som i webbläsare.
+        for key in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
+            tk.Misc.bind_all(self.root, key, lambda _event: self._step_text_scale(1), add="+")
+        for key in ("<Control-minus>", "<Control-KP_Subtract>"):
+            tk.Misc.bind_all(self.root, key, lambda _event: self._step_text_scale(-1), add="+")
+        for key in ("<Control-Key-0>", "<Control-KP_0>"):
+            tk.Misc.bind_all(self.root, key, lambda _event: (self._apply_text_scale(1.0), "break")[1], add="+")
+
+        # Fält, tabell och logg tar redan fokus i Tk. De registreras bara för fokusramen.
+        for entry in (self.url_entry, self.delay_entry, self.max_pages_entry, self.max_depth_entry,
+                      self.concurrency_entry, self.dir_entry, self.exclude_entry, self.require_entry,
+                      self.lang_filter_entry):
+            self._focus_targets[str(entry._entry)] = entry
+        self._focus_targets[str(self.tree)] = self.tree
+        self._focus_targets[str(self.log_area._textbox)] = self.log_area
+
+        # Tabbordningen följer staplingsordningen: ställ den i samma ordning som fönstret läses.
+        # Full omcrawl skapas efter fälten men står överst till höger på fliken Avancerat.
+        self.cb_full.lift(self.cb_traf)
+
+        tk.Misc.bind_all(self.root, "<FocusIn>", self._on_focus_in, add="+")
+        tk.Misc.bind_all(self.root, "<FocusOut>", self._on_focus_out, add="+")
+        tk.Misc.bind_all(self.root, "<Escape>", lambda _event: self._hide_tooltip(), add="+")
+
+    def _make_focusable(self, widget, activate=None, step=None):
+        """Ge ett CustomTkinter-reglage plats i tabbordningen och tangentbindningar."""
+        def can_take_focus(_path):
+            # Ett svar från funktionen ersätter Tk:s egen kontroll, så dolda flikar måste uteslutas här.
+            try:
+                if not widget.winfo_viewable():
+                    return 0
+            except tk.TclError:
+                return 0
+            try:
+                return 0 if widget.cget("state") == "disabled" else 1
+            except (tk.TclError, ValueError):
+                return 1  # reglaget saknar inställningen state och är alltid aktivt
+        # CustomTkinter-reglagen är ramar. Bindningarna läggs på själva ramen, som får fokus.
+        tk.Frame.configure(widget, takefocus=can_take_focus)
+        self._focus_targets[str(widget)] = widget
+        if activate is not None:
+            for key in ("<space>", "<Return>", "<KP_Enter>"):
+                tk.Misc.bind(widget, key, lambda _event: (activate(), "break")[1])
+        if step is not None:
+            for key, direction in (("<Left>", -1), ("<Up>", -1), ("<Right>", 1), ("<Down>", 1)):
+                tk.Misc.bind(widget, key, lambda _event, d=direction: (step(d), "break")[1])
+            # Alt+Pil ned öppnar en lista, som i Windows.
+            if activate is not None:
+                tk.Misc.bind(widget, "<Alt-Down>", lambda _event: (activate(), "break")[1])
+
+    @staticmethod
+    def _neighbour(values, current, direction):
+        index = values.index(current) if current in values else 0
+        return values[max(0, min(len(values) - 1, index + direction))]
+
+    def _step_option_menu(self, menu, direction):
+        values = list(menu.cget("values"))
+        new = self._neighbour(values, menu.get(), direction)
+        if values and new != menu.get():
+            # Samma väg som ett val i listan, så att eventuell callback också körs.
+            menu._dropdown_callback(new)
+
+    def _step_segmented(self, segmented, direction):
+        values = list(segmented.cget("values"))
+        new = self._neighbour(values, segmented.get(), direction)
+        if values and new != segmented.get():
+            segmented.set(new, from_button_callback=True)
+
+    def _mark_selected_segment(self, segmented):
+        """Valt läge får egen textfärg mot den starkare fyllningen (WCAG 1.4.11)."""
+        select, unselect = segmented._select_button_by_value, segmented._unselect_button_by_value
+
+        def selected(value):
+            select(value)
+            segmented._buttons_dict[value].configure(text_color=self.SEGMENT_SELECTED_TEXT)
+
+        def unselected(value):
+            unselect(value)
+            if value in segmented._buttons_dict:
+                segmented._buttons_dict[value].configure(text_color=self.STATUS_COLOR)
+
+        segmented._select_button_by_value = selected
+        segmented._unselect_button_by_value = unselected
+        if segmented.get() in segmented._buttons_dict:
+            selected(segmented.get())
+
+    def _on_focus_in(self, event):
+        target = self._focus_targets.get(str(event.widget))
+        if target is None:
+            return
+        self._scroll_into_view(target)
+        self._show_focus_ring(target)
+        key = self._tooltip_keys.get(target)
+        if key is not None:
+            # Hjälp som visas vid hovring ska också nås från tangentbordet.
+            self._show_tooltip(target, key)
+
+    def _on_focus_out(self, event):
+        target = self._focus_targets.get(str(event.widget))
+        if target is not None and target is self._focus_ring_target:
+            self._hide_focus_ring()
+            if self._tooltip_keys.get(target) is not None:
+                self._hide_tooltip()
+
+    def _show_focus_ring(self, target):
+        dark = ctk.get_appearance_mode() == "Dark"
+        width = max(1, round(self.FOCUS_RING_WIDTH * self._ui_scale))
+        offset = round(self.FOCUS_RING_GAP * self._ui_scale) + width
+        top, bottom, left, right = self._focus_ring
+        try:
+            for part in self._focus_ring:
+                part.configure(background=self.FOCUS_RING[dark])
+            top.place(in_=target, x=-offset, y=-offset, relwidth=1, width=2 * offset, height=width)
+            bottom.place(in_=target, x=-offset, rely=1, y=offset - width, relwidth=1, width=2 * offset,
+                         height=width)
+            left.place(in_=target, x=-offset, y=-offset, relheight=1, height=2 * offset, width=width)
+            right.place(in_=target, relx=1, x=offset - width, y=-offset, relheight=1, height=2 * offset,
+                        width=width)
+            for part in self._focus_ring:
+                part.lift()
+        except tk.TclError:
+            return
+        self._focus_ring_target = target
+
+    def _hide_focus_ring(self):
+        for part in getattr(self, "_focus_ring", ()):
+            part.place_forget()
+        self._focus_ring_target = None
+
+    def _selected_result_url(self) -> Optional[str]:
+        selection = self.tree.selection()
+        if not selection:
+            return None
+        url = str(self.tree.item(selection[0])['values'][0])
+        return url if url.startswith("http") else None
+
+    def _open_selected_result(self):
+        url = self._selected_result_url()
+        if url:
+            webbrowser.open(url)
+        return "break"
+
+    def _copy_selected_result_url(self):
+        url = self._selected_result_url()
+        if url:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(url)
+        return "break"
+
+    def _focus_first_result(self):
+        """Ge tabellen en aktuell rad när den får fokus, så att piltangenterna fungerar direkt."""
+        rows = self.tree.get_children()
+        if rows and not self.tree.focus():
+            self.tree.focus(rows[0])
+            if not self.tree.selection():
+                self.tree.selection_set(rows[0])
+
+    # ─── Snabbmenyer ────────────────────────────────────────
+    def _build_context_menus(self):
+        """Snabbmenyer för resultat och logg: högerklick, Menytangenten eller Skift+F10, som i Windows.
+        De innehåller samma åtgärder som tangenterna, så att åtgärderna också syns."""
+        self.result_menu = tk.Menu(self.root, tearoff=0)
+        self.result_menu.add_command(command=self._open_selected_result, accelerator="Enter")
+        self.result_menu.add_command(command=self._copy_selected_result_url, accelerator="Ctrl+C")
+        self.log_menu = tk.Menu(self.root, tearoff=0)
+        self.log_menu.add_command(command=self._copy_log_selection, accelerator="Ctrl+C")
+        self.log_menu.add_command(command=self._select_all_log, accelerator="Ctrl+A")
+        self._label_context_menus()
+        text = self.log_area._textbox
+        self.tree.bind("<Button-3>", self._show_result_menu_at_pointer)
+        text.bind("<Button-3>", lambda event: self._show_log_menu(event.x_root, event.y_root))
+        for key in ("<Shift-F10>", "<App>"):
+            self.tree.bind(key, lambda _event: self._show_result_menu_at_row())
+            text.bind(key, lambda _event: self._show_log_menu_at_cursor())
+        for key in ("<Control-a>", "<Control-A>"):
+            text.bind(key, lambda _event: self._select_all_log())
+
+    def _label_context_menus(self):
+        for menu, keys in ((self.result_menu, ("menu_open_page", "menu_copy_url")),
+                           (self.log_menu, ("menu_copy", "menu_select_all"))):
+            for index, key in enumerate(keys):
+                menu.entryconfigure(index, label=self.texts[key][self.lang])
+
+    def _popup(self, menu, x, y):
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    def _show_result_menu(self, x, y):
+        state = "normal" if self._selected_result_url() else "disabled"
+        for index in (0, 1):
+            self.result_menu.entryconfigure(index, state=state)
+        return self._popup(self.result_menu, x, y)
+
+    def _show_result_menu_at_pointer(self, event):
+        # Högerklick väljer raden under pekaren först, som i Utforskaren.
+        row = self.tree.identify_row(event.y)
+        if row:
+            self.tree.selection_set(row)
+            self.tree.focus(row)
+        return self._show_result_menu(event.x_root, event.y_root)
+
+    def _show_result_menu_at_row(self):
+        row = self.tree.focus() or next(iter(self.tree.selection()), "")
+        box = self.tree.bbox(row) if row else ""
+        x = self.tree.winfo_rootx() + (box[0] + round(16 * self._ui_scale) if box else 0)
+        y = self.tree.winfo_rooty() + (box[1] + box[3] if box else 0)
+        return self._show_result_menu(x, y)
+
+    def _show_log_menu(self, x, y):
+        has_selection = bool(self.log_area._textbox.tag_ranges("sel"))
+        self.log_menu.entryconfigure(0, state="normal" if has_selection else "disabled")
+        return self._popup(self.log_menu, x, y)
+
+    def _show_log_menu_at_cursor(self):
+        text = self.log_area._textbox
+        box = text.bbox("insert") or (0, 0, 0, 0)
+        return self._show_log_menu(text.winfo_rootx() + box[0], text.winfo_rooty() + box[1] + box[3])
+
+    def _copy_log_selection(self):
+        text = self.log_area._textbox
+        if text.tag_ranges("sel"):
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text.get("sel.first", "sel.last"))
+        return "break"
+
+    def _select_all_log(self):
+        text = self.log_area._textbox
+        text.tag_add("sel", "1.0", "end-1c")
+        return "break"
 
     # ─── Tooltips ───────────────────────────────────────────
     def _add_tooltip(self, widget, key: str):
-        def show(_event=None):
-            self._hide_tooltip()
-            text = self.texts["tips"][key][self.lang]
-            win = tk.Toplevel(self.root)
-            win.wm_overrideredirect(True)
-            x = widget.winfo_rootx() + 20
-            y = widget.winfo_rooty() + widget.winfo_height() + 4
-            win.wm_geometry(f"+{x}+{y}")
-            tk.Label(win, text=text, justify=tk.LEFT, background="#ffffe0",
-                     foreground="black", relief=tk.SOLID, borderwidth=1,
-                     wraplength=380, padx=6, pady=4).pack()
-            self._tooltip_win = win
-        widget.bind("<Enter>", show, add="+")
-        widget.bind("<Leave>", lambda e: self._hide_tooltip(), add="+")
+        self._tooltip_keys[widget] = key
+        widget.bind("<Enter>", lambda _event: self._show_tooltip(widget, key), add="+")
+        widget.bind("<Leave>", lambda _event: self._hide_tooltip(), add="+")
+
+    def _show_tooltip(self, widget, key: str):
+        self._hide_tooltip()
+        dark = ctk.get_appearance_mode() == "Dark"
+        scale = self._ui_scale
+        win = tk.Toplevel(self.root)
+        win.wm_overrideredirect(True)
+        x = widget.winfo_rootx() + round(20 * scale)
+        # Under fokusramen, så att tipset aldrig döljer den fokuserade kontrollen.
+        y = widget.winfo_rooty() + widget.winfo_height() + round(8 * scale)
+        win.wm_geometry(f"+{x}+{y}")
+        # Ramens bakgrund blir tipsets kant, med samma kontrast som fältkanterna.
+        border = max(1, round(scale))
+        frame = tk.Frame(win, background=self.FIELD_BORDER[dark], padx=border, pady=border)
+        frame.pack()
+        tk.Label(frame, text=self.texts["tips"][key][self.lang], justify=tk.LEFT,
+                 background=self.TOOLTIP_SURFACE[dark], foreground=self.STATUS_COLOR[dark],
+                 font=self.tk_fonts["body"], wraplength=round(380 * scale),
+                 padx=round(8 * scale), pady=round(5 * scale)).pack()
+        self._tooltip_win = win
 
     def _hide_tooltip(self):
         if self._tooltip_win is not None:
@@ -5524,37 +6642,67 @@ class AppGUI:
             self._tooltip_win = None
 
     def _on_closing(self):
+        if self._closing:
+            return
+        if self.crawl_thread and self.crawl_thread.is_alive():
+            if not messagebox.askyesno(self.texts['window_title'][self.lang], self.texts['confirm_close'][self.lang]):
+                return
+            self._closing = True
+            self._save_settings()
+            self.stop_crawl()
+            self._close_when_crawl_finishes()
+            return
         self._save_settings()
-        if self.crawler_instance:
-            self.crawler_instance.stop()
-            # Ge crawlern en chans att spola databasen och skriva rapporterna
-            if self.crawl_thread and self.crawl_thread.is_alive():
-                self.crawl_thread.join(timeout=5)
         self.root.destroy()
+
+    def _close_when_crawl_finishes(self):
+        if self.crawl_thread and self.crawl_thread.is_alive():
+            self.root.after(100, self._close_when_crawl_finishes)
+        else:
+            self.root.destroy()
+
+    @staticmethod
+    def _open_local_path(path):
+        if sys.platform.startswith("win"):
+            os.startfile(path)             # noqa: S606 — användarens egen utdata
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
 
     def open_output_folder(self):
         folder = self.dir_var.get()
         if not os.path.isdir(folder):
             return
         try:
-            if sys.platform.startswith("win"):
-                os.startfile(folder)             # noqa: S606 — användarens egen mapp
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", folder])
-            else:
-                subprocess.Popen(["xdg-open", folder])
+            self._open_local_path(folder)
         except Exception as e:
             self._log_to_gui(f"Kunde inte öppna mappen: {e}")
 
+    def open_report(self):
+        path = self._last_summary.report_path if self._last_summary else None
+        if not path or not os.path.isfile(path):
+            self.report_btn.configure(state="disabled")
+            self._log_to_gui(self.texts["report_missing"][self.lang])
+            return
+        try:
+            self._open_local_path(path)
+        except OSError as error:
+            self._log_to_gui(self.texts["report_open_error"][self.lang].format(error))
+
+    def _render_summary(self, summary: CrawlSummary) -> str:
+        text = summary.render(self.lang, self.texts["run_summary"])
+        self.stats_label.configure(text=text, text_color=self.RUN_STATUS_COLORS[summary.status])
+        self.report_btn.configure(state="normal" if summary.report_path and os.path.isfile(summary.report_path)
+                                  else "disabled")
+        return text
+
     def change_appearance_mode_event(self):
-        if self.theme_switch.get() == 1:
-            ctk.set_appearance_mode("Dark")
-            self.theme_switch.configure(text="🌙")
-            self._update_treeview_style("Dark")
-        else:
-            ctk.set_appearance_mode("Light")
-            self.theme_switch.configure(text="☀️")
-            self._update_treeview_style("Light")
+        mode = "Dark" if self.theme_switch.get() == 1 else "Light"
+        ctk.set_appearance_mode(mode)
+        self._update_treeview_style(mode)
+        if getattr(self, "_focus_ring_target", None) is not None:
+            self._show_focus_ring(self._focus_ring_target)   # fokusramens färg följer temat
 
     def change_language_event(self, choice):
         inverted_map = {v[self.lang]: k for k, v in self.texts["run_modes"].items()}
@@ -5570,12 +6718,16 @@ class AppGUI:
         new_adv = self.texts["tab_adv"][new_lang]
         self.tabview.rename(old_basic, new_basic)
         self.tabview.rename(old_adv, new_adv)
+        # rename() lämnar flikknappen utan valt läge. Markera bara knappen igen: tabview.set()
+        # skulle dölja andra flikar efter 100 ms och kunna dölja en flik som väljs under tiden.
+        self.tabview._segmented_button.set(self.tabview.get())
 
         self.lang = new_lang
         self.root.title(self.texts["window_title"][self.lang])
 
         self.lbl_url.configure(text=self.texts["lbl_url"][self.lang])
         self.help_btn.configure(text=self.texts["btn_help"][self.lang])
+        self.theme_switch.configure(text=self.texts["dark_mode"][self.lang])
         self.lbl_delay.configure(text=self.texts["lbl_delay"][self.lang])
         self.lbl_max_pages.configure(text=self.texts["lbl_max_pages"][self.lang])
         self.lbl_max_depth.configure(text=self.texts["lbl_max_depth"][self.lang])
@@ -5602,6 +6754,7 @@ class AppGUI:
         self.cb_full.configure(text=self.texts["cb_full"][self.lang])
         self.lbl_lang_filter.configure(text=self.texts["lbl_lang_filter"][self.lang])
         self.open_btn.configure(text=self.texts["btn_open"][self.lang])
+        self.report_btn.configure(text=self.texts["btn_report"][self.lang])
         if getattr(self, "template_menu", None) is not None:
             old_none = self.texts["template_none"]["en" if new_lang == "sv" else "sv"]
             new_none = self.texts["template_none"][new_lang]
@@ -5619,7 +6772,11 @@ class AppGUI:
 
         self.tree.heading('Status', text=self.texts["col_status"][self.lang])
         self.tree.heading('Titel', text=self.texts["col_title"][self.lang])
-        if not self.crawler_instance or self.crawler_instance.state in (
+        for key, label in self.output_labels.items():
+            label.configure(text=self.texts[key][self.lang])
+        if self._last_summary:
+            self._render_summary(self._last_summary)
+        elif not self.crawler_instance or self.crawler_instance.state in (
             CrawlerState.IDLE, CrawlerState.STOPPED
         ):
             self.stats_label.configure(text=self.texts["status_wait"][self.lang])
@@ -5632,33 +6789,68 @@ class AppGUI:
         if self.format_var.get() not in format_vals:
             self.format_var.set(format_vals[-1])
 
+        self.text_size_menu.configure(values=[self._text_scale_label(scale) for scale in self.TEXT_SCALES])
+        self.text_size_menu.set(self._text_scale_label(self.text_scale))
+        self._label_context_menus()
+        # Nya texter ändrar bredden utan att delarnas höjd ändras, så rullytan räknas om här, och
+        # en gång till när reglagen som krymper har ritats om.
+        self._schedule_scroll_update()
+        self.root.after(200, self._schedule_scroll_update)
+
     def _update_treeview_style(self, mode):
-        style = ttk.Style()
+        style = ttk.Style(self.root)
         style.theme_use("default")
-        if mode == "Dark":
-            style.configure("Treeview", background="#2b2b2b", foreground="white",
-                            fieldbackground="#2b2b2b", borderwidth=0, rowheight=25)
-            style.configure("Treeview.Heading", background="#565b5e", foreground="white",
-                            font=('Arial', 10, 'bold'), relief="flat")
-            style.map('Treeview', background=[('selected', '#1f538d')])
-            style.map("Treeview.Heading", background=[('active', '#343638')])
-        else:
-            style.configure("Treeview", background="#ffffff", foreground="black",
-                            fieldbackground="#ffffff", borderwidth=0, rowheight=25)
-            style.configure("Treeview.Heading", background="#e5e5e5", foreground="black",
-                            font=('Arial', 10, 'bold'), relief="flat")
-            style.map('Treeview', background=[('selected', '#3a7ebf')])
-            style.map("Treeview.Heading", background=[('active', '#d1d1d1')])
+        dark = mode == "Dark"
+        surface = self.PANEL_SURFACE[dark]
+        # Samma faktor som CustomTkinters text, inte fönsterskalningen (se _on_ui_scaling).
+        scale = self._ui_scale
+        body = self.tk_fonts["body"]
+        style.configure("Treeview", background=surface, fieldbackground=surface,
+                        foreground=self.STATUS_COLOR[dark], borderwidth=0,
+                        font=body, rowheight=body.metrics("linespace") + round(10 * scale))
+        style.configure("Treeview.Heading", background="#343e49" if dark else "#edf2f7",
+                        foreground=self.MUTED_TEXT[dark], font=self.tk_fonts["column_heading"],
+                        padding=(round(8 * scale), round(5 * scale)), relief="flat")
+        style.map("Treeview", background=[('selected', self.ACCENT[dark])], foreground=[('selected', 'white')])
+        style.map("Treeview.Heading", background=[('active', self.CONTROL_HOVER[dark])])
+        style.configure("TPanedwindow", background="#353d46" if dark else "#d9e0e7")
+        style.configure("Horizontal.Sash", background="#7f8c9b", sashthickness=round(self.SASH_HEIGHT * scale))
+        if getattr(self, "_scroll_canvas", None) is not None:
+            self._scroll_canvas.configure(background=self.WINDOW_SURFACE[dark])
 
     def open_help_window(self):
         help_win = ctk.CTkToplevel(self.root)
         help_win.title(self.texts["help_title"][self.lang])
         help_win.geometry("600x600")
-        help_text = ctk.CTkTextbox(help_win, wrap=tk.WORD,
-                                   font=ctk.CTkFont(family="Arial", size=13))
+        help_text = ctk.CTkTextbox(help_win, wrap=tk.WORD, font=self.fonts["body"])
         help_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         help_text.insert(tk.END, self.texts["help_content"][self.lang])
         help_text.configure(state="disabled")
+        # Texten kan läsas och rullas med tangentbordet. Esc stänger och fokus går tillbaka till Hjälp.
+        help_text._textbox.configure(takefocus=1)
+
+        def close(_event=None):
+            help_win.destroy()
+            # CTkButton.focus_set() fokuserar den inre etiketten; ramen bär tangentbindningarna.
+            tk.Misc.focus_set(self.help_btn)
+
+        tk.Misc.bind(help_win, "<Escape>", close)
+        help_win.protocol("WM_DELETE_WINDOW", close)
+        # CustomTkinter döljer och visar fönstret kort för titelradens färg. Fokus som sätts medan
+        # fönstret är dolt kan gå förlorat, så texten fokuseras varje gång fönstret visas.
+        # CustomTkinter fokuserar själva fönstret 10 ms efter att det visats igen, så texten fokuseras
+        # strax efter det, och varje gång fönstret självt får fokus.
+        def focus_text_soon(event):
+            if event.widget is help_win:
+                help_win.after(60, help_text._textbox.focus_set)
+
+        def focus_text_now(event):
+            if event.widget is help_win:
+                help_text._textbox.focus_set()
+
+        tk.Misc.bind(help_win, "<Map>", focus_text_soon, add="+")
+        tk.Misc.bind(help_win, "<FocusIn>", focus_text_now, add="+")
+        help_text._textbox.focus_set()
 
     def choose_directory(self):
         d = filedialog.askdirectory()
@@ -5692,15 +6884,17 @@ class AppGUI:
     def _apply_template(self, choice):
         none_label = self.texts["template_none"][self.lang]
         if choice == none_label:
-            self._template_conversion_options = {}
+            self._template_options = {}
+            self._template_choice = None
+            self._template_start_url = ''
             return
 
         site = self.templates.get(choice)
         if not site:
             return
-        self._template_conversion_options = {key: site[key] for key in (
-            'conversion_workers', 'conversion_queue_size', 'conversion_timeout',
-            'generation_keep', 'generation_min_age_hours') if key in site}
+        self._template_options = {key: value for key, value in site.items() if key in KNOWN_CONFIG_KEYS}
+        self._template_choice = choice
+        self._template_start_url = site.get('start_url', '')
 
         if site.get("start_url"):
             self.url_entry.delete(0, tk.END)
@@ -5718,7 +6912,9 @@ class AppGUI:
             self.concurrency_entry.delete(0, tk.END)
             self.concurrency_entry.insert(0, str(site["concurrency"]))
         if "save_format" in site:
-            self.format_var.set(site["save_format"])
+            value = site['save_format']
+            self.format_var.set(('Ingen text' if self.lang == 'sv' else 'No text')
+                                if value in ('Ingen text', 'No text') else value)
         if "download_docs" in site:
             self.docs_var.set(site["download_docs"])
         if "headless_mode" in site:
@@ -5761,219 +6957,575 @@ class AppGUI:
             if site["convert_docs_to_md"]:
                 self.docs_var.set(True)
 
-        if site.get("name"):
+        if site.get('output_dir'):
+            self.dir_var.set(site['output_dir'])
+        elif site.get("name"):
             base_dir = os.path.join(os.path.expanduser("~"), "Desktop", "crawl_output")
             safe_folder_name = slugify(site["name"])
             self.dir_var.set(os.path.join(base_dir, safe_folder_name))
 
         self._log_to_gui(self.texts["template_loaded"][self.lang].format(choice))
 
+    @staticmethod
+    def _same_template_origin(url: str, template_url: str) -> bool:
+        def origin(value):
+            if not value:
+                return None
+            parsed = urlparse(value if '://' in value else 'https://' + value)
+            return (parsed.scheme.lower(), (parsed.hostname or '').lower().rstrip('.'),
+                    parsed.port or (443 if parsed.scheme == 'https' else 80))
+        try:
+            return bool(origin(url)) and origin(url) == origin(template_url)
+        except ValueError:
+            return False
+
+    def _template_options_for(self, url: str) -> Dict:
+        options = getattr(self, '_template_options', {})
+        if options and not self._same_template_origin(url, getattr(self, '_template_start_url', '')):
+            self._template_options = {}
+            self._template_choice = None
+            if getattr(self, 'template_var', None) is not None:
+                self.template_var.set(self.texts['template_none'][self.lang])
+            self._log_to_gui(self.texts['template_detached'][self.lang])
+            return {}
+        return dict(options)
+
     def _log_to_gui(self, msg):
         t = datetime.now().strftime("%H:%M:%S")
-        self.log_area.insert(tk.END, f"[{t}] {msg}\n")
-        self.log_area.see(tk.END)
+        self.output_labels["log_empty"].place_forget()
+        # Följ med nya rader bara när loggen redan visar slutet, som i ett terminalfönster. Den som
+        # har rullat upp för att läsa en äldre rad blir kvar där.
+        textbox = self.log_area._textbox
+        # En loggpost kan ta flera visuella rader. Följ bara om postens slut syns.
+        following = textbox.compare("end-1c", "==", "1.0") or textbox.dlineinfo("end-2c") is not None
+        # Loggen är skrivskyddad för användaren och öppnas bara medan appen skriver.
+        self.log_area.configure(state="normal")
+        self.log_area.insert(tk.END, f"[{t}] {redact_diagnostic_urls(msg)}\n")
+        if following:
+            # Visa senaste textraden, inte den tomma raden efter den avslutande radbrytningen.
+            self.log_area.see("end-2c")
+        if int(self.log_area.index('end-1c').split('.')[0]) > 500:
+            self.log_area.delete("1.0", "2.0")
+        self.log_area.configure(state="disabled")
+
+    def _output_panel(self, key):
+        frame = ctk.CTkFrame(self.results_pane, fg_color=self.PANEL_SURFACE, bg_color=self.WINDOW_SURFACE,
+                             border_color=self.PANEL_BORDER, border_width=1, corner_radius=8)
+        header = ctk.CTkFrame(frame, fg_color="transparent")
+        header.pack(fill=tk.X, padx=12, pady=(5, 3))
+        title = ctk.CTkLabel(header, text=self.texts[key][self.lang], height=22,
+                             text_color=self.STATUS_COLOR, font=self.fonts["panel_title"])
+        title.pack(side=tk.LEFT)
+        self.output_labels[key] = title
+        return frame, header
+
+    # ─── Rullyta, textstorlek och loggens storlek ────────────
+    def _build_scroll_area(self):
+        """Rullyta för hela innehållet. Rullningslisterna syns bara när innehållet inte får plats,
+        till exempel vid stor text i ett litet fönster. Annars fyller innehållet fönstret som förut."""
+        viewport = ctk.CTkFrame(self.root, fg_color=self.WINDOW_SURFACE, corner_radius=0)
+        viewport.pack(fill=tk.BOTH, expand=True)
+        viewport.grid_rowconfigure(0, weight=1)
+        viewport.grid_columnconfigure(0, weight=1)
+        canvas = tk.Canvas(viewport, highlightthickness=0, borderwidth=0, takefocus=0,
+                           background=self.WINDOW_SURFACE[0])
+        canvas.grid(row=0, column=0, sticky="nsew")
+        # Varje list ligger i en vanlig Tk-ram som visas och döljs. CustomTkinter upprepar annars sina
+        # egna geometrianrop vid skalningsbyte, och en dold list kan då dyka upp igen.
+        self._vbar_box = tk.Frame(viewport, borderwidth=0, highlightthickness=0, takefocus=0)
+        self._hbar_box = tk.Frame(viewport, borderwidth=0, highlightthickness=0, takefocus=0)
+        self._vbar = ctk.CTkScrollbar(self._vbar_box, orientation="vertical", command=canvas.yview)
+        self._hbar = ctk.CTkScrollbar(self._hbar_box, orientation="horizontal", command=canvas.xview)
+        self._vbar.pack(fill=tk.BOTH, expand=True)
+        self._hbar.pack(fill=tk.BOTH, expand=True)
+        canvas.configure(yscrollcommand=self._vbar.set, xscrollcommand=self._hbar.set)
+        content = ctk.CTkFrame(canvas, fg_color=self.WINDOW_SURFACE, bg_color=self.WINDOW_SURFACE,
+                               corner_radius=0)
+        self._scroll_window = canvas.create_window(0, 0, window=content, anchor="nw")
+        self._scroll_canvas, self._scroll_content, self._viewport = canvas, content, viewport
+        self._scroll_state = None
+        # Ytterytan ändras bara med fönstret, inte när en rullningslist visas eller döljs.
+        tk.Misc.bind(viewport, "<Configure>", self._schedule_scroll_update, add="+")
+        tk.Misc.bind_all(self.root, "<MouseWheel>", self._on_mousewheel, add="+")
+        tk.Misc.bind_all(self.root, "<Shift-MouseWheel>",
+                         lambda event: self._on_mousewheel(event, horizontal=True), add="+")
+        return content
+
+    def _schedule_scroll_update(self, _event=None):
+        if not self._scroll_update_pending:
+            self._scroll_update_pending = True
+            self.root.after_idle(self._update_scroll_area)
+
+    def _update_scroll_area(self):
+        self._scroll_update_pending = False
+        canvas, content = self._scroll_canvas, self._scroll_content
+        if getattr(self, "results_pane", None) is None:
+            return  # fönstret byggs fortfarande; ett senare <Configure> gör beräkningen
+        try:
+            # Räkna från ytterytan, som inte ändras av rullningslisterna. Annars kan en list som
+            # visas göra ytan smalare, så att den andra listen visas, och så vidare.
+            width, height = self._viewport.winfo_width(), self._viewport.winfo_height()
+            if width <= 1 or height <= 1:
+                return
+            scale = self._ui_scale
+            bar_size = max(self._vbar_box.winfo_reqwidth(), self._hbar_box.winfo_reqheight())
+            # Körstatusen bryts efter fönstrets bredd i stället för en fast bredd.
+            wrap = max(200, round((width - 48 * scale) / scale))
+            if wrap != self._stats_wrap:
+                self._stats_wrap = wrap
+                self.stats_label.configure(wraplength=wrap)
+            # Båda panelernas innehåll behöver plats även i fönstrets minsta läge.
+            other_height = content.winfo_reqheight() - self.results_pane.winfo_reqheight()
+            need_height = other_height + sum(round(part * scale) for part in
+                                            (self.MIN_TABLE_HEIGHT, self.MIN_LOG_HEIGHT, self.SASH_HEIGHT))
+            need_width = max(part.winfo_reqwidth() for part in self._main_frame.pack_slaves()
+                             if part is not self.results_pane) + 2 * round(self.CONTENT_PAD_X * scale)
+            # Kompakt läge när det breda läget inte ryms.
+            compact = self._wide_layout_width() > width
+            if compact != self._compact:
+                self._set_compact(compact)
+                self._scroll_state = None
+                self._schedule_scroll_update()
+                return
+            vertical = need_height > height - (bar_size if need_width > width else 0)
+            view_width = width - (bar_size if vertical else 0)
+            horizontal = need_width > view_width
+            view_height = height - (bar_size if horizontal else 0)
+            if vertical:
+                need_height = other_height + round(self.RESULTS_HEIGHT_WHEN_SCROLLING * scale)
+            state = (max(view_width, need_width), max(view_height, need_height), vertical, horizontal)
+            if state != self._scroll_state:
+                self._scroll_state = state
+                inner_width, inner_height = state[:2]
+                canvas.itemconfigure(self._scroll_window, width=inner_width, height=inner_height)
+                canvas.configure(scrollregion=(0, 0, inner_width, inner_height),
+                                 yscrollincrement=round(20 * scale), xscrollincrement=round(20 * scale))
+                for box, needed, grid in ((self._vbar_box, vertical, dict(row=0, column=1, sticky="ns")),
+                                          (self._hbar_box, horizontal, dict(row=1, column=0, sticky="ew"))):
+                    if needed:
+                        box.grid(**grid)
+                    else:
+                        box.grid_remove()
+        except tk.TclError:
+            pass  # fönstret håller på att stängas
+
+    def _restore_focus_after_scaling(self):
+        self._scale_focus_job = None
+        if self._scroll_update_pending:
+            self._scale_focus_job = self.root.after(40, self._restore_focus_after_scaling)
+            return
+        target = self._focus_ring_target
+        if target is not None and target.winfo_viewable():
+            self._scroll_into_view(target)
+
+    def _keep_output_panels_visible(self, _event=None):
+        """Lämna plats för innehåll i båda panelerna när delaren flyttas."""
+        pane, scale = self.results_pane, self._ui_scale
+        first = round(self.MIN_TABLE_HEIGHT * scale)
+        last = pane.winfo_height() - round(self.MIN_LOG_HEIGHT * scale) - round(self.SASH_HEIGHT * scale)
+        if last >= first:
+            position = pane.sashpos(0)
+            if not first <= position <= last:
+                pane.sashpos(0, max(first, min(position, last)))
+
+    def _wide_layout_width(self) -> int:
+        """Bredden i pixlar som det breda läget behöver. Den räknas från reglagens egna önskade
+        bredder, som inte beror på vilket läge som visas, så att beslutet aldrig fastnar i ett läge."""
+        scale = self._ui_scale
+
+        def width(*widgets):
+            return max(widget.winfo_reqwidth() for widget in widgets)
+
+        def pad(value):
+            return round(value * scale)
+
+        top = width(self.lbl_url) + pad(10) + width(self.url_entry) + width(self._prefs_frame) + pad(24)
+        buttons = (width(self.start_btn) + width(self.pause_btn) + width(self.stop_btn)
+                   + width(self.open_btn) + width(self.report_btn) + pad(18))
+        basic = (width(self.lbl_delay, self.lbl_max_depth, self.lbl_concurrency) + pad(15)
+                 + width(self.delay_entry, self.max_depth_entry, self.concurrency_entry) + pad(10)
+                 + width(self.lbl_max_pages, self.lbl_format, self.lbl_mode) + pad(15)
+                 + width(self.max_pages_entry, self.format_menu, self.headless_menu) + pad(10))
+        documents = width(self.cb_docs) + width(self.cb_convert_docs) + pad(36)
+        advanced = (width(self.cb_hybrid, self.cb_sitemap) + width(self.cb_traf, self.cb_robots)
+                    + width(self.cb_full, self.cb_strict) + pad(60))
+        privacy = sum(width(box) for box in (self.cb_rm_email, self.cb_rm_phone, self.cb_rm_pnr,
+                                             self.cb_rm_ip)) + pad(68)
+        # Flikvyns egen kant och marginal runt flikens innehåll. Vid flikbyte ligger båda flikarna
+        # kvar i 100 ms, så den bredaste placerade fliken används.
+        tabs_shown = [self.tabview.tab(self.texts[key][self.lang]) for key in ("tab_basic", "tab_adv")]
+        widest_tab = max((tab.winfo_reqwidth() for tab in tabs_shown if tab.winfo_manager()), default=0)
+        tab_overhead = max(0, self.tabview.winfo_reqwidth() - widest_tab)
+        tabs = max(basic, documents, advanced, privacy) + tab_overhead
+        return max(top, buttons, tabs) + 2 * pad(self.CONTENT_PAD_X)
+
+    def _set_compact(self, compact: bool):
+        """Kompakt layout när det breda läget inte får plats, till exempel vid stor text: inställningarna
+        i en kolumn, och Hjälp/textstorlek/tema/språk och utdataknapparna på egna rader."""
+        self._compact = compact
+        # pack() behåller tidigare alternativ som inte anges, till exempel marginaler från det andra
+        # läget. Börja därför från noll.
+        self._prefs_frame.pack_forget()
+        self._output_buttons.pack_forget()
+        if compact:
+            self._prefs_frame.pack(in_=self._source_panel, fill=tk.X, padx=12, pady=(0, 7), after=self._url_frame)
+            self._output_buttons.pack(in_=self._main_frame, anchor="w", pady=(0, 3), after=self._btn_frame)
+        else:
+            self._prefs_frame.pack(in_=self._url_frame, side=tk.RIGHT, before=self.lbl_url)
+            self._output_buttons.pack(in_=self._btn_frame, side=tk.RIGHT)
+        self._grid_basic_settings(compact)
+        self._grid_advanced_settings(compact)
+        # Mätningen kan ske mitt i en omritning (språk- eller flikbyte). Pröva läget igen när den är klar.
+        self.root.after(300, self._recheck_layout)
+
+    def _recheck_layout(self):
+        self._scroll_state = None
+        self._schedule_scroll_update()
+
+    def _grid_basic_settings(self, compact: bool):
+        pairs = ((self.lbl_delay, self.delay_entry), (self.lbl_max_pages, self.max_pages_entry),
+                 (self.lbl_max_depth, self.max_depth_entry), (self.lbl_format, self.format_menu),
+                 (self.lbl_concurrency, self.concurrency_entry), (self.lbl_mode, self.headless_menu))
+        for index, (label, field) in enumerate(pairs):
+            row, column = (index, 0) if compact else divmod(index, 2)
+            column = 0 if compact else column * 2
+            label.grid(row=row, column=column, padx=(10, 5), pady=3, sticky="e")
+            field.grid(row=row, column=column + 1, padx=(0, 10), pady=3, sticky="w")
+        rows, span = (len(pairs), 2) if compact else (3, 4)
+        self._documents_row.grid(row=rows, column=0, columnspan=span, padx=10, pady=3, sticky="w")
+        if compact:
+            self.cb_convert_docs.grid(row=1, column=0, pady=(6, 0), sticky="w")
+        else:
+            self.cb_convert_docs.grid(row=0, column=1, pady=0, sticky="w")
+        self.lbl_folder.grid(row=rows + 1, column=0, padx=(10, 5), pady=3, sticky="e")
+        self._folder_row.grid(row=rows + 1, column=1, columnspan=span - 1, padx=(0, 10), pady=3, sticky="ew")
+        self.delay_entry.master.grid_columnconfigure(3, weight=0 if compact else 1)
+
+    def _grid_advanced_settings(self, compact: bool):
+        checks = (self.cb_hybrid, self.cb_traf, self.cb_full, self.cb_sitemap, self.cb_robots, self.cb_strict)
+        for index, checkbox in enumerate(checks):
+            row, column = (index, 0) if compact else divmod(index, 3)
+            checkbox.grid(row=row, column=column, columnspan=3 if compact else 1, padx=10, pady=3, sticky="w")
+        first = len(checks) if compact else 2
+        fields = ((self.lbl_exclude, self.exclude_entry), (self.lbl_require, self.require_entry),
+                  (self.lbl_lang_filter, self.lang_filter_entry))
+        for offset, (label, entry) in enumerate(fields):
+            label.grid(row=first + offset, column=0, padx=(10, 5), pady=3, sticky="e")
+            entry.grid(row=first + offset, column=1, columnspan=2, padx=(0, 10), pady=3, sticky="ew")
+        self._pii_row.grid(row=first + len(fields), column=0, columnspan=3, padx=10, pady=3, sticky="w")
+        for index, checkbox in enumerate((self.cb_rm_email, self.cb_rm_phone, self.cb_rm_pnr, self.cb_rm_ip)):
+            row, column = divmod(index, 2) if compact else (0, index)
+            checkbox.grid(row=row, column=column, padx=(0, 12), pady=(0, 6) if compact else 0, sticky="w")
+        tab = self.cb_hybrid.master
+        for column, weight in enumerate((0, 1, 0) if compact else (1, 1, 1)):
+            tab.grid_columnconfigure(column, weight=weight)
+
+    def _scroll_into_view(self, widget):
+        """Rulla så att en fokuserad kontroll syns helt (fokus får inte hamna utanför bild)."""
+        canvas = getattr(self, "_scroll_canvas", None)
+        if canvas is None or not (self._vbar_box.winfo_ismapped() or self._hbar_box.winfo_ismapped()):
+            return
+        try:
+            region = [float(v) for v in str(canvas.cget("scrollregion")).split()]
+            total_width, total_height = region[2], region[3]
+            margin = round(12 * self._ui_scale)
+            for start, size, view_start, view_size, total, moveto in (
+                    (widget.winfo_rooty() - self._scroll_content.winfo_rooty(), widget.winfo_height(),
+                     canvas.canvasy(0), canvas.winfo_height(), total_height, canvas.yview_moveto),
+                    (widget.winfo_rootx() - self._scroll_content.winfo_rootx(), widget.winfo_width(),
+                     canvas.canvasx(0), canvas.winfo_width(), total_width, canvas.xview_moveto)):
+                if total <= 0:
+                    continue
+                if start - margin < view_start or size + 2 * margin > view_size:
+                    moveto(max(0, start - margin) / total)
+                elif start + size + margin > view_start + view_size:
+                    moveto((start + size + margin - view_size) / total)
+        except (tk.TclError, ValueError, IndexError):
+            pass
+
+    def _on_mousewheel(self, event, horizontal=False):
+        # Tabellen och loggen rullar själva; hjulet rullar hela innehållet bara utanför dem.
+        widget_class = event.widget.winfo_class() if hasattr(event.widget, "winfo_class") else ""
+        if widget_class in ("Treeview", "Text", "Menu"):
+            return
+        box = self._hbar_box if horizontal else self._vbar_box
+        if box.winfo_ismapped():
+            steps = -2 if event.delta > 0 else 2
+            (self._scroll_canvas.xview_scroll if horizontal else self._scroll_canvas.yview_scroll)(steps, "units")
+
+    def _text_scale_label(self, scale: float) -> str:
+        percent = round(scale * 100)
+        return f"Text {percent} %" if self.lang == "sv" else f"Text {percent}%"
+
+    def _apply_text_scale(self, scale: float):
+        """Textstorlek 100–200 %. CustomTkinter skalar sina kontroller; _on_ui_scaling tar resten."""
+        self.text_scale = min(self.TEXT_SCALES, key=lambda allowed: abs(allowed - scale))
+        ctk.set_widget_scaling(self.text_scale)
+        self.text_size_menu.set(self._text_scale_label(self.text_scale))
+        self._schedule_scroll_update()
+
+    def _on_text_size_chosen(self, label: str):
+        labels = [self._text_scale_label(scale) for scale in self.TEXT_SCALES]
+        if label in labels:
+            self._apply_text_scale(self.TEXT_SCALES[labels.index(label)])
+
+    def _step_text_scale(self, direction: int):
+        index = self.TEXT_SCALES.index(self.text_scale) if self.text_scale in self.TEXT_SCALES else 0
+        self._apply_text_scale(self.TEXT_SCALES[max(0, min(len(self.TEXT_SCALES) - 1, index + direction))])
+        return "break"
+
+    def _show_empty_output(self):
+        self.output_labels["results_empty"].place(relx=.5, rely=.60, anchor="center")
+        self.output_labels["log_empty"].place(relx=.5, rely=.5, anchor="center")
 
     def _build_ui(self):
-        main_frame = ctk.CTkFrame(self.root, fg_color="transparent")
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        # Typsnittet måste vara valt innan första kontrollen skapas.
+        self._setup_typography()
+        self._update_treeview_style("Light")
+        self.root.configure(fg_color=self.WINDOW_SURFACE)
+        content = self._build_scroll_area()
+        main_frame = ctk.CTkFrame(content, fg_color="transparent")
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=self.CONTENT_PAD_X, pady=8)
+        self._main_frame = main_frame
 
-        # Top URL bar
-        url_frame = ctk.CTkFrame(main_frame)
-        url_frame.pack(fill=tk.X, pady=(0, 10))
+        panel_style = dict(fg_color=self.PANEL_SURFACE, border_color=self.PANEL_BORDER,
+                           border_width=1, corner_radius=8)
+        entry_style = dict(fg_color=self.FIELD_SURFACE, border_color=self.FIELD_BORDER,
+                           border_width=1, text_color=self.STATUS_COLOR,
+                           placeholder_text_color=self.MUTED_TEXT)
+        menu_style = dict(fg_color=self.FIELD_SURFACE, button_color=self.SELECTED_SURFACE,
+                          button_hover_color=self.CONTROL_HOVER, text_color=self.STATUS_COLOR,
+                          dropdown_fg_color=self.PANEL_SURFACE, dropdown_text_color=self.STATUS_COLOR,
+                          dropdown_hover_color=self.CONTROL_HOVER)
+        check_style = dict(fg_color=self.ACCENT, hover_color=self.ACCENT_HOVER,
+                           border_color=self.MUTED_TEXT, text_color=self.STATUS_COLOR,
+                           checkmark_color="#ffffff", border_width=2,
+                           checkbox_width=18, checkbox_height=18, height=24)
+        secondary_button = dict(fg_color=self.PANEL_SURFACE, hover_color=self.CONTROL_HOVER,
+                                text_color=self.STATUS_COLOR, text_color_disabled=self.DISABLED_TEXT,
+                                border_color=self.PANEL_BORDER, border_width=1)
+
+        # Startadress, språk och visningsläge delar samma panel.
+        source_panel = ctk.CTkFrame(main_frame, **panel_style)
+        source_panel.pack(fill=tk.X, pady=(0, 7))
+        url_frame = ctk.CTkFrame(source_panel, fg_color="transparent")
+        url_frame.pack(fill=tk.X, padx=12, pady=7)
         self.lbl_url = ctk.CTkLabel(url_frame, text=self.texts["lbl_url"][self.lang],
-                                    font=ctk.CTkFont(weight="bold"))
-        self.lbl_url.pack(side=tk.LEFT, padx=(15, 10), pady=15)
-        self.url_entry = ctk.CTkEntry(url_frame, width=250, placeholder_text="https://...")
-        self.url_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 15), pady=15)
+                                    text_color=self.STATUS_COLOR, font=self.fonts["body_strong"])
+        self.lbl_url.pack(side=tk.LEFT, padx=(0, 10))
+        self.url_entry = ctk.CTkEntry(url_frame, width=200, placeholder_text="https://...", **entry_style)
+        self.url_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.url_entry.insert(0, "https://")
-
-        self.lang_var = ctk.StringVar(value="🇸🇪 SV")
-        self.lang_switch = ctk.CTkSegmentedButton(
-            url_frame, values=["🇸🇪 SV", "🇬🇧 EN"],
-            variable=self.lang_var, command=self.change_language_event
-        )
-        self.lang_switch.pack(side=tk.RIGHT, padx=15, pady=15)
-        self.theme_switch = ctk.CTkSwitch(url_frame, text="☀️", width=40,
-                                          command=self.change_appearance_mode_event)
-        self.theme_switch.pack(side=tk.RIGHT, padx=(0, 15), pady=15)
-        self.theme_switch.deselect()
+        # Hjälp, textstorlek, tema och språk ligger i en egen ram: till höger på adressraden,
+        # eller på en egen rad i kompakt läge (_set_compact). Skapas i läsordning för Tab.
+        self._prefs_frame = ctk.CTkFrame(source_panel, fg_color="transparent")
         self.help_btn = ctk.CTkButton(
-            url_frame, text=self.texts["btn_help"][self.lang], width=80,
-            fg_color=("#d9d9d9", "#4a4a4a"),
-            text_color=("black", "white"),
-            hover_color=("#c9c9c9", "#5a5a5a"),
-            command=self.open_help_window
-        )
-        self.help_btn.pack(side=tk.RIGHT, padx=(0, 15), pady=15)
+            self._prefs_frame, text=self.texts["btn_help"][self.lang], width=66,
+            command=self.open_help_window, **secondary_button)
+        # Textstorlek 100–200 %. Ctrl+Plus, Ctrl+Minus och Ctrl+0 gör samma sak.
+        self.text_size_menu = ctk.CTkOptionMenu(
+            self._prefs_frame, values=[self._text_scale_label(scale) for scale in self.TEXT_SCALES],
+            width=96, command=self._on_text_size_chosen, **menu_style)
+        self.text_size_menu.set(self._text_scale_label(self.text_scale))
+        self.theme_switch = ctk.CTkSwitch(
+            self._prefs_frame, text=self.texts["dark_mode"][self.lang], switch_width=30, switch_height=16,
+            fg_color=self.PANEL_BORDER, progress_color=self.ACCENT,
+            button_color=("#51657b", "#dce6f1"), button_hover_color=("#364a60", "#ffffff"),
+            text_color=self.STATUS_COLOR, command=self.change_appearance_mode_event)
+        self.lang_var = ctk.StringVar(value="SV")
+        self.lang_switch = ctk.CTkSegmentedButton(
+            self._prefs_frame, values=["SV", "EN"], width=66, height=28,
+            variable=self.lang_var, command=self.change_language_event,
+            fg_color=self.FIELD_SURFACE, selected_color=self.SEGMENT_SELECTED,
+            selected_hover_color=self.SEGMENT_SELECTED_HOVER, unselected_color=self.FIELD_SURFACE,
+            unselected_hover_color=self.CONTROL_HOVER, text_color=self.STATUS_COLOR)
+        self.lang_switch.pack(side=tk.RIGHT, padx=(10, 0))
+        self.theme_switch.pack(side=tk.RIGHT, padx=(10, 0))
+        self.text_size_menu.pack(side=tk.RIGHT, padx=(10, 0))
+        self.help_btn.pack(side=tk.RIGHT, padx=(8, 0))
+        self._prefs_frame.pack(in_=url_frame, side=tk.RIGHT, before=self.lbl_url)
+        self._source_panel, self._url_frame = source_panel, url_frame
 
-        # Templates
         self.templates = self._find_templates()
         if self.templates:
-            tpl_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
-            tpl_frame.pack(fill=tk.X, pady=(0, 5))
+            tpl_frame = ctk.CTkFrame(source_panel, fg_color="transparent")
+            tpl_frame.pack(fill=tk.X, padx=12, pady=(0, 7))
             self.lbl_template = ctk.CTkLabel(
                 tpl_frame, text=self.texts["lbl_template"][self.lang],
-                font=ctk.CTkFont(weight="bold"))
-            self.lbl_template.pack(side=tk.LEFT, padx=(15, 10))
+                text_color=self.STATUS_COLOR, font=self.fonts["body_strong"])
+            self.lbl_template.pack(side=tk.LEFT, padx=(0, 10))
             none_label = self.texts["template_none"][self.lang]
             template_names = [none_label] + list(self.templates.keys())
             self.template_var = ctk.StringVar(value=none_label)
             self.template_menu = ctk.CTkOptionMenu(
                 tpl_frame, variable=self.template_var, values=template_names,
-                width=300, command=self._apply_template)
-            self.template_menu.pack(side=tk.LEFT, padx=(0, 15))
+                width=300, command=self._apply_template, **menu_style)
+            self.template_menu.pack(side=tk.LEFT)
 
-        # Tabs
-        self.tabview = ctk.CTkTabview(main_frame, height=260)
-        self.tabview.pack(fill=tk.X, pady=(0, 10))
+        # Låt innehållet i den aktiva fliken bestämma höjden.
+        self.tabview = ctk.CTkTabview(
+            main_frame, height=60, anchor="w", **panel_style,
+            segmented_button_fg_color=self.FIELD_SURFACE,
+            segmented_button_selected_color=self.SEGMENT_SELECTED,
+            segmented_button_selected_hover_color=self.SEGMENT_SELECTED_HOVER,
+            segmented_button_unselected_color=self.FIELD_SURFACE,
+            segmented_button_unselected_hover_color=self.CONTROL_HOVER,
+            text_color=self.STATUS_COLOR)
+        self.tabview.pack(fill=tk.X, pady=(0, 6))
         tab_basic = self.tabview.add(self.texts["tab_basic"][self.lang])
         tab_adv = self.tabview.add(self.texts["tab_adv"][self.lang])
+        row_pad = 3
 
         # Tab 1: Basic
         tab_basic.grid_columnconfigure(1, weight=1)
         tab_basic.grid_columnconfigure(3, weight=1)
 
         self.lbl_delay = ctk.CTkLabel(tab_basic, text=self.texts["lbl_delay"][self.lang])
-        self.lbl_delay.grid(row=0, column=0, padx=(10, 5), pady=8, sticky="e")
-        self.delay_entry = ctk.CTkEntry(tab_basic, width=80)
+        self.lbl_delay.grid(row=0, column=0, padx=(10, 5), pady=row_pad, sticky="e")
+        self.delay_entry = ctk.CTkEntry(tab_basic, width=80, **entry_style)
         self.delay_entry.insert(0, "0.5")
-        self.delay_entry.grid(row=0, column=1, padx=(0, 20), pady=8, sticky="w")
+        self.delay_entry.grid(row=0, column=1, padx=(0, 10), pady=row_pad, sticky="w")
 
         self.lbl_max_pages = ctk.CTkLabel(tab_basic, text=self.texts["lbl_max_pages"][self.lang])
-        self.lbl_max_pages.grid(row=0, column=2, padx=(10, 5), pady=8, sticky="e")
-        self.max_pages_entry = ctk.CTkEntry(tab_basic, width=80)
+        self.lbl_max_pages.grid(row=0, column=2, padx=(10, 5), pady=row_pad, sticky="e")
+        self.max_pages_entry = ctk.CTkEntry(tab_basic, width=80, **entry_style)
         self.max_pages_entry.insert(0, "0")
-        self.max_pages_entry.grid(row=0, column=3, padx=(0, 10), pady=8, sticky="w")
+        self.max_pages_entry.grid(row=0, column=3, padx=(0, 10), pady=row_pad, sticky="w")
 
         self.lbl_max_depth = ctk.CTkLabel(tab_basic, text=self.texts["lbl_max_depth"][self.lang])
-        self.lbl_max_depth.grid(row=1, column=0, padx=(10, 5), pady=8, sticky="e")
-        self.max_depth_entry = ctk.CTkEntry(tab_basic, width=80)
+        self.lbl_max_depth.grid(row=1, column=0, padx=(10, 5), pady=row_pad, sticky="e")
+        self.max_depth_entry = ctk.CTkEntry(tab_basic, width=80, **entry_style)
         self.max_depth_entry.insert(0, "0")
-        self.max_depth_entry.grid(row=1, column=1, padx=(0, 20), pady=8, sticky="w")
+        self.max_depth_entry.grid(row=1, column=1, padx=(0, 10), pady=row_pad, sticky="w")
 
         self.lbl_format = ctk.CTkLabel(tab_basic, text=self.texts["lbl_format"][self.lang])
-        self.lbl_format.grid(row=1, column=2, padx=(10, 5), pady=8, sticky="e")
+        self.lbl_format.grid(row=1, column=2, padx=(10, 5), pady=row_pad, sticky="e")
         # Default: .md (LLM-vänligt, fungerar bäst med RAG-pipelines som
         # chunkar i stycken). .json finns kvar för dem som vill ha strukturerade
         # fält per sida.
         self.format_var = ctk.StringVar(value=".md")
         self.format_menu = ctk.CTkOptionMenu(
             tab_basic, variable=self.format_var,
-            values=[".json", ".md", ".txt", "Ingen text"], width=100)
-        self.format_menu.grid(row=1, column=3, padx=(0, 10), pady=8, sticky="w")
+            values=[".json", ".md", ".txt", "Ingen text"], width=100, **menu_style)
+        self.format_menu.grid(row=1, column=3, padx=(0, 10), pady=row_pad, sticky="w")
 
         self.lbl_concurrency = ctk.CTkLabel(tab_basic, text=self.texts["lbl_concurrency"][self.lang])
-        self.lbl_concurrency.grid(row=2, column=0, padx=(10, 5), pady=8, sticky="e")
-        self.concurrency_entry = ctk.CTkEntry(tab_basic, width=80)
+        self.lbl_concurrency.grid(row=2, column=0, padx=(10, 5), pady=row_pad, sticky="e")
+        self.concurrency_entry = ctk.CTkEntry(tab_basic, width=80, **entry_style)
         self.concurrency_entry.insert(0, "10")
-        self.concurrency_entry.grid(row=2, column=1, padx=(0, 20), pady=8, sticky="w")
+        self.concurrency_entry.grid(row=2, column=1, padx=(0, 10), pady=row_pad, sticky="w")
+
+        self.lbl_mode = ctk.CTkLabel(tab_basic, text=self.texts["lbl_mode"][self.lang])
+        self.lbl_mode.grid(row=2, column=2, padx=(10, 5), pady=row_pad, sticky="e")
+        self.headless_var = ctk.StringVar(value=self.texts["run_modes"]["headless"][self.lang])
+        self.headless_menu = ctk.CTkOptionMenu(
+            tab_basic, variable=self.headless_var,
+            values=[v[self.lang] for v in self.texts["run_modes"].values()], width=220, **menu_style)
+        self.headless_menu.grid(row=2, column=3, padx=(0, 10), pady=row_pad, sticky="w")
 
         # Default: ladda ner och konvertera dokument — det är den vanligaste
         # användningen för RAG-system. Användaren kan stänga av om de bara
         # vill ha sidor.
+        documents_row = self._documents_row = ctk.CTkFrame(tab_basic, fg_color="transparent")
+        documents_row.grid(row=3, column=0, columnspan=4, padx=10, pady=row_pad, sticky="w")
         self.docs_var = ctk.BooleanVar(value=True)
-        self.cb_docs = ctk.CTkCheckBox(tab_basic, text=self.texts["cb_docs"][self.lang],
-                                       variable=self.docs_var)
-        self.cb_docs.grid(row=2, column=2, padx=10, pady=8, sticky="w")
+        self.cb_docs = ctk.CTkCheckBox(documents_row, text=self.texts["cb_docs"][self.lang],
+                                       variable=self.docs_var, **check_style)
+        self.cb_docs.grid(row=0, column=0, padx=(0, 16), sticky="w")
 
         self.convert_docs_var = ctk.BooleanVar(value=True)
         self.cb_convert_docs = ctk.CTkCheckBox(
-            tab_basic, text=self.texts["cb_convert_docs"][self.lang],
+            documents_row, text=self.texts["cb_convert_docs"][self.lang],
             variable=self.convert_docs_var,
-            command=self._on_convert_docs_toggled)
-        self.cb_convert_docs.grid(row=2, column=3, padx=10, pady=8, sticky="w")
-
-        self.lbl_mode = ctk.CTkLabel(tab_basic, text=self.texts["lbl_mode"][self.lang])
-        self.lbl_mode.grid(row=3, column=0, padx=(10, 5), pady=8, sticky="e")
-        self.headless_var = ctk.StringVar(value=self.texts["run_modes"]["headless"][self.lang])
-        self.headless_menu = ctk.CTkOptionMenu(
-            tab_basic, variable=self.headless_var,
-            values=[v[self.lang] for v in self.texts["run_modes"].values()], width=180)
-        self.headless_menu.grid(row=3, column=1, columnspan=3, padx=(0, 10), pady=8, sticky="w")
+            command=self._on_convert_docs_toggled, **check_style)
+        self.cb_convert_docs.grid(row=0, column=1, sticky="w")
 
         self.lbl_folder = ctk.CTkLabel(tab_basic, text=self.texts["lbl_folder"][self.lang])
-        self.lbl_folder.grid(row=4, column=0, padx=(10, 5), pady=8, sticky="e")
+        self.lbl_folder.grid(row=4, column=0, padx=(10, 5), pady=row_pad, sticky="e")
+        folder_row = self._folder_row = ctk.CTkFrame(tab_basic, fg_color="transparent")
+        folder_row.grid(row=4, column=1, columnspan=3, padx=(0, 10), pady=row_pad, sticky="ew")
+        folder_row.grid_columnconfigure(0, weight=1)
         self.dir_var = ctk.StringVar(
             value=os.path.join(os.path.expanduser("~"), "Desktop", "crawl_output"))
-        self.dir_entry = ctk.CTkEntry(tab_basic, textvariable=self.dir_var, state="readonly")
-        self.dir_entry.grid(row=4, column=1, columnspan=2, sticky="ew", padx=(0, 10), pady=8)
+        self.dir_entry = ctk.CTkEntry(folder_row, textvariable=self.dir_var, state="readonly", **entry_style)
+        self.dir_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
         self.btn_folder = ctk.CTkButton(
-            tab_basic, text=self.texts["btn_folder"][self.lang],
-            width=100, command=self.choose_directory)
-        self.btn_folder.grid(row=4, column=3, padx=(0, 10), pady=8, sticky="w")
+            folder_row, text=self.texts["btn_folder"][self.lang],
+            width=100, command=self.choose_directory, **secondary_button)
+        self.btn_folder.grid(row=0, column=1)
 
         # Tab 2: Advanced
-        tab_adv.grid_columnconfigure(1, weight=1)
+        tab_adv.grid_columnconfigure((0, 1, 2), weight=1)
 
         self.hybrid_var = ctk.BooleanVar(value=True)
         self.cb_hybrid = ctk.CTkCheckBox(tab_adv, text=self.texts["cb_hybrid"][self.lang],
-                                         variable=self.hybrid_var)
-        self.cb_hybrid.grid(row=0, column=0, padx=10, pady=5, sticky="w")
+                                         variable=self.hybrid_var, **check_style)
+        self.cb_hybrid.grid(row=0, column=0, padx=10, pady=row_pad, sticky="w")
 
         self.traf_var = ctk.BooleanVar(value=HAS_TRAFILATURA)
         self.cb_traf = ctk.CTkCheckBox(tab_adv, text=self.texts["cb_traf"][self.lang],
-                                       variable=self.traf_var)
-        self.cb_traf.grid(row=0, column=1, padx=10, pady=5, sticky="w")
+                                       variable=self.traf_var, **check_style)
+        self.cb_traf.grid(row=0, column=1, padx=10, pady=row_pad, sticky="w")
         if not HAS_TRAFILATURA:
             self.cb_traf.configure(state="disabled")
 
         self.sitemap_var = ctk.BooleanVar(value=True)
         self.cb_sitemap = ctk.CTkCheckBox(tab_adv, text=self.texts["cb_sitemap"][self.lang],
-                                          variable=self.sitemap_var)
-        self.cb_sitemap.grid(row=1, column=0, padx=10, pady=5, sticky="w")
+                                          variable=self.sitemap_var, **check_style)
+        self.cb_sitemap.grid(row=1, column=0, padx=10, pady=row_pad, sticky="w")
 
         self.robots_var = ctk.BooleanVar(value=True)
         self.cb_robots = ctk.CTkCheckBox(tab_adv, text=self.texts["cb_robots"][self.lang],
-                                         variable=self.robots_var)
-        self.cb_robots.grid(row=1, column=1, padx=10, pady=5, sticky="w")
+                                         variable=self.robots_var, **check_style)
+        self.cb_robots.grid(row=1, column=1, padx=10, pady=row_pad, sticky="w")
 
         self.strict_var = ctk.BooleanVar(value=True)
         self.cb_strict = ctk.CTkCheckBox(tab_adv, text=self.texts["cb_strict"][self.lang],
-                                         variable=self.strict_var)
-        self.cb_strict.grid(row=1, column=2, padx=10, pady=5, sticky="w")
+                                         variable=self.strict_var, **check_style)
+        self.cb_strict.grid(row=1, column=2, padx=10, pady=row_pad, sticky="w")
 
         self.lbl_exclude = ctk.CTkLabel(tab_adv, text=self.texts["lbl_exclude"][self.lang])
-        self.lbl_exclude.grid(row=2, column=0, padx=(10, 5), pady=5, sticky="e")
-        self.exclude_entry = ctk.CTkEntry(tab_adv, placeholder_text="images, login, kalender")
-        self.exclude_entry.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(0, 10), pady=5)
+        self.lbl_exclude.grid(row=2, column=0, padx=(10, 5), pady=row_pad, sticky="e")
+        self.exclude_entry = ctk.CTkEntry(tab_adv, placeholder_text="images, login, kalender", **entry_style)
+        self.exclude_entry.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(0, 10), pady=row_pad)
 
         self.lbl_require = ctk.CTkLabel(tab_adv, text=self.texts["lbl_require"][self.lang])
-        self.lbl_require.grid(row=3, column=0, padx=(10, 5), pady=5, sticky="e")
-        self.require_entry = ctk.CTkEntry(tab_adv, placeholder_text="intranat, bibliotek")
-        self.require_entry.grid(row=3, column=1, columnspan=2, sticky="ew", padx=(0, 10), pady=5)
+        self.lbl_require.grid(row=3, column=0, padx=(10, 5), pady=row_pad, sticky="e")
+        self.require_entry = ctk.CTkEntry(tab_adv, placeholder_text="intranat, bibliotek", **entry_style)
+        self.require_entry.grid(row=3, column=1, columnspan=2, sticky="ew", padx=(0, 10), pady=row_pad)
 
         self.lbl_lang_filter = ctk.CTkLabel(tab_adv, text=self.texts["lbl_lang_filter"][self.lang])
-        self.lbl_lang_filter.grid(row=5, column=0, padx=(10, 5), pady=5, sticky="e")
-        self.lang_filter_entry = ctk.CTkEntry(tab_adv, placeholder_text="sv")
-        self.lang_filter_entry.grid(row=5, column=1, columnspan=2, sticky="ew", padx=(0, 10), pady=5)
+        self.lbl_lang_filter.grid(row=4, column=0, padx=(10, 5), pady=row_pad, sticky="e")
+        self.lang_filter_entry = ctk.CTkEntry(tab_adv, placeholder_text="sv", **entry_style)
+        self.lang_filter_entry.grid(row=4, column=1, columnspan=2, sticky="ew", padx=(0, 10), pady=row_pad)
 
         self.full_var = ctk.BooleanVar(value=False)
         self.cb_full = ctk.CTkCheckBox(tab_adv, text=self.texts["cb_full"][self.lang],
-                                       variable=self.full_var)
-        self.cb_full.grid(row=0, column=2, padx=10, pady=5, sticky="w")
+                                       variable=self.full_var, **check_style)
+        self.cb_full.grid(row=0, column=2, padx=10, pady=row_pad, sticky="w")
 
-        arow4 = ctk.CTkFrame(tab_adv, fg_color="transparent")
-        arow4.grid(row=4, column=0, columnspan=3, pady=(10, 0), sticky="w")
+        pii_row = self._pii_row = ctk.CTkFrame(tab_adv, fg_color="transparent")
+        pii_row.grid(row=5, column=0, columnspan=3, padx=10, pady=row_pad, sticky="w")
 
         self.rm_email_var = ctk.BooleanVar(value=True)
-        self.cb_rm_email = ctk.CTkCheckBox(arow4, text=self.texts["cb_rm_email"][self.lang],
-                                           variable=self.rm_email_var)
-        self.cb_rm_email.grid(row=0, column=0, padx=10, pady=5, sticky="w")
+        self.cb_rm_email = ctk.CTkCheckBox(pii_row, text=self.texts["cb_rm_email"][self.lang],
+                                           variable=self.rm_email_var, **check_style)
+        self.cb_rm_email.grid(row=0, column=0, padx=(0, 12), sticky="w")
 
         self.rm_phone_var = ctk.BooleanVar(value=True)
-        self.cb_rm_phone = ctk.CTkCheckBox(arow4, text=self.texts["cb_rm_phone"][self.lang],
-                                           variable=self.rm_phone_var)
-        self.cb_rm_phone.grid(row=0, column=1, padx=10, pady=5, sticky="w")
+        self.cb_rm_phone = ctk.CTkCheckBox(pii_row, text=self.texts["cb_rm_phone"][self.lang],
+                                           variable=self.rm_phone_var, **check_style)
+        self.cb_rm_phone.grid(row=0, column=1, padx=(0, 12), sticky="w")
 
         self.rm_pnr_var = ctk.BooleanVar(value=True)
-        self.cb_rm_pnr = ctk.CTkCheckBox(arow4, text=self.texts["cb_rm_pnr"][self.lang],
-                                         variable=self.rm_pnr_var)
-        self.cb_rm_pnr.grid(row=0, column=2, padx=10, pady=5, sticky="w")
+        self.cb_rm_pnr = ctk.CTkCheckBox(pii_row, text=self.texts["cb_rm_pnr"][self.lang],
+                                         variable=self.rm_pnr_var, **check_style)
+        self.cb_rm_pnr.grid(row=0, column=2, padx=(0, 12), sticky="w")
 
         self.rm_ip_var = ctk.BooleanVar(value=False)
-        self.cb_rm_ip = ctk.CTkCheckBox(arow4, text=self.texts["cb_rm_ip"][self.lang],
-                                        variable=self.rm_ip_var)
-        self.cb_rm_ip.grid(row=1, column=0, padx=10, pady=5, sticky="w")
+        self.cb_rm_ip = ctk.CTkCheckBox(pii_row, text=self.texts["cb_rm_ip"][self.lang],
+                                        variable=self.rm_ip_var, **check_style)
+        self.cb_rm_ip.grid(row=0, column=3, sticky="w")
 
         for widget, key in ((self.cb_hybrid, "hybrid"), (self.cb_traf, "traf"),
                             (self.cb_sitemap, "sitemap"), (self.cb_robots, "robots"),
@@ -5984,75 +7536,103 @@ class AppGUI:
                             (self.lbl_lang_filter, "lang"), (self.lang_filter_entry, "lang")):
             self._add_tooltip(widget, key)
 
-        # Buttons
+        # Körningsknappar till vänster och genvägar till utdata till höger.
         btn_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
-        btn_frame.pack(pady=5)
+        btn_frame.pack(fill=tk.X, pady=(1, 3))
         self.start_btn = ctk.CTkButton(
-            btn_frame, text=self.texts["btn_start"][self.lang],
-            font=ctk.CTkFont(weight="bold"),
-            fg_color="#1f6aa5", command=self.start_crawl)
-        self.start_btn.pack(side=tk.LEFT, padx=10)
+            btn_frame, text=self.texts["btn_start"][self.lang], width=104,
+            font=self.fonts["body_strong"], fg_color=self.ACCENT, hover_color=self.ACCENT_HOVER,
+            text_color="#ffffff", text_color_disabled=self.DISABLED_TEXT, command=self.start_crawl)
+        self.start_btn.pack(side=tk.LEFT)
         self.pause_btn = ctk.CTkButton(
-            btn_frame, text=self.texts["btn_pause"][self.lang],
-            state="disabled",
-            fg_color=("#d9d9d9", "#4a4a4a"),
-            text_color=("black", "white"),
-            hover_color=("#c9c9c9", "#5a5a5a"),
-            command=self.toggle_pause)
-        self.pause_btn.pack(side=tk.LEFT, padx=10)
+            btn_frame, text=self.texts["btn_pause"][self.lang], width=100,
+            state="disabled", command=self.toggle_pause, **secondary_button)
+        self.pause_btn.pack(side=tk.LEFT, padx=(6, 0))
         self.stop_btn = ctk.CTkButton(
-            btn_frame, text=self.texts["btn_stop"][self.lang],
-            state="disabled",
-            fg_color=("#d35b5b", "#a51f1f"),
-            hover_color=("#c42b2b", "#8a1a1a"),
-            text_color=("white", "white"),
-            command=self.stop_crawl)
-        self.stop_btn.pack(side=tk.LEFT, padx=10)
+            btn_frame, text=self.texts["btn_stop"][self.lang], width=96,
+            state="disabled", command=self.stop_crawl,
+            **(secondary_button | {"text_color": self.RUN_STATUS_COLORS["failed"]}))
+        self.stop_btn.pack(side=tk.LEFT, padx=(6, 0))
+        # Genvägarna till utdata ligger till höger på knappraden, eller på en egen rad i kompakt läge.
+        self._output_buttons = ctk.CTkFrame(main_frame, fg_color="transparent")
         self.open_btn = ctk.CTkButton(
-            btn_frame, text=self.texts["btn_open"][self.lang],
-            fg_color=("#d9d9d9", "#4a4a4a"),
-            text_color=("black", "white"),
-            hover_color=("#c9c9c9", "#5a5a5a"),
-            command=self.open_output_folder)
-        self.open_btn.pack(side=tk.LEFT, padx=10)
+            self._output_buttons, text=self.texts["btn_open"][self.lang], width=108,
+            command=self.open_output_folder, **secondary_button)
+        self.report_btn = ctk.CTkButton(
+            self._output_buttons, text=self.texts["btn_report"][self.lang], width=112,
+            state="disabled", command=self.open_report, **secondary_button)
+        self.report_btn.pack(side=tk.RIGHT)
+        self.open_btn.pack(side=tk.RIGHT, padx=(0, 6))
+        self._output_buttons.pack(in_=btn_frame, side=tk.RIGHT)
+        self._btn_frame = btn_frame
 
         # Stats & display
         self.stats_label = ctk.CTkLabel(
             main_frame, text=self.texts["status_wait"][self.lang],
-            font=ctk.CTkFont(family="Consolas", size=12, weight="bold"),
-            text_color="#4caf50")
-        self.stats_label.pack(fill=tk.X, pady=5)
-        self.progress_bar = ctk.CTkProgressBar(main_frame, orientation="horizontal")
+            font=self.fonts["body_strong"],
+            text_color=self.STATUS_COLOR, wraplength=660, anchor="w", justify="left")
+        self.stats_label.pack(fill=tk.X, pady=3)
+        self.progress_bar = ctk.CTkProgressBar(
+            main_frame, orientation="horizontal", fg_color=self.PANEL_BORDER, progress_color=self.ACCENT)
 
-        table_frame = ctk.CTkFrame(main_frame)
-        table_frame.pack(fill=tk.BOTH, expand=True)
-        self.tree = ttk.Treeview(table_frame, columns=('URL', 'Status', 'Titel'),
-                                 show='headings', height=7)
-        self.tree.heading('URL', text='URL')
-        self.tree.heading('Status', text=self.texts["col_status"][self.lang])
-        self.tree.heading('Titel', text=self.texts["col_title"][self.lang])
-        self.tree.column('URL', width=300)
-        self.tree.column('Status', width=130)
-        self.tree.column('Titel', width=300)
+        self.results_pane = ttk.Panedwindow(main_frame, orient=tk.VERTICAL)
+        self.results_pane.pack(fill=tk.BOTH, expand=True)
 
-        scrollbar = ctk.CTkScrollbar(table_frame, orientation="vertical",
+        self.output_labels = {}
+        table_frame, _table_header = self._output_panel("results_title")
+        table_body = ctk.CTkFrame(table_frame, fg_color="transparent")
+        table_body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 6))
+        table_body.grid_columnconfigure(0, weight=1)
+        table_body.grid_rowconfigure(0, weight=1)
+        self.tree = ttk.Treeview(table_body, columns=('URL', 'Status', 'Titel'),
+                                 displaycolumns=('Titel', 'Status', 'URL'), show='headings', height=6)
+        self.tree.heading('URL', text='URL', anchor=tk.W)
+        self.tree.heading('Status', text=self.texts["col_status"][self.lang], anchor=tk.W)
+        self.tree.heading('Titel', text=self.texts["col_title"][self.lang], anchor=tk.W)
+        for column, width in self.TREE_COLUMN_WIDTHS.items():
+            self.tree.column(column, width=round(width * self._ui_scale), stretch=column != 'Status')
+
+        scrollbar = ctk.CTkScrollbar(table_body, orientation="vertical",
                                      command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        def sync_scrollbar(first, last):
+            scrollbar.set(first, last)
+            if float(first) == 0 and float(last) == 1:
+                scrollbar.grid_forget()
+            else:
+                scrollbar.grid(row=0, column=1, sticky="ns")
 
-        self.tree.bind(
-            "<Double-1>",
-            lambda e: webbrowser.open(self.tree.item(self.tree.selection()[0])['values'][0])
-            if self.tree.selection()
-            and self.tree.item(self.tree.selection()[0])['values'][0].startswith("http")
-            else None
-        )
+        self.tree.configure(yscrollcommand=sync_scrollbar)
+        self.tree.grid(row=0, column=0, sticky="nsew")
 
-        self.log_area = ctk.CTkTextbox(main_frame,
-                                       font=ctk.CTkFont(family="Consolas", size=11),
-                                       height=100)
-        self.log_area.pack(fill=tk.BOTH, expand=False, pady=(10, 0))
+        # Dubbelklick och Enter öppnar markerad sida; Ctrl+C kopierar dess adress.
+        self.tree.bind("<Double-1>", lambda _event: self._open_selected_result())
+        self.tree.bind("<Return>", lambda _event: self._open_selected_result())
+        self.tree.bind("<KP_Enter>", lambda _event: self._open_selected_result())
+        self.tree.bind("<Control-c>", lambda _event: self._copy_selected_result_url())
+        self.tree.bind("<FocusIn>", lambda _event: self._focus_first_result(), add="+")
+
+        log_frame, _log_header = self._output_panel("log_title")
+        self.log_area = ctk.CTkTextbox(log_frame, fg_color=self.PANEL_SURFACE, text_color=self.STATUS_COLOR,
+                                       font=self.fonts["body"],
+                                       height=60, wrap=tk.WORD)
+        self.log_area.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 6))
+        # Skrivskyddad men fokuserbar: raderna kan läsas, markeras och kopieras med tangentbordet.
+        self.log_area.configure(state="disabled")
+        self.log_area._textbox.configure(takefocus=1)
+        self.results_pane.add(table_frame, weight=3)
+        self.results_pane.add(log_frame, weight=1)
+        self.results_pane.bind("<Configure>", self._keep_output_panels_visible, add="+")
+        self.results_pane.bind("<ButtonRelease-1>", self._keep_output_panels_visible, add="+")
+        for key, parent in (("results_empty", self.tree), ("log_empty", self.log_area)):
+            self.output_labels[key] = ctk.CTkLabel(
+                parent, text=self.texts[key][self.lang], bg_color=self.PANEL_SURFACE,
+                text_color=self.MUTED_TEXT, font=self.fonts["body"])
+        self._show_empty_output()
+        self._build_context_menus()
+        # Innehållets naturliga höjd ändras med flik, språk och textstorlek; rullytan följer med.
+        for part in (source_panel, self.tabview, btn_frame, self.stats_label):
+            tk.Misc.bind(part, "<Configure>", self._schedule_scroll_update, add="+")
+        self._setup_keyboard()
 
     def process_queue(self):
         try:
@@ -6060,18 +7640,30 @@ class AppGUI:
                 try:
                     msg_type, data = self.msg_queue.get_nowait()
                     if msg_type == "log":
-                        t = datetime.now().strftime("%H:%M:%S")
-                        self.log_area.insert(tk.END, f"[{t}] {data}\n")
-                        self.log_area.see(tk.END)
-                        if int(self.log_area.index('end-1c').split('.')[0]) > 500:
-                            self.log_area.delete("1.0", "2.0")
+                        if isinstance(data, tuple):
+                            level, key = data
+                            data = f"[{level}] {self.texts[key][self.lang]}"
+                        self._log_to_gui(data)
                     elif msg_type == "table":
                         if data[1] == self.texts['status_login_required']['sv']:
                             data = (data[0], self.texts['status_login_required'][self.lang], data[2])
+                        if self.lang == 'en':
+                            url, status, title = data
+                            translations = self.texts['table_status_en']
+                            prefix, space, detail = status.partition(' (')
+                            status = translations.get(status, translations.get(prefix, prefix) + space + detail)
+                            data = (url, status, translations['Ingen titel'] if title == 'Ingen titel' else title)
+                        self.output_labels["results_empty"].place_forget()
                         self.tree.insert('', 0, values=data)
                         if len(self.tree.get_children()) > 100:
                             self.tree.delete(self.tree.get_children()[-1])
+                        if not self.tree.focus() and self.root.focus_get() is self.tree:
+                            self._focus_first_result()
                     elif msg_type == "stats_data":
+                        if self.crawler_instance and self.crawler_instance.state == CrawlerState.STOPPED:
+                            continue
+                        if self.lang == 'en':
+                            data = (*data[:-1], self.texts['eta_texts'].get(data[-1], data[-1]))
                         self.stats_label.configure(
                             text=self.texts["stats_fmt"][self.lang].format(*data))
                         if self.progress_bar and self.max_pages_entry.get() != "0":
@@ -6081,6 +7673,9 @@ class AppGUI:
                                     self.progress_bar.set(data[0] / max_p)
                             except ValueError:
                                 pass
+                    elif msg_type == 'phase':
+                        if self.crawler_instance and self.crawler_instance.state != CrawlerState.STOPPED:
+                            self.stats_label.configure(text=self.texts[data][self.lang])
                     elif msg_type == "login_wait":
                         proceed = messagebox.askokcancel(
                             "Inloggning / Login", self.texts["login_msg"][self.lang])
@@ -6090,15 +7685,11 @@ class AppGUI:
                             else:
                                 self.crawler_instance.login_event.set()
                     elif msg_type == "summary":
-                        for key in ('run_success', 'run_partial', 'run_failed'):
-                            prefix = self.texts[key]['sv'] + ':'
-                            if data.startswith(prefix):
-                                data = self.texts[key][self.lang] + ':' + data[len(prefix):]
-                                break
-                        self.stats_label.configure(text=data)
-                        self._log_to_gui(data)
+                        self._last_summary = data
+                        self._log_to_gui(self._render_summary(data))
                     elif msg_type == "done":
-                        self.start_btn.configure(state="normal")
+                        if not self._closing:
+                            self.start_btn.configure(state="normal", fg_color=self.ACCENT)
                         self.pause_btn.configure(state="disabled")
                         self.stop_btn.configure(state="disabled")
                         self.progress_bar.stop()
@@ -6106,13 +7697,30 @@ class AppGUI:
                 except queue.Empty:
                     break
                 except Exception as inner_e:
-                    self.log_area.insert(tk.END, f"[GUI FEL] Kunde inte rita rad: {inner_e}\n")
+                    self._log_to_gui(f"[GUI FEL] Kunde inte rita rad: {inner_e}")
         finally:
             self.root.after(100, self.process_queue)
 
     def _error_dialog(self, key: str, extra: str = ""):
         messagebox.showerror(self.texts["err_title"][self.lang],
                              self.texts[key][self.lang] + (f"\n\n{extra}" if extra else ""))
+
+    def _focus_field(self, entry):
+        """Efter ett felmeddelande: visa fältets flik, ge fältet fokus och markera texten."""
+        inner = getattr(entry, "_entry", None)
+        if inner is None:
+            return
+        try:
+            for key in ("tab_basic", "tab_adv"):
+                name = self.texts[key][self.lang]
+                tab = self.tabview.tab(name)
+                if str(inner).startswith(str(tab) + ".") and self.tabview.get() != name:
+                    self.tabview.set(name)
+            inner.focus_set()
+            inner.select_range(0, tk.END)
+            inner.icursor(tk.END)
+        except (tk.TclError, ValueError, AttributeError):
+            pass
 
     def start_crawl(self):
         url = self.url_entry.get().strip()
@@ -6121,28 +7729,36 @@ class AppGUI:
             url = "https://" + url
             self.url_entry.delete(0, tk.END)
             self.url_entry.insert(0, url)
-        parsed = urlparse(url)
-        if (parsed.scheme not in ("http", "https") or not parsed.netloc
-                or ("." not in parsed.netloc and parsed.hostname != "localhost")):
+        if not _valid_http_url(url):
             self._error_dialog("err_url")
+            self._focus_field(self.url_entry)
             return
-        try:
-            delay_val = float(self.delay_entry.get())
-            max_pages_val = int(self.max_pages_entry.get())
-            max_depth_val = int(self.max_depth_entry.get())
-            concurrency_val = int(self.concurrency_entry.get())
-        except ValueError:
-            self._error_dialog("err_num")
-            return
-        if delay_val < 0.1 or not 1 <= concurrency_val <= 50 \
-                or max_pages_val < 0 or max_depth_val < 0:
-            self._error_dialog("err_range")
-            return
+        # Kontrollera ett fält i taget. Felmeddelandet pekar ut fältet, och sedan hamnar fokus där.
+        checks = ((self.delay_entry, float, lambda v: v >= 0.1, "err_delay"),
+                  (self.max_pages_entry, int, lambda v: v >= 0, "err_max_pages"),
+                  (self.max_depth_entry, int, lambda v: v >= 0, "err_max_depth"),
+                  (self.concurrency_entry, int, lambda v: 1 <= v <= 50, "err_concurrency"))
+        values = []
+        for entry, convert, allowed, error in checks:
+            try:
+                # Decimalkomma accepteras, eftersom det är vad svenska användare skriver.
+                value = convert(entry.get().strip().replace(",", "."))
+            except ValueError:
+                value = None
+            if value is None or not allowed(value):
+                self._error_dialog(error)
+                self._focus_field(entry)
+                return
+            values.append(value)
+        delay_val, max_pages_val, max_depth_val, concurrency_val = values
+        if not self.strict_var.get() and max_pages_val == max_depth_val == 0:
+            if not messagebox.askyesno(self.texts['window_title'][self.lang], self.texts['confirm_unbounded'][self.lang]):
+                return
 
         inverted_map = {v[self.lang]: k for k, v in self.texts["run_modes"].items()}
 
         config = {
-            **getattr(self, '_template_conversion_options', {}),
+            **self._template_options_for(url),
             "start_url": url,
             "output_dir": self.dir_var.get(),
             "delay": delay_val,
@@ -6179,15 +7795,19 @@ class AppGUI:
             self._error_dialog("err_start", str(e))
             return
         self.crawler_instance = crawler
+        self._last_summary = None
         self._save_settings()
 
-        self.start_btn.configure(state="disabled")
+        self.start_btn.configure(state="disabled", fg_color=self.FIELD_SURFACE)
+        self.report_btn.configure(state="disabled")
+        self.stats_label.configure(text=self.texts["status_starting"][self.lang], text_color=self.STATUS_COLOR)
         self.pause_btn.configure(state="normal", text=self.texts["btn_pause"][self.lang])
         self.stop_btn.configure(state="normal")
         self.tree.delete(*self.tree.get_children())
         self.log_area.delete("1.0", tk.END)
+        self._show_empty_output()
 
-        self.progress_bar.pack(fill=tk.X, pady=(0, 10))
+        self.progress_bar.pack(before=self.results_pane, fill=tk.X, pady=(0, 4))
         if max_pages_val > 0:
             self.progress_bar.configure(mode='determinate')
             self.progress_bar.set(0)
@@ -6199,7 +7819,9 @@ class AppGUI:
             try:
                 asyncio.run(crawler.crawl())
             except Exception as e:      # crawl() fångar det mesta, det här är sista skyddsnätet
-                self.msg_queue.put(("log", f"[ERROR] Crawlen kraschade: {e}"))
+                crawler.fatal_error = f"{type(e).__name__}: {e}"
+                self.msg_queue.put(("log", redact_diagnostic_urls(f"[ERROR] Crawlen kraschade: {e}")))
+                self.msg_queue.put(("summary", crawler.run_summary()))
                 self.msg_queue.put(("done", "Fel"))
 
         self.crawl_thread = threading.Thread(target=run, daemon=True)
@@ -6216,6 +7838,8 @@ class AppGUI:
     def stop_crawl(self):
         if self.crawler_instance:
             self.stop_btn.configure(state="disabled")
+            self.pause_btn.configure(state="disabled")
+            self.stats_label.configure(text=self.texts['phase_stopping'][self.lang])
             self.crawler_instance.stop()
 
 

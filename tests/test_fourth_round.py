@@ -60,8 +60,9 @@ def test_pdf_dates_sources_headings_tables_and_repeated_margins(tmp_path):
     assert 'Giltig' not in md and 'Senast ändrad' not in md
     assert '## Taxa 2025 – sida 2' in md
     assert '### Avgifter och regler' in md
-    assert '| Parkering | 1250 kr |' in md
-    assert md.count('Parkering') == 1
+    lines = md.splitlines()
+    assert lines.count('| Parkering | 1250 kr |') == 1
+    assert lines.count('Tabellrad. Tjanst: Parkering. Avgift: 1250 kr.') == 1
     assert 'Kommunens dokumentservice' not in md
     assert 'Testkommun | Sida' not in md
     assert md.count('Gemensam bestammelse') == 4
@@ -155,7 +156,7 @@ def test_failed_ocr_attempts_also_count_against_page_limit(tmp_path, monkeypatch
     converter = uwc.DocumentConverter(str(tmp_path), ocr_max_pages=2)
     calls = []
     monkeypatch.setattr(converter, 'ocr_available', lambda: True)
-    monkeypatch.setattr(converter, '_ocr_page', lambda p: calls.append(p.number) or '')
+    monkeypatch.setattr(converter, '_ocr_page', lambda p, **kwargs: calls.append(p.number) or '')
     assert converter.convert(str(source), 'https://test.se/scanned.pdf') is None
     assert calls == [0, 1]
 
@@ -250,6 +251,21 @@ def test_word_page_and_slide_like_headings_do_not_create_pdf_or_pptx_metadata():
           '## Sida 7\n\nRubrik i ett Word-dokument.\n\n## Bild 2\n\nAnnan rubrik.\n\n---\n')
     _, chunks = uwc.markdown_file_to_chunks(md, is_document=True)
     assert all('page_number' not in chunk and 'slide_number' not in chunk for chunk in chunks)
+    body = uwc.DocumentConverter._repeat_document_context('## Sida 7\n\nRubrik i ett Word-dokument.',
+                                                           'Rapport', 'https://test.se/doc', '', [])
+    assert 'PDF-sida' not in body and 'Sidlänk:' not in body
+
+
+def test_pdf_page_reference_keeps_query_and_replaces_existing_fragment():
+    url = 'https://test.se/filer/taxa.pdf?ref=kommun#page=99'
+    target = 'https://test.se/filer/taxa.pdf?ref=kommun#page=2'
+    reference = uwc.pdf_page_reference(url, 2)
+    assert reference == f'PDF-sida 2. Sidlänk: <{target}>'
+    md = (f'# Taxa\n\n**Dokument-URL:** {url}\n**Filtyp:** PDF\n\n---\n\n'
+          f'## Taxa – sida 2\n\n{reference}\n\n### Avgift\n\nAvgiften är 85 kronor.\n\n---\n')
+    _, chunks = uwc.markdown_file_to_chunks(md, is_document=True)
+    assert len(chunks) == 1
+    assert chunks[0]['page_url'] == target and chunks[0]['content'] == 'Avgiften är 85 kronor.'
 
 
 @pytest.mark.parametrize('kind,label,field', [('PDF', 'sida', 'page_number'),

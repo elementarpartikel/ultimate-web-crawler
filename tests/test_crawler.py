@@ -175,9 +175,9 @@ def test_priority_queue_year_penalty_not_triggered_by_digits():
 
 
 def test_keep_query_params_overrides_default_ignore():
-    kept = uwc.normalize_url("http://a.se/x?ref=abc&utm_source=z",
-                             [p for p in uwc.DEFAULT_IGNORE_QUERY_PARAMS if p != "ref"])
-    assert "ref=abc" in kept and "utm_source" not in kept
+    kept = uwc.normalize_url("http://a.se/x?utm_source=abc&fbclid=z",
+                             [p for p in uwc.DEFAULT_IGNORE_QUERY_PARAMS if p != "utm_source"])
+    assert "utm_source=abc" in kept and "fbclid" not in kept
 
 
 def test_pii_role_mailbox_and_link_text():
@@ -547,6 +547,7 @@ def test_cli_happy_path_exit_code_zero(tmp_path):
         runner, base = await serve(site)
         cfg = tmp_path / "sites.json"
         cfg.write_text(json.dumps([{"name": "Test", "start_url": base + "/", "delay": 0.05,
+                                    "allow_private_hosts": True,
                                     "max_pages": 5, "save_format": ".md",
                                     "respect_robots": False, "find_sitemap": False,
                                     "use_trafilatura": False}]), encoding="utf-8")
@@ -556,6 +557,33 @@ def test_cli_happy_path_exit_code_zero(tmp_path):
             await runner.cleanup()
     assert run(go()) == 0
     assert os.path.isfile(tmp_path / "out" / "test" / "crawl_report.json")
+
+
+def test_cli_uses_unique_folders_even_when_a_generated_suffix_is_taken(tmp_path):
+    async def go():
+        site = Site()
+        names = [("taxa-3", "/alfa"), ("taxa", "/beta"), ("taxa", "/gamma")]
+        for name, route in names:
+            site.pages[route] = (page(f"Avgift {route}", f"Kommunal avgift för {route}."), None)
+        runner, base = await serve(site)
+        config_path = tmp_path / "sites.json"
+        config_path.write_text(json.dumps([
+            {"name": name, "start_url": base + route, "delay": 0.05, "allow_private_hosts": True,
+             "find_sitemap": False, "respect_robots": False, "use_hybrid": False, "use_trafilatura": False}
+            for name, route in names
+        ]), encoding="utf-8")
+        try:
+            return await uwc.run_cli_mode(str(config_path), output_dir=str(tmp_path / "out"))
+        finally:
+            await runner.cleanup()
+
+    assert run(go()) == 0
+    for folder, route in [("taxa-3", "/alfa"), ("taxa", "/beta"), ("taxa-4", "/gamma")]:
+        generation = published(tmp_path / "out" / folder)
+        report = json.loads((generation / "crawl_report.json").read_text(encoding="utf-8"))
+        assert report["status"] == "success"
+        chunks = (generation / "chunks.jsonl").read_text(encoding="utf-8").splitlines()
+        assert len(chunks) == 1 and json.loads(chunks[0])["url"].endswith(route)
 
 
 def test_server_mode_works_without_tkinter(tmp_path):

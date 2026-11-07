@@ -3,6 +3,7 @@ import asyncio
 import ctypes
 import json
 import os
+import stat
 from pathlib import Path
 import sys
 import time
@@ -252,9 +253,9 @@ def test_gui_templates_keep_conversion_options_and_clear_them_when_unselected():
                           texts={'template_none': {'sv': 'Ingen mall'}, 'template_loaded': {'sv': 'Laddad {}'}},
                           _log_to_gui=lambda *args: None)
     uwc.AppGUI._apply_template(gui, 'Dokument')
-    assert gui._template_conversion_options == {'conversion_workers': 1, 'conversion_timeout': 300}
+    assert gui._template_options == {'conversion_workers': 1, 'conversion_timeout': 300}
     uwc.AppGUI._apply_template(gui, 'Ingen mall')
-    assert gui._template_conversion_options == {}
+    assert gui._template_options == {}
 
 
 def test_document_conversion_does_not_occupy_a_crawl_slot(tmp_path, monkeypatch):
@@ -521,8 +522,19 @@ def test_conversion_configuration_is_validated(key, value):
     assert any(key in error for error in errors)
 
 
+@pytest.mark.skipif(os.name != 'nt', reason='Windows-attribut för skrivskyddade kataloger')
+def test_cleanup_removes_readonly_directories_created_in_a_document_job(tmp_path):
+    job = tmp_path / 'job'
+    documents = job / 'Documents'
+    documents.mkdir(parents=True)
+    (documents / 'temporary.txt').write_text('Tillfällig fil', encoding='utf-8')
+    os.chmod(documents, stat.S_IREAD)
+    runtime.remove_tree(str(tmp_path), str(job))
+    assert not job.exists()
+
+
 def test_real_libreoffice_conversion_when_installed(tmp_path):
-    converter = uwc.DocumentConverter(str(tmp_path))
+    converter = uwc.DocumentConverter(str(tmp_path), allow_libreoffice=True)
     if not converter._soffice:
         pytest.skip('LibreOffice är inte installerat i testmiljön')
     async def go():
@@ -531,7 +543,7 @@ def test_real_libreoffice_conversion_when_installed(tmp_path):
         url = 'https://test.se/legacy.rtf'
         runner = runtime.ConversionProcessRunner(str(tmp_path / 'jobs'))
         try:
-            result = await runner.run(str(source), url, {}, {},
+            result = await runner.run(str(source), url, {}, {'allow_libreoffice': True},
                                       uwc.DocumentConverter.md_filename(url, source.name), 1000000)
             assert result['text'], result['error']
             assert 'LibreOffice-konvertering' in result['text']

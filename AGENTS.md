@@ -2,8 +2,8 @@
 
 Asynkron webbcrawler med GUI (CustomTkinter) och serverläge (CLI). Byggd av Fredrik Eriksson (AI Sweden).
 Huvudsyfte: ladda ner hela webbplatser/intranät som ren, källmärkt text (Markdown/JSON) att använda som
-kunskapskällor i **Svea**, AI Swedens assistent (RAG). Allt som ändrar utdata ska bedömas utifrån frågan:
-*blir det bättre eller sämre underlag för retrieval och källhänvisning i Svea?*
+kunskapskällor i RAG-tjänster och AI-assistenter. Allt som ändrar utdata ska bedömas utifrån frågan:
+*blir det bättre eller sämre underlag för retrieval och källhänvisning i en RAG-tjänst?*
 
 Språk: kod-kommentarer, loggar och GUI är på **svenska** (GUI även engelska). Skriv nya kommentarer,
 loggmeddelanden och användartexter på svenska, och lägg till engelsk översättning i `AppGUI.texts`.
@@ -18,13 +18,15 @@ loggmeddelanden och användartexter på svenska, och lägg till engelsk översä
 | `document_conversion.py` | PDF/Office/OCR med parsers som laddas efter filtyp, utan GUI/HTML/nätverksimport. |
 | `crawler_text.py` | Gemensam PII-tvätt, texthjälpare och loggnivåer för crawler och worker. |
 | `tests/test_crawler.py` | pytest-tester mot en lokal aiohttp-testserver (ingen riktig sajt). |
+| `tools/skarmlasarprov.py`, `tools/uia_dump.ps1` | Skärmläsar- och tangentbordsprov för GUI:t samt utskrift av UI Automation-trädet. Protokoll: `SKARMLASARPROV.md`. |
 | `sites.example.json` | Mallar. Kopieras till `sites.json` (läses av GUI:t och `--config`). `sites.json` är gitignorerad. |
 | `requirements.txt` | Beroenden med nedre gränser. |
 | `README.md` | Användardokumentation (sv). Uppdatera vid nya config-nycklar eller ändrad utdata. |
 | `README.en.md` | Engelsk användardokumentation. Håll innehåll och språkval synkroniserade med README.md. |
 
 Git-repo: https://github.com/elementarpartikel/ultimate-web-crawler. Miljö: Windows 11, Python 3.11+
-(använder `asyncio.TaskGroup`; testat på 3.14).
+(använder `asyncio.TaskGroup`; testat på 3.14). GUI:ts leveransmiljö är projektets `.venv` med Python 3.14,
+CustomTkinter 6.0 (låst till 6.x i `requirements.txt`) och Tk 9.0. Design och tillgänglighet följer `DESIGNPLAN-WCAG.md`.
 Commits använder projektägarens konto. Lägg inte till automatiska AI-medförfattare eller AI-attributioner.
 
 ## Köra och testa
@@ -83,7 +85,7 @@ avancerade (`cookie_file`, `user_agent`, `allowed_domains`, `max_*`, `keep_*`, `
 `sites.json` och README. En ny GUI-nyckel måste läggas till i: `AppGUI._build_ui`, `_apply_template`, `start_crawl`,
 `_collect_settings`/`_load_settings`, `KNOWN_CONFIG_KEYS`, `sites.example.json` och README.
 
-## Utdata (kontrakt mot Svea – ändra inte utan att ta hänsyn till nedströmsintag)
+## Utdata (kontrakt mot RAG-intaget – ändra inte utan att ta hänsyn till nedströmsintag)
 
 ```
 texter/<slug>_<md5:8>.md|json|txt     en fil per sida (stabilt namn från URL)
@@ -163,6 +165,11 @@ Invarianter att bevara:
 - Kontrollera `self.state` (`STOPPED`/`PAUSED`) vid varje väntepunkt.
 - Valfria bibliotek guardas med `HAS_*`. **GUI-beroenden är valfria**: serverläget ska fungera utan tkinter.
 - Logga via `self._log(msg, LogLevel.X)`; DEBUG går bara till fil, inte till GUI:t.
+- GUI: fonter hämtas från `AppGUI.TEXT_ROLES` (`self.fonts`/`self.tk_fonts`), aldrig hårdkodade. Nya reglage
+  registreras i `AppGUI._setup_keyboard` (tabbordning, tangenter, fokusram). Använd `tk.Misc.focus_set(w)` för
+  CustomTkinter-knappar; deras egen `focus_set()` fokuserar en inre etikett utan tangentbindningar.
+  CustomTkinter upprepar sitt senaste `grid()`/`pack()` vid skalningsbyte: visa och dölj CTk-kontroller via en
+  vanlig Tk-ram (som rullningslisterna i `_build_scroll_area`), inte med `grid_remove()` på kontrollen.
 - Håll crawlern artig och ärlig: respektera robots.txt och `delay`, identifiera dig med `user_agent`, aldrig utge dig för en webbläsare som standard.
 
 ## Säkerhet och dataskydd
@@ -182,6 +189,9 @@ Dubblettkontrollen är exakt (hash av normaliserad text), inte fuzzy. Processgr�
 behålls som standard; valbar städning kräver respit längre än pinnade läsares inläsningstid. Textarkiv/loggar städas
 inte av generationsregeln. Browser-dokument kräver vanlig HTTP-navigation;
 JS-genererade blob-downloads stöds inte.
+Skrivbordsappen är inte anpassad för skärmläsare (beslut 2026-11-06): Tk 9.0.4 ger bara namnlösa rutor till
+UI Automation. Skärmläsaranvändare hänvisas till serverläget i en terminal. Lova inte WCAG-förenlighet för GUI:t.
+Tangentbord, kontrast och skalning är fortfarande krav; se `DESIGNPLAN-WCAG.md`.
 Avancerade PDF-layouter och jämförelse mot pymupdf4llm återstår; layoutförbättringarna är verifierade med syntetiska referenser.
 Huvudfilen är fortfarande stor; process-/publiceringsstödet finns i separata moduler. Övriga granskningsfynd
 och nästa omgång finns i README:s åtgärdslista (2026-10-12).

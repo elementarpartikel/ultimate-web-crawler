@@ -28,7 +28,10 @@ def test_document_same_size_without_validators_is_updated(tmp_path):
         site = doc_site()
         old = make_pdf('Taxa 100 kronor')
         new = make_pdf('Taxa 200 kronor')
-        assert len(old) == len(new)
+        # Slumpmässiga PDF-ID:n kan ge olika längd. Jämna ut efter slutmarkören.
+        size = max(len(old), len(new))
+        old = old.ljust(size, b'\n')
+        new = new.ljust(size, b'\n')
         site.files['/taxa.pdf'] = (old, None)
         runner, base = await serve(site)
         try:

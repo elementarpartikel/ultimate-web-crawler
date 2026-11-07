@@ -5,6 +5,11 @@ import sys
 import time
 
 
+def _block_python_network(event, args):
+    if event.startswith('socket.'):
+        raise PermissionError('Python-nätverk är avstängt för dokumentworkern')
+
+
 def main(job_path=None, result_path=None, converter_module=None):
     # Inga parsers eller barnprocesser får starta innan föräldern skyddat processträdet.
     if job_path is None:
@@ -19,6 +24,10 @@ def main(job_path=None, result_path=None, converter_module=None):
             time.sleep(0.02)
     elif sys.stdin is None or sys.stdin.buffer.read(1) != b'G':
         return 2
+    from crawler_runtime import limit_worker_memory
+    limit_worker_memory(request.get('memory_bytes', 1024 * 1024 * 1024))
+    # Kompletterande skydd för Python-anrop. Native bibliotek kräver OS-isolering.
+    sys.addaudithook(_block_python_network)
     module = converter_module
     if module is None:
         import document_conversion as module
@@ -26,7 +35,8 @@ def main(job_path=None, result_path=None, converter_module=None):
     converter = module.DocumentConverter(
         request['output'], pii_cleaner=lambda text: module.clean_pii_text(options, text),
         ocr=options.get('ocr', True), ocr_languages=options.get('ocr_languages', 'swe+eng'),
-        ocr_max_pages=options.get('ocr_max_pages', 50), work_dir=os.path.dirname(job_path))
+        ocr_max_pages=options.get('ocr_max_pages', 50), work_dir=os.path.dirname(job_path),
+        allow_libreoffice=options.get('allow_libreoffice') is True)
     if request.get('expected_hash') and module.file_sha256(request['input']) != request['expected_hash']:
         result = {'path': None, 'ocr': False, 'error': 'Originalversionen ändrades före konverteringen'}
     elif not converter.can_convert(request['input']):

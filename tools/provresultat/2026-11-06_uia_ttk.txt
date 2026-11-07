@@ -1,0 +1,21 @@
+﻿Fönster: Webbdammsugare – ttk – skärmläsarprov
+Tid: 2026-11-06 21:57
+Element: 16, med namn: 1, fokuserbara: 0
+Kontrolltyper: Pane 15, Window 1
+
+Window | namn="Webbdammsugare – ttk – skärmläsarprov" | klass=TkTopLevel | fokuserbar=False | aktiv=True | värde="" | mönster=Window,Transform
+  Pane | namn="" | klass=TkChild | fokuserbar=False | aktiv=True | värde="" | mönster=
+    Pane | namn="" | klass=TkChild | fokuserbar=False | aktiv=True | värde="" | mönster=
+      Pane | namn="" | klass=TkChild | fokuserbar=False | aktiv=True | värde="" | mönster=
+      Pane | namn="" | klass=TkChild | fokuserbar=False | aktiv=True | värde="" | mönster=
+      Pane | namn="" | klass=TkChild | fokuserbar=False | aktiv=True | värde="" | mönster=
+      Pane | namn="" | klass=TkChild | fokuserbar=False | aktiv=True | värde="" | mönster=
+      Pane | namn="" | klass=TkChild | fokuserbar=False | aktiv=True | värde="" | mönster=
+      Pane | namn="" | klass=TkChild | fokuserbar=False | aktiv=True | värde="" | mönster=
+        Pane | namn="" | klass=TkChild | fokuserbar=False | aktiv=True | värde="" | mönster=
+      Pane | namn="" | klass=TkChild | fokuserbar=False | aktiv=True | värde="" | mönster=
+        Pane | namn="" | klass=TkChild | fokuserbar=False | aktiv=True | värde="" | mönster=
+          Pane | namn="" | klass=TkChild | fokuserbar=False | aktiv=True | värde="" | mönster=
+      Pane | namn="" | klass=TkChild | fokuserbar=False | aktiv=True | värde="" | mönster=
+        Pane | namn="" | klass=TkChild | fokuserbar=False | aktiv=True | värde="" | mönster=
+        Pane | namn="" | klass=TkChild | fokuserbar=False | aktiv=True | värde="" | mönster=

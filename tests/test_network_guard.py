@@ -11,13 +11,15 @@ from test_advanced import needs_chromium
 
 
 @pytest.mark.parametrize('host', ['127.0.0.1', 'localhost', '10.0.0.1',
-                                  '169.254.169.254', '::1', 'fc00::1'])
+                                  '169.254.169.254', '::1', 'fc00::1', '64:ff9b::7f00:1',
+                                  '64:ff9b:1::1', '2002:7f00:1::', '2001::1', '::ffff:127.0.0.1'])
 def test_proxy_rejects_private_literals_without_connecting(monkeypatch, host):
     async def forbidden(*args, **kwargs):
         pytest.fail('Privata mål får aldrig öppnas')
     monkeypatch.setattr(uwc.asyncio, 'open_connection', forbidden)
     async def go():
         proxy = uwc.BrowserEgressProxy()
+        monkeypatch.setattr(proxy.resolver, 'resolve', forbidden)
         try:
             with pytest.raises(uwc.BlockedHostError):
                 await proxy._connect(host, 80)
@@ -46,12 +48,13 @@ def test_proxy_pins_connection_to_validated_dns_address(monkeypatch):
     run(go())
 
 
-@pytest.mark.parametrize('addresses', [['10.1.2.3'], ['93.184.215.14', '127.0.0.1']])
+@pytest.mark.parametrize('addresses', [['10.1.2.3'], ['93.184.215.14', '127.0.0.1'],
+                                        ['93.184.215.14', '64:ff9b::7f00:1']])
 def test_proxy_rejects_private_and_mixed_dns_results(monkeypatch, addresses):
     async def forbidden(*args, **kwargs):
         pytest.fail('Privata DNS-resultat får aldrig öppnas')
-    monkeypatch.setattr(uwc.asyncio, 'open_connection', forbidden)
     async def go():
+        monkeypatch.setattr(asyncio.get_running_loop(), 'sock_connect', forbidden)
         proxy = uwc.BrowserEgressProxy()
         async def resolve(host, port, family):
             return [{'host': addr} for addr in addresses]

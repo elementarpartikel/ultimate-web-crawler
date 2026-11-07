@@ -284,7 +284,8 @@ def test_cli_minimal_config_has_defaults_and_numeric_strings_are_coerced(tmp_pat
         runner, base = await serve(site)
         try:
             file = tmp_path / 'sites.json'
-            file.write_text(json.dumps({'name': 'minimal', 'start_url': base + '/'}), encoding='utf-8')
+            file.write_text(json.dumps({'name': 'minimal', 'start_url': base + '/', 'allow_private_hosts': True}),
+                            encoding='utf-8')
             assert await uwc.run_cli_mode(str(file), output_dir=str(tmp_path / 'output')) == 0
             c = uwc.AsyncWebCrawler(config(base, tmp_path / 'types', delay='0.05', max_pages='2', concurrency='2'))
             assert c.delay == 0.05 and c.max_pages == 2 and c.concurrency == 2
