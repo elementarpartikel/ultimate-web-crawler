@@ -21,8 +21,8 @@ loggmeddelanden och användartexter på svenska, och lägg till engelsk översä
 | `tools/skarmlasarprov.py`, `tools/uia_dump.ps1` | Skärmläsar- och tangentbordsprov för GUI:t samt utskrift av UI Automation-trädet. Protokoll: `SKARMLASARPROV.md`. |
 | `sites.example.json` | Mallar. Kopieras till `sites.json` (läses av GUI:t och `--config`). `sites.json` är gitignorerad. |
 | `requirements.txt` | Beroenden med nedre gränser. |
-| `README.md` | Användardokumentation (sv). Uppdatera vid nya config-nycklar eller ändrad utdata. |
-| `README.en.md` | Engelsk användardokumentation. Håll innehåll och språkval synkroniserade med README.md. |
+| `README.md`, `README.en.md` | Startguider på svenska och engelska. |
+| `docs/anvandarguide.md`, `docs/user-guide.md` | Referens för CLI, konfiguration och utdata. Håll båda språken synkroniserade. |
 
 Git-repo: https://github.com/elementarpartikel/ultimate-web-crawler. Miljö: Windows 11, Python 3.11+
 (använder `asyncio.TaskGroup`; testat på 3.14). GUI:ts leveransmiljö är projektets `.venv` med Python 3.14,
@@ -82,8 +82,8 @@ och dokumenthantering, där felen tidigare var tysta.
 
 Alla giltiga nycklar står i `KNOWN_CONFIG_KEYS` (okända nycklar ger varning i serverläget). Grundnycklar finns i GUI:t;
 avancerade (`cookie_file`, `user_agent`, `allowed_domains`, `max_*`, `keep_*`, `ignore_https_errors` m.fl.) finns bara i
-`sites.json` och README. En ny GUI-nyckel måste läggas till i: `AppGUI._build_ui`, `_apply_template`, `start_crawl`,
-`_collect_settings`/`_load_settings`, `KNOWN_CONFIG_KEYS`, `sites.example.json` och README.
+`sites.json` och användarguiderna. En ny GUI-nyckel måste läggas till i: `AppGUI._build_ui`, `_apply_template`, `start_crawl`,
+`_collect_settings`/`_load_settings`, `KNOWN_CONFIG_KEYS`, `sites.example.json` och användarguiderna.
 
 ## Utdata (kontrakt mot RAG-intaget – ändra inte utan att ta hänsyn till nedströmsintag)
 
