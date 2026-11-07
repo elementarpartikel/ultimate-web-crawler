@@ -571,8 +571,6 @@ Run `python -m pytest tests/test_rag_acceptance.py -q` to exercise the workflow 
 
 On the second run, one page changes and produces fewer chunks. The test checks that the other 99 pages return HTTP 304, that the documents are reused and that obsolete search results disappear when the page's chunks are replaced.
 
-The export has also been tested manually in a RAG service, with uploaded Markdown and JSON files as knowledge sources. Once table rows were also written as plain paragraphs, the spot checks returned the correct answer and source file, including prices in an Excel table. Answers about PDF content could cite the correct page through the page link in the body text. In the test, the service kept using an older file with the same name after an update, so check that an updated source has actually replaced the old one in the knowledge base.
-
 In a local generation test on 6 November 2026, the crawler first published 103 Markdown files. On the second run, the group room closing time changed from 19:00 to 22:15, while the page about lost school keys returned HTTP 404. The crawler published 102 files, reused 101 sources and recorded one update and one removal in `changes.jsonl`. The study workshop file was identical in both generations. The first generation could still be read with its original fact and the removed file.
 
 ---
@@ -816,26 +814,6 @@ The local Windows measurement used Python 3.14, NTFS and 3,000 synthetic Markdow
 | Space after all seven publications | 500.65 MB | 423.08 MB |
 
 Corresponding chunk files in all three series had identical SHA-256 hashes. An unchanged generation stored 0 MB of new chunk data. A changed generation still stores a new complete 26.31 MB chunk file. With full history, it also stores a new complete change log. With `changes_history_max_entries=25000`, the current generation's change log fell from 47.65 to 4.76 MB and the measured growth with 30 changed sources was 33.53 MB per generation. That series used 256.35 MB after seven publications, including earlier generations. See `tests/test_incremental_export.py` for the regression tests.
-
-## Status after six review rounds (2026-10-12)
-
-Round one fixed network protection, freshness, document versions and corpus cleanup. Round two fixed URL handling, page processing caches and metadata, canonical/duplicate handling, 403/session checks, configuration validation, document injection detection and `.txt` export. It also addressed ignored browser status, lastmod hiding changed JavaScript pages and metadata spoofing source fields.
-
-Round three fixed run status/CLI exit codes, silent export failures, atomic index/change-log writes, robots handling per origin including the start page and redirects, sitemap discovery when robots enforcement is disabled, sitemap rate limiting, adaptive-delay recovery and bounded browser-document streaming. The proxy uses raw asynchronous sockets with explicit closing to avoid a Windows hang after reset connections while preserving DNS pinning.
-
-Round four added document dates with provenance, correct retrieval dates after 304, reconversion after link/date metadata changes, repeated context in long documents, PDF headings/tables/two-column order and cautious margin removal, small sibling chunks and PowerPoint groups/tables/speaker notes. Failed OCR attempts count toward the limit. JSONL distinguishes PDF page numbers from PowerPoint slide numbers and retains merged heading paths. Older conversions/processing profiles are reconsidered when their sources are next visited.
-
-Round five isolated PDF/Office/OCR in a bounded process queue with timeouts, descendant cancellation and copied-input version checks. Fetch concurrency is freed during conversion. Corpus, index, manifest, originals and cache are prepared as one generation committed through atomic `current.json` replacement. Cancellation before commit retains the previous delivery; restarts use its cache and clean working directories. Legacy paths are compatibility copies, and importers must pin a generation for consistent reads. `tests/test_fifth_round.py` covers real processes, hard crashes, timeouts, descendants, backpressure, cancellation, publication failures and recovery.
-
-Round six fixed publication during outages: `failed` never becomes `current.json`; robots outages cannot empty the export; public 403 retains old text; large unexplained loss blocks publication. Normal HTTP deletion can publish an empty site when there are no other errors. Processing profiles are separated from selection settings. Unlined PDF price lists retain label/amount pairing without interleaving subsequent prose columns. Conversion moved into a lightweight module with parsers loaded by file type. Five local startup measurements gave medians of 1.025 s before and 0.250 s for the PDF worker after; this measures startup/imports, not conversion time. Unchanged originals are hashed once per run and checked hashes reused at export; the cache deliberately does not persist across runs. Session probes are shared for one minute, adaptive slowdown affects only the relevant host, and optional generation cleanup includes a grace period. `tests/test_sixth_round.py` covers these cases, including real connection failure, recovery and profile migration.
-
-Final verification after round six: **266 tests passed, 2 skipped** with OCR and LibreOffice skipped at that time. Tests use local servers and worker/browser processes; no live sites are crawled.
-
-Remaining work:
-
-- **Advanced PDF quality:** The follow-up above fixes the checked cases. Tables where color or typography alone associates values, missing table rows in scans and chart interpretation remain open.
-- **Injection detection:** `prompt_injection_signals` records the type of content that triggered a match. The report omits matched excerpts. The verification above documents the false-positive results.
-- **Performance:** Cache requeueing and duplicate checks use bulk reads. Language and quarantine checks for Markdown and plain text use metadata without chunking. In an isolated local measurement with 10,000 synthetic SQLite rows, the median cache read fell from 15.0 to 0.13 seconds across three trials. Sharing one lxml tree across the entire HTML pipeline and reducing repeated link validation remain possible improvements.
 
 ---
 

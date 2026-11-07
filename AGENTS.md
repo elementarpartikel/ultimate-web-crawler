@@ -193,5 +193,4 @@ Skrivbordsappen är inte anpassad för skärmläsare (beslut 2026-11-06): Tk 9.0
 UI Automation. Skärmläsaranvändare hänvisas till serverläget i en terminal. Lova inte WCAG-förenlighet för GUI:t.
 Tangentbord, kontrast och skalning är fortfarande krav; se `DESIGNPLAN-WCAG.md`.
 Avancerade PDF-layouter och jämförelse mot pymupdf4llm återstår; layoutförbättringarna är verifierade med syntetiska referenser.
-Huvudfilen är fortfarande stor; process-/publiceringsstödet finns i separata moduler. Övriga granskningsfynd
-och nästa omgång finns i README:s åtgärdslista (2026-10-12).
+Huvudfilen är fortfarande stor. Process- och publiceringsstödet finns i separata moduler.

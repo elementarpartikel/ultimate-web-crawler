@@ -554,8 +554,6 @@ Kör `python -m pytest tests/test_rag_acceptance.py -q` för att prova flödet l
 
 Vid omkörningen ändras en sida och får färre chunks. Provet kontrollerar att de andra 99 sidorna ger HTTP 304, att dokumenten återanvänds och att de gamla sökträffarna försvinner när sidans chunks ersätts.
 
-Exporten har också provats manuellt i en RAG-tjänst, med uppladdade Markdown- och JSON-filer som kunskapskällor. När tabellraderna även skrevs som vanliga textstycken gav stickproven rätt svar och rätt källfil, också för priser i en Excel-tabell. Svar om innehåll i en PDF kunde hänvisa till rätt sida via sidlänken i brödtexten. I provet fortsatte tjänsten att använda en äldre fil med samma namn efter en uppdatering, så kontrollera att en uppdaterad källa verkligen har ersatt den gamla i kunskapsbasen.
-
 Vid ett lokalt generationsprov den 6 november 2026 publicerade crawlern först 103 Markdown-filer. Vid omkörningen ändrades grupprummens stängningstid från 19.00 till 22.15, medan sidan om kvarglömda skolnycklar gav HTTP 404. Crawlern publicerade 102 filer, återanvände 101 källor och registrerade en ändring och en borttagning i `changes.jsonl`. Studieverkstadens fil var identisk mellan generationerna. Den första generationen kunde fortfarande läsas med sin ursprungliga uppgift och den borttagna filen.
 
 ---
@@ -799,24 +797,6 @@ Den lokala mätningen på Windows med Python 3.14 och NTFS använde 3 000 syntet
 | Utrymme efter alla sju publiceringarna | 500,65 MB | 423,08 MB |
 
 Alla motsvarande chunkfiler i de tre serierna gav samma SHA-256. En oförändrad generation lagrade 0 MB ny chunkdata. Vid ändringar lagras fortfarande en ny komplett chunkfil på 26,31 MB. Med full historik lagras också en ny komplett ändringslogg. Med `changes_history_max_entries=25000` sjönk historiken i den aktuella generationen från 47,65 till 4,76 MB och den uppmätta tillväxten vid 30 ändrade källor blev 33,53 MB per generation. Efter sju publiceringar tog den serien 256,35 MB inklusive de äldre generationerna. Regressionstesterna finns i `tests/test_incremental_export.py`.
-
-## Åtgärdsstatus efter sex omgångar (granskning 2026-10-12)
-
-Den första omgången åtgärdade nätverksskydd, aktualitet, dokumentversioner och städning av korpusen. Den andra åtgärdade URL-hantering, sidornas bearbetningscache och metadata, canonical/dubbletter, 403-/sessionskontroll, konfigurationsvalidering, dokumentens injektionskontroll och `.txt`-export. Den täpper också till fel där browser-status ignorerades, lastmod dolde ändrade JS-sidor och metadata kunde förfalska källfält.
-
-Den tredje åtgärdar körstatus/CLI-exitkoder, tysta exportfel, atomisk index-/ändringsloggsskrivning, robots-hantering per origin inklusive startsida och redirects, sitemap-inläsning utan robots-efterlevnad, sitemap-rate-limit, återhämtning av adaptiv fördröjning och strömmande storleksbegränsning för browser-dokument. Proxyn använder råa asynkrona sockets med explicit avslut för att undvika ett Windows-häng efter återställda anslutningar, samtidigt som DNS-pinning bevaras.
-
-Den fjärde lägger till dokumentdatum med tydlig proveniens, korrekt hämtningstid vid 304, omkonvertering vid ändrad länk-/datummetadata, återkommande källkontext i långa dokument, PDF-rubriker/tabeller/tvåspaltsordning och försiktig marginalrensning, små syskonchunks samt PPTX-grupper/tabeller/talarnoteringar. Även misslyckade OCR-försök räknas mot gränsen. JSONL skiljer PDF-sidnummer från PowerPoint-bildnummer och bevarar sammanslagna rubrikvägar. Alla äldre konverteringar/bearbetningsprofiler omprövas automatiskt när källorna besöks nästa gång.
-
-Den femte isolerar PDF/Office/OCR i en separat begränsad processkö med timeout, avbrott av barnprocesser och versionskontroll av indatakopian. Hämtningarnas samtidighet frigörs under konvertering. Korpus, index, manifest, original och cache förbereds som en gemensam generation med atomisk `current.json`-commit. Avbrott före commit behåller föregående leverans; återstart använder dess cache och städar arbetsmappar. Gamla filvägar är kompatibilitetskopior, och inläsaren behöver pinna generationen för sammanhängande läsning. `tests/test_fifth_round.py` provar riktiga processer, hård processkrasch, timeout, barnprocesser, backpressure, avbrott, publiceringsfel och återhämtning.
-
-Den sjätte rättar publicering vid driftfel: `failed` kan aldrig bli `current.json`, robots-störningar får inte tömma exporten, publika 403 behåller tidigare text och stort oförklarat bortfall stoppas. Även normal HTTP-borttagning utan andra fel kan nu publiceras när inga sidor återstår. Bearbetningsprofilen skiljs från urvalsinställningar. PDF-prislistor utan linjer bevarar radkopplingen mellan etikett och belopp utan att blanda efterföljande textspalter. Konverteringen har flyttats till en lätt modul med parsers som laddas efter filtyp. Lokal mätning av fem processstarter gav median 1,025 s före och 0,250 s för PDF-worker efter; detta mäter import/start, inte konverteringstiden. Oförändrade original hashas en gång per körning och kontrollen återanvänds vid export; cachen är avsiktligt inte beständig mellan körningar. Sessionskontroller delas under en minut, adaptiv bromsning gäller berörd värd och generationsstädning är valbar med respit. `tests/test_sixth_round.py` täcker dessa fall, inklusive verkligt anslutningsfel, återhämtning och profilmigration. Följande återstår:
-
-Slutkontroll efter sjätte omgången: **266 tester godkända, 2 överhoppade** (OCR- och LibreOffice-testerna hoppades över då). Testerna använder lokala servrar och worker-/browserprocesser; inga skarpa sajter crawlas.
-
-- **Avancerad PDF-kvalitet:** uppföljningen ovan rättar de kontrollerade fallen. Tabeller där endast färg eller typografi visar hur beloppen hör ihop, ofullständiga tabellrader i skanningar och tolkning av diagram återstår.
-- **Injektionskontroll:** `prompt_injection_signals` anger vilken typ av innehåll som gav utslag. Rapporten återger inga matchande textutdrag. Se verifieringen ovan för mätningen av falska positiva.
-- **Prestanda:** återköning och dubblettkontroll använder samlade cachefrågor. Språk- och karantänkontroller för Markdown och klartext använder metadata utan chunkning. I en isolerad lokal mätning med 10 000 syntetiska SQLite-poster gick cacheläsningen från 15,0 till 0,13 sekunder i median över tre försök. Ett gemensamt lxml-träd för hela HTML-flödet och färre upprepade länkvalideringar är fortsatt möjliga förbättringar.
 
 ---
 
